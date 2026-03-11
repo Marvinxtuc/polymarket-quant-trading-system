@@ -1,0 +1,6 @@
+e7ed2ed27bab30e63e91eea6617367c21aeb387b404cc62bf613e4be92d322cc  snapshots/v1.0-paper-stable/.env
+49dc7828f2e723fda5f0c66d248563c35d1c761a7862a7bf99919b7b525a34d1  snapshots/v1.0-paper-stable/.env.example
+60e5b511d20a4a11476c7464d25a54cbe1c8f5113ec2d859e46f4cb467dcb435  snapshots/v1.0-paper-stable/config.py
+0fb8316e3a7eb9411a9674c3f8148b0f9f56d69b0ec204b8da4f5a7fcc1e28cf  snapshots/v1.0-paper-stable/runner.py
+85b63312324dd854979f354a06c293d5e54cf85d8df852db52314f1a2f2e9a43  snapshots/v1.0-paper-stable/main.py
+2742390299442fc7383e1c8d68c08fd3c3a1c23a78e43a6f4abe488696639a6a  snapshots/v1.0-paper-stable/BASELINE.md
