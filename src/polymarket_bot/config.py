@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     max_open_positions: int = Field(default=8, ge=1)
     min_price: float = Field(default=0.08, ge=0.01, le=0.99)
     max_price: float = Field(default=0.92, ge=0.01, le=0.99)
+    control_path: str = "/tmp/poly_runtime_data/control.json"
 
     # APIs
     polymarket_data_api: str = "https://data-api.polymarket.com"

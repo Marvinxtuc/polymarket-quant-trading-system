@@ -44,6 +44,12 @@ def _empty_state() -> dict:
             "wallet_discovery_enabled": False,
             "wallet_discovery_mode": "",
         },
+        "control": {
+            "pause_opening": False,
+            "reduce_only": False,
+            "emergency_stop": False,
+            "updated_ts": 0,
+        },
         "summary": {
             "pnl_today": 0.0,
             "equity": 0.0,

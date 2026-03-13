@@ -98,6 +98,14 @@ h1 { margin: 0; font-size: 17px; }
 }
 .btn.ghost { background: transparent; }
 .btn.warn { border-color: #bb4a59; color: #ffd4da; }
+.btn.active {
+  border-color: rgba(105, 201, 255, 0.75);
+  box-shadow: inset 0 0 0 1px rgba(105, 201, 255, 0.28);
+}
+.btn.warn.active {
+  border-color: rgba(255, 107, 127, 0.9);
+  box-shadow: inset 0 0 0 1px rgba(255, 107, 127, 0.28);
+}
 
 .budget-card { padding: 8px 10px; display: grid; gap: 6px; }
 .budget-line {

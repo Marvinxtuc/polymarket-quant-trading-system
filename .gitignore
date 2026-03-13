@@ -8,3 +8,27 @@ __pycache__/
 
 .DS_Store
 *.bak.dynamic
+
+# Secrets / local config
+.env
+**/.env
+!.env.example
+!**/.env.example
+
+# Logs / caches
+*.log
+logs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+coverage/
+
+# Node / build artifacts
+node_modules/
+dist/
+build/
+
+# Local editor settings
+.vscode/
+.idea/

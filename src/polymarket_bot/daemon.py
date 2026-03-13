@@ -133,6 +133,12 @@ def _build_state(trader, settings: Settings) -> dict[str, Any]:
             "wallet_discovery_enabled": bool(settings.wallet_discovery_enabled),
             "wallet_discovery_mode": str(settings.wallet_discovery_mode),
         },
+        "control": {
+            "pause_opening": bool(trader.control_state.pause_opening),
+            "reduce_only": bool(trader.control_state.reduce_only),
+            "emergency_stop": bool(trader.control_state.emergency_stop),
+            "updated_ts": int(trader.control_state.updated_ts),
+        },
         "summary": {
             "pnl_today": float(trader.state.daily_realized_pnl),
             "equity": float(settings.bankroll_usd + trader.state.daily_realized_pnl),

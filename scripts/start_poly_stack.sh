@@ -131,6 +131,11 @@ launch_agent_restart() {
   "$LAUNCHCTL_BIN" kickstart -k "gui/$UID_NUM/$label"
 }
 
+launch_agent_pid() {
+  local label="$1"
+  "$LAUNCHCTL_BIN" print "gui/$UID_NUM/$label" 2>/dev/null | awk '/^[[:space:]]*pid = /{print $3; exit}'
+}
+
 cd "$BASE"
 if [[ ! -x "$PY_BIN" ]]; then
   echo ".venv/bin/python not found, please create venv first" >&2
@@ -145,8 +150,14 @@ write_web_plist
 write_bot_plist
 launch_agent_restart "$WEB_LABEL" "$WEB_PLIST"
 launch_agent_restart "$BOT_LABEL" "$BOT_PLIST"
-pgrep -f "polymarket_bot.web --host 127.0.0.1 --port 8787" | head -n 1 >"$WEB_PID_FILE" || true
-pgrep -f "polymarket_bot.daemon --state-path $STATE_PATH" | head -n 1 >"$BOT_PID_FILE" || true
+web_pid="$(launch_agent_pid "$WEB_LABEL" || true)"
+bot_pid="$(launch_agent_pid "$BOT_LABEL" || true)"
+if [[ -n "${web_pid:-}" ]]; then
+  echo "$web_pid" >"$WEB_PID_FILE"
+fi
+if [[ -n "${bot_pid:-}" ]]; then
+  echo "$bot_pid" >"$BOT_PID_FILE"
+fi
 
 # Verify processes are still alive after spawn.
 if ! is_running "$WEB_PID_FILE"; then

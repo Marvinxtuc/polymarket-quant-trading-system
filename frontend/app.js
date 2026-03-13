@@ -1,5 +1,11 @@
 (function () {
   const $ = (id) => document.getElementById(id);
+  const controlState = {
+    pause_opening: false,
+    reduce_only: false,
+    emergency_stop: false,
+    updated_ts: 0,
+  };
 
   function fmtUsd(n) {
     const v = Number(n || 0);
@@ -84,6 +90,93 @@
     if ($("meter-util-text")) $("meter-util-text").textContent = `${fmtPct(util, 1)} / 100%`;
   }
 
+  function setButtonBusy(el, busy) {
+    if (!el) return;
+    el.disabled = !!busy;
+    el.style.opacity = busy ? "0.7" : "1";
+  }
+
+  function renderControlState(next) {
+    controlState.pause_opening = !!next.pause_opening;
+    controlState.reduce_only = !!next.reduce_only;
+    controlState.emergency_stop = !!next.emergency_stop;
+    controlState.updated_ts = Number(next.updated_ts || 0);
+
+    const pauseBtn = $("btn-pause-opening");
+    const reduceBtn = $("btn-reduce-only");
+    const emergencyBtn = $("btn-emergency-stop");
+
+    if (pauseBtn) {
+      pauseBtn.classList.toggle("active", controlState.pause_opening);
+      pauseBtn.textContent = controlState.pause_opening ? "恢复开仓" : "暂停开仓";
+    }
+    if (reduceBtn) {
+      reduceBtn.classList.toggle("active", controlState.reduce_only);
+      reduceBtn.textContent = controlState.reduce_only ? "取消只减仓" : "只减仓模式";
+    }
+    if (emergencyBtn) {
+      emergencyBtn.classList.toggle("active", controlState.emergency_stop);
+      emergencyBtn.textContent = controlState.emergency_stop ? "解除紧急退出" : "紧急退出";
+    }
+  }
+
+  async function pushControl(command, value) {
+    const res = await fetch("/api/control", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ command, value }),
+    });
+    if (!res.ok) {
+      throw new Error(`control request failed: ${res.status}`);
+    }
+    const payload = await res.json();
+    renderControlState(payload || {});
+  }
+
+  function bindControlActions() {
+    const pauseBtn = $("btn-pause-opening");
+    if (pauseBtn) {
+      pauseBtn.addEventListener("click", async () => {
+        setButtonBusy(pauseBtn, true);
+        try {
+          await pushControl("pause_opening", !controlState.pause_opening);
+        } catch (_err) {
+          // keep current state if control API is unavailable
+        } finally {
+          setButtonBusy(pauseBtn, false);
+        }
+      });
+    }
+
+    const reduceBtn = $("btn-reduce-only");
+    if (reduceBtn) {
+      reduceBtn.addEventListener("click", async () => {
+        setButtonBusy(reduceBtn, true);
+        try {
+          await pushControl("reduce_only", !controlState.reduce_only);
+        } catch (_err) {
+          // keep current state if control API is unavailable
+        } finally {
+          setButtonBusy(reduceBtn, false);
+        }
+      });
+    }
+
+    const emergencyBtn = $("btn-emergency-stop");
+    if (emergencyBtn) {
+      emergencyBtn.addEventListener("click", async () => {
+        setButtonBusy(emergencyBtn, true);
+        try {
+          await pushControl("emergency_stop", !controlState.emergency_stop);
+        } catch (_err) {
+          // keep current state if control API is unavailable
+        } finally {
+          setButtonBusy(emergencyBtn, false);
+        }
+      });
+    }
+  }
+
   async function refresh() {
     try {
       const res = await fetch("/api/state", { cache: "no-store" });
@@ -92,8 +185,10 @@
 
       const summary = data.summary || {};
       const config = data.config || {};
+      const control = data.control || {};
       const now = Number(data.ts || 0);
       const pollSec = Number(config.poll_interval_seconds || 0);
+      renderControlState(control);
 
       if ($("status-line")) {
         $("status-line").textContent = `聪明钱包共识引擎 · 最近刷新 ${hhmm(now)} · 下次刷新 ${pollSec}s · 每 ${pollSec}s 轮询`;
@@ -224,6 +319,7 @@
     }
   }
 
+  bindControlActions();
   refresh();
   setInterval(refresh, 5000);
 })();

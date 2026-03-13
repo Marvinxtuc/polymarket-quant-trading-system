@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections import deque
@@ -12,6 +13,14 @@ from polymarket_bot.config import Settings
 from polymarket_bot.risk import RiskManager, RiskState
 from polymarket_bot.strategies.wallet_follower import WalletFollowerStrategy
 from polymarket_bot.types import Signal
+
+
+@dataclass(slots=True)
+class ControlState:
+    pause_opening: bool = False
+    reduce_only: bool = False
+    emergency_stop: bool = False
+    updated_ts: int = 0
 
 
 @dataclass(slots=True)
@@ -31,10 +40,145 @@ class Trader:
     recent_orders: deque[dict[str, object]] = field(init=False, default_factory=lambda: deque(maxlen=100))
     positions_book: dict[str, dict[str, object]] = field(init=False, default_factory=dict)
     token_reentry_until: dict[str, int] = field(init=False, default_factory=dict)
+    control_state: ControlState = field(init=False, default_factory=ControlState)
+    _last_control_signature: tuple[bool, bool, bool, int] = field(
+        init=False,
+        default=(False, False, False, 0),
+    )
 
     def __post_init__(self) -> None:
         self.state = RiskState()
         self.log = logging.getLogger("polybot")
+
+    def _load_control_state(self) -> ControlState:
+        payload: dict[str, object] = {}
+        try:
+            with open(self.settings.control_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                payload = data
+        except FileNotFoundError:
+            payload = {}
+        except Exception as exc:
+            self.log.warning("Control state read failed path=%s err=%s", self.settings.control_path, exc)
+            payload = {}
+
+        state = ControlState(
+            pause_opening=bool(payload.get("pause_opening", False)),
+            reduce_only=bool(payload.get("reduce_only", False)),
+            emergency_stop=bool(payload.get("emergency_stop", False)),
+            updated_ts=int(payload.get("updated_ts") or 0),
+        )
+
+        signature = (
+            state.pause_opening,
+            state.reduce_only,
+            state.emergency_stop,
+            state.updated_ts,
+        )
+        if signature != self._last_control_signature:
+            self._last_control_signature = signature
+            self.log.info(
+                "CONTROL pause_opening=%s reduce_only=%s emergency_stop=%s updated_ts=%d",
+                state.pause_opening,
+                state.reduce_only,
+                state.emergency_stop,
+                state.updated_ts,
+            )
+
+        self.control_state = state
+        return state
+
+    def _apply_emergency_exit(self) -> None:
+        if not self.positions_book:
+            return
+
+        now = int(time.time())
+        close_notional = self.settings.stale_position_close_notional_usd
+
+        for token_id in list(self.positions_book.keys()):
+            position = self.positions_book.get(token_id)
+            if not position:
+                continue
+
+            current_notional = float(position.get("notional") or 0.0)
+            current_qty = float(position.get("quantity") or 0.0)
+            if current_notional <= 0 or current_qty <= 0:
+                del self.positions_book[token_id]
+                self.state.open_positions = max(0, self.state.open_positions - 1)
+                continue
+
+            sig = Signal(
+                wallet="system-emergency-stop",
+                market_slug=str(position.get("market_slug") or token_id),
+                token_id=token_id,
+                outcome=str(position.get("outcome") or "YES"),
+                side="SELL",
+                confidence=1.0,
+                price_hint=float(position.get("price") or 0.5),
+                observed_size=current_qty,
+                observed_notional=current_notional,
+                timestamp=datetime.now(tz=timezone.utc),
+            )
+            result = self.broker.execute(sig, current_notional)
+            if not result.ok:
+                self.recent_orders.appendleft(
+                    {
+                        "ts": now,
+                        "title": sig.market_slug,
+                        "side": sig.side,
+                        "status": "REJECTED",
+                        "retry_count": 0,
+                        "latency_ms": 0,
+                        "reason": f"emergency-exit failed: {result.message}",
+                    }
+                )
+                self.log.error(
+                    "EMERGENCY_EXIT_FAIL slug=%s token=%s reason=%s",
+                    sig.market_slug,
+                    sig.token_id,
+                    result.message,
+                )
+                continue
+
+            filled_qty = result.filled_notional / max(0.01, result.filled_price)
+            remaining_notional = max(0.0, current_notional - result.filled_notional)
+            remaining_qty = max(0.0, current_qty - filled_qty)
+            position["notional"] = remaining_notional
+            position["quantity"] = remaining_qty
+            position["price"] = result.filled_price
+            position["last_trim_ts"] = now
+
+            self.recent_orders.appendleft(
+                {
+                    "ts": now,
+                    "title": sig.market_slug,
+                    "side": sig.side,
+                    "status": "FILLED",
+                    "retry_count": 0,
+                    "latency_ms": 0,
+                    "reason": "emergency-exit",
+                }
+            )
+            self.log.warning(
+                "EMERGENCY_EXIT slug=%s token=%s notional=%.2f remain_notional=%.2f",
+                sig.market_slug,
+                sig.token_id,
+                result.filled_notional,
+                remaining_notional,
+            )
+
+            if remaining_notional <= close_notional or remaining_qty <= 0:
+                del self.positions_book[token_id]
+                self.state.open_positions = max(0, self.state.open_positions - 1)
+                if self.settings.token_reentry_cooldown_seconds > 0:
+                    self.token_reentry_until[token_id] = now + self.settings.token_reentry_cooldown_seconds
+                self.log.warning(
+                    "EMERGENCY_EXIT_CLOSE slug=%s token=%s open_positions=%d",
+                    sig.market_slug,
+                    sig.token_id,
+                    self.state.open_positions,
+                )
 
     def _resolve_wallets(self) -> list[str]:
         seed_wallets = self.settings.wallet_list
@@ -197,6 +341,16 @@ class Trader:
                 )
 
     def step(self) -> None:
+        control = self._load_control_state()
+        if control.emergency_stop:
+            self._apply_emergency_exit()
+            self.last_signals = []
+            self.log.warning(
+                "EMERGENCY_STOP active, skip opening logic, open_positions=%d",
+                self.state.open_positions,
+            )
+            return
+
         self._apply_time_exit()
         wallets = self._resolve_wallets()
         self.last_wallets = wallets
@@ -212,6 +366,21 @@ class Trader:
             return
 
         for sig in signals:
+            if sig.side == "BUY" and control.pause_opening:
+                self.log.info(
+                    "SKIP wallet=%s slug=%s reason=pause opening enabled",
+                    sig.wallet,
+                    sig.market_slug,
+                )
+                continue
+            if sig.side == "BUY" and control.reduce_only:
+                self.log.info(
+                    "SKIP wallet=%s slug=%s reason=reduce-only mode",
+                    sig.wallet,
+                    sig.market_slug,
+                )
+                continue
+
             now = int(time.time())
             cooldown_until = int(self.token_reentry_until.get(sig.token_id, 0))
             if cooldown_until > 0 and cooldown_until <= now:
