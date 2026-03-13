@@ -1,0 +1,190 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Polymarket 自动交易控制台</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="./styles.css?v=20260313a" />
+</head>
+<body>
+  <div class="bg-grid"></div>
+  <main class="console">
+    <header class="panel topbar">
+      <section class="brand-wrap">
+        <span class="pill live">实盘</span>
+        <div>
+          <h1>Polymarket 自动交易系统</h1>
+          <p id="status-line">聪明钱包共识引擎 · 最近刷新 --:--:-- · 下次刷新 --s · 每 --s 轮询</p>
+        </div>
+      </section>
+      <section class="top-actions">
+        <span class="status"><span class="dot"></span>在线</span>
+        <span class="guard" id="guard-line">账户 --U · 单笔上限 --U · 今日剩余风险 --%</span>
+        <button class="btn">暂停开仓</button>
+        <button class="btn ghost">只减仓模式</button>
+        <button class="btn warn">紧急退出</button>
+      </section>
+    </header>
+
+    <section class="panel budget-card">
+      <div class="head"><h2>今日风险预算</h2><span class="mono" id="budget-meta">已使用 --% · 剩余 --% · 预计可开仓 -- 次</span></div>
+      <div class="budget-line">
+        <div class="budget-fill" id="budget-fill" style="width:32%"></div>
+      </div>
+    </section>
+
+    <section class="kpi-row">
+      <article class="panel kpi">
+        <h3>今日收益</h3>
+        <p class="num good" id="kpi-pnl">$0.00</p>
+        <small id="kpi-equity">权益：-- USDC</small>
+      </article>
+      <article class="panel kpi">
+        <h3>当前持仓</h3>
+        <p class="num" id="kpi-pos">0 / 0</p>
+        <small id="kpi-exp">总敞口：0.00%</small>
+      </article>
+      <article class="panel kpi">
+        <h3>共识信号</h3>
+        <p class="num" id="kpi-signals">0</p>
+        <small id="kpi-signals-note">每轮最多 0 条</small>
+      </article>
+      <article class="panel kpi">
+        <h3>风控模式</h3>
+        <p class="num warn" id="kpi-risk-mode">-</p>
+        <small id="kpi-risk-note">拥堵阈值 -- / 拥堵减仓 --</small>
+      </article>
+    </section>
+
+    <section class="main-grid">
+      <div class="col">
+        <article class="panel card">
+          <div class="head"><h2>策略参数</h2><span class="mono" id="param-wallet-pool">wallet_pool=0</span></div>
+          <ul class="list tight">
+            <li><span>单钱包净加仓阈值</span><b id="param-min-increase">-</b></li>
+            <li><span>每轮最大信号数</span><b id="param-max-signals">-</b></li>
+            <li><span>单笔风险</span><b id="param-risk-trade">-</b></li>
+            <li><span>日止损</span><b id="param-risk-day">-</b></li>
+            <li><span>价格带</span><b id="param-price-band">-</b></li>
+            <li><span>加仓冷却</span><b id="param-add-cooldown">-</b></li>
+          </ul>
+        </article>
+
+        <article class="panel card">
+          <div class="head"><h2>钱包监控</h2><span class="mono">可交易视图</span></div>
+          <div class="table-wrap small-scroll">
+            <table class="table">
+              <thead><tr><th>钱包</th><th>可用</th><th>今日PnL</th><th>交易次数</th><th>状态</th><th>最近异常</th></tr></thead>
+              <tbody id="wallets-body">
+                <tr><td colspan="6">等待数据...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+      </div>
+
+      <div class="col">
+        <article class="panel card">
+          <div class="head"><h2>持仓详情</h2><span class="mono">含退出条件</span></div>
+          <div class="table-wrap">
+            <table class="table">
+              <thead><tr><th>市场</th><th>方向</th><th>数量</th><th>持仓</th><th>结算</th><th>Edge</th><th>未实现</th><th>理由</th><th>退出条件</th></tr></thead>
+              <tbody id="positions-body">
+                <tr><td colspan="9">等待数据...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="panel card">
+          <div class="head"><h2>订单管理</h2><span class="mono">失败原因 + 重试次数</span></div>
+          <div class="chips">
+            <span class="chip active" id="chip-pending">进行中 0</span>
+            <span class="chip" id="chip-filled">已成交 0</span>
+            <span class="chip" id="chip-canceled">已取消 0</span>
+            <span class="chip" id="chip-rejected">已拒绝 0</span>
+          </div>
+          <div class="table-wrap small-scroll">
+            <table class="table">
+              <thead><tr><th>时间</th><th>市场</th><th>动作</th><th>状态</th><th>重试</th><th>耗时</th><th>原因</th></tr></thead>
+              <tbody id="orders-body">
+                <tr><td colspan="7">等待数据...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+      </div>
+
+      <div class="col">
+        <article class="panel card">
+          <div class="head"><h2>异常告警中心</h2><span class="mono">Alerts</span></div>
+          <ul class="alert-list" id="alerts-list">
+            <li><span class="level green">正常</span><span>等待数据...</span></li>
+          </ul>
+        </article>
+
+        <article class="panel card">
+          <div class="head"><h2>信号源可用性</h2><span class="mono">权重色阶 + 在线状态</span></div>
+          <div class="table-wrap small-scroll">
+            <table class="table">
+              <thead><tr><th>来源</th><th>权重</th><th>状态</th><th>更新</th><th>命中率</th></tr></thead>
+              <tbody id="sources-body">
+                <tr><td colspan="5">等待数据...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section class="bottom-grid">
+      <article class="panel chart">
+        <div class="head"><h2>收益曲线</h2><span class="mono">PnL Curve</span></div>
+        <div class="chips">
+          <span class="chip active">1h</span>
+          <span class="chip">6h</span>
+          <span class="chip">24h</span>
+          <span class="chip">7d</span>
+        </div>
+        <div class="plot">
+          <svg viewBox="0 0 320 92" preserveAspectRatio="none" aria-label="收益曲线">
+            <polyline points="0,65 35,62 70,58 105,60 140,50 175,43 210,37 245,31 280,29 320,24" />
+          </svg>
+        </div>
+      </article>
+
+      <article class="panel chart">
+        <div class="head"><h2>风险监控</h2><span class="mono">Drawdown / Exposure</span></div>
+        <div class="meters">
+          <div><label>回撤</label><progress id="meter-dd" value="0" max="100"></progress><span id="meter-dd-text">0.0% / 0.0%</span></div>
+          <div><label>总敞口</label><progress id="meter-exp" value="0" max="100"></progress><span id="meter-exp-text">0.0% / 100%</span></div>
+          <div><label>加仓冷却命中</label><progress id="meter-cooldown" value="0" max="100"></progress><span id="meter-cooldown-text">0 / 0</span></div>
+          <div><label>仓位利用率</label><progress id="meter-util" value="0" max="100"></progress><span id="meter-util-text">0.0% / 100%</span></div>
+        </div>
+      </article>
+
+      <article class="panel chart">
+        <div class="head"><h2>系统健康</h2><span class="mono" id="health-runtime">运行中</span></div>
+        <ul class="health">
+          <li><span>Data API</span><b class="good" id="health-dataapi">-</b></li>
+          <li><span>Polymarket API</span><b class="good" id="health-polyapi">-</b></li>
+          <li><span>钱包池规模</span><b class="good" id="health-wallet-pool">-</b></li>
+          <li><span>Discovery</span><b class="good" id="health-discovery">-</b></li>
+          <li><span>Order Gateway</span><b class="good" id="health-gateway">正常</b></li>
+        </ul>
+      </article>
+
+      <article class="panel chart">
+        <div class="head"><h2>自动交易状态时间轴</h2><span class="mono">System Timeline</span></div>
+        <ul class="timeline" id="timeline-list">
+          <li><span>--:--</span><b>等待数据...</b></li>
+        </ul>
+      </article>
+    </section>
+  </main>
+  <script src="./app.js?v=20260313a"></script>
+</body>
+</html>

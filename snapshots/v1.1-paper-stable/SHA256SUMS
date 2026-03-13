@@ -1,0 +1,11 @@
+a30482212b398c48b1cb7dbfbfeaf1ec6131625380a0d7e9a2fcf64ad5f75411  snapshots/v1.1-paper-stable/.env
+8ac44a5fe067b909c8fc6b0bd82ca02dc19cadaadd7a1539bb9b27bab0983da1  snapshots/v1.1-paper-stable/.env.example
+60e5b511d20a4a11476c7464d25a54cbe1c8f5113ec2d859e46f4cb467dcb435  snapshots/v1.1-paper-stable/config.py
+85b63312324dd854979f354a06c293d5e54cf85d8df852db52314f1a2f2e9a43  snapshots/v1.1-paper-stable/main.py
+0fb8316e3a7eb9411a9674c3f8148b0f9f56d69b0ec204b8da4f5a7fcc1e28cf  snapshots/v1.1-paper-stable/runner.py
+691c128cf21a909fff66cc7f5882206f6f16173e1375dba7e66ab0c6b15d0d2a  snapshots/v1.1-paper-stable/risk.py
+6c79f58594741826aa1659789293125d8bda37dfb1a16a6f45d68106e7face51  snapshots/v1.1-paper-stable/daemon.py
+8aa95f4a0a87786166eea827029be71f5d0cc1de98fb531560b71115ffff6acc  snapshots/v1.1-paper-stable/web.py
+c607df5d68e6052fe0138c175c8ba713c1ea4e3614b78f04a59b863b35ec278a  snapshots/v1.1-paper-stable/index.html
+b6ad88e003afd970136410fff0e465622374baf77ce0b4a115ed5853487b3d96  snapshots/v1.1-paper-stable/app.js
+696fb5ab8a0e3e4d173fa2d77636e2a5b409276ae7862e18f8631c5d1c8cfee0  snapshots/v1.1-paper-stable/BASELINE.md
