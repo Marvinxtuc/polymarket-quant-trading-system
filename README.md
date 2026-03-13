@@ -58,6 +58,12 @@ cp .env.example .env
 # edit .env
 ```
 
+Optional env check:
+
+```bash
+python scripts/check_env.py
+```
+
 3. Run one cycle (recommended first):
 
 ```bash

@@ -142,6 +142,10 @@ if [[ ! -x "$PY_BIN" ]]; then
   exit 1
 fi
 
+if ! "$PY_BIN" "$BASE/scripts/check_env.py" --warn-only; then
+  echo "env check failed (continuing)" >&2
+fi
+
 ensure_owned_or_stop "$WEB_PID_FILE" "polymarket_bot.web"
 ensure_owned_or_stop "$BOT_PID_FILE" "polymarket_bot.daemon"
 stop_legacy_runtime
