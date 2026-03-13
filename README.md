@@ -96,6 +96,13 @@ pip install -e '.[live]'
 
 3. Start bot.
 
+## Environment Notes
+
+- Keep real secrets in `.env` and never commit them.
+- `.env.example` is the safe template; update it when you add new settings.
+- For paper trading, you can leave `PRIVATE_KEY` and `FUNDER_ADDRESS` empty.
+- For live trading, `PRIVATE_KEY` and `FUNDER_ADDRESS` are required.
+
 ## Notes
 
 - This is a framework you can extend (sell logic, stop-loss, TP, portfolio netting, market filters).
