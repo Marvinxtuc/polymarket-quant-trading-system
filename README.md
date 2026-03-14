@@ -9,30 +9,16 @@ Default mode is `paper trading` (safe). It can be switched to live CLOB executio
 - Polls target wallets from `WATCH_WALLETS`
 - Detects new/increased positions (smart-money follow signal)
 - Applies risk constraints
-- Executes via:
-  - `PaperBroker` (default)
-  - `LiveClobBroker` (optional, needs `py-clob-client` + key config)
+- Executes via `PaperBroker` (default) or `LiveClobBroker` (optional, needs `py-clob-client` + key config)
 
 ## Strategy (v1)
 
 Signal: if a watched wallet opens or increases a position by at least `MIN_WALLET_INCREASE_USD`, emit a `BUY` signal for that token.
 
 Wallet screening (Polymarket-native):
-- Candidate wallets come from:
-  - static seed list `WATCH_WALLETS`
-  - optional dynamic discovery from `WALLET_DISCOVERY_PATHS`
-- Discovery controls:
-  - `WALLET_DISCOVERY_ENABLED=true|false`
-  - `WALLET_DISCOVERY_MODE=union|replace`
-  - `WALLET_DISCOVERY_PATHS` (recommend `/trades`)
-  - `WALLET_DISCOVERY_TOP_N`
-  - `WALLET_DISCOVERY_MIN_EVENTS`
-  - `WALLET_DISCOVERY_REFRESH_SECONDS` (cache refresh interval, e.g. `900`)
-- A wallet is monitored only if current Polymarket active positions pass all filters:
-  - `MIN_WALLET_ACTIVE_POSITIONS`
-  - `MIN_WALLET_UNIQUE_MARKETS`
-  - `MIN_WALLET_TOTAL_NOTIONAL_USD`
-  - `MAX_WALLET_TOP_MARKET_SHARE`
+- Candidate wallets come from static seed list `WATCH_WALLETS` plus optional dynamic discovery from `WALLET_DISCOVERY_PATHS`.
+- Discovery controls: `WALLET_DISCOVERY_ENABLED`, `WALLET_DISCOVERY_MODE`, `WALLET_DISCOVERY_PATHS` (recommend `/trades`), `WALLET_DISCOVERY_TOP_N`, `WALLET_DISCOVERY_MIN_EVENTS`, `WALLET_DISCOVERY_REFRESH_SECONDS`.
+- A wallet is monitored only if current Polymarket active positions pass all filters: `MIN_WALLET_ACTIVE_POSITIONS`, `MIN_WALLET_UNIQUE_MARKETS`, `MIN_WALLET_TOTAL_NOTIONAL_USD`, `MAX_WALLET_TOP_MARKET_SHARE`.
 
 Risk checks:
 - Max risk per trade (`RISK_PER_TRADE_PCT`)
@@ -49,6 +35,13 @@ cd /Users/marvin.xa/Desktop/Polymarket
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
+```
+
+Optional: use Makefile shortcuts:
+
+```bash
+make venv
+make install
 ```
 
 2. Configure env:
@@ -70,10 +63,22 @@ python scripts/check_env.py
 polybot --once
 ```
 
+Or via Makefile:
+
+```bash
+make run-once
+```
+
 4. Run continuous:
 
 ```bash
 polybot
+```
+
+Or via Makefile:
+
+```bash
+make run
 ```
 
 ## Dashboard + Bot (One-Click)
@@ -83,9 +88,8 @@ polybot
 - Bot daemon: `polymarket_bot.daemon` writes runtime state to `/tmp/poly_runtime_data/state.json`
 
 Desktop launcher:
-- `一键 poly.app` now starts this repository stack via:
-  - `/Users/marvin.xa/Desktop/Polymarket/scripts/start_poly_stack.sh`
-  - web on `http://127.0.0.1:8787`
+- `一键 poly.app` now starts this repository stack via `/Users/marvin.xa/Desktop/Polymarket/scripts/start_poly_stack.sh`.
+- Web UI is on `http://127.0.0.1:8787`.
 
 ## Live Trading Enablement
 
