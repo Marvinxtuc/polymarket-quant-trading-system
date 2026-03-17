@@ -7,22 +7,22 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="./styles.css?v=20260313a" />
+  <link rel="stylesheet" href="./styles.css?v=20260317s" />
 </head>
 <body>
   <div class="bg-grid"></div>
   <main class="console">
     <header class="panel topbar">
       <section class="brand-wrap">
-        <span class="pill live">实盘</span>
+        <span class="pill paper" id="mode-pill">PAPER</span>
         <div>
           <h1>Polymarket 自动交易系统</h1>
-          <p id="status-line">聪明钱包共识引擎 · 最近刷新 --:--:-- · 下次刷新 --s · 每 --s 轮询</p>
+          <p id="status-line">聪明钱包跟单账本 · 状态时间 --:--:-- · bot 轮询 --s · 前端刷新 5s</p>
         </div>
       </section>
       <section class="top-actions">
         <span class="status"><span class="dot"></span>在线</span>
-        <span class="guard" id="guard-line">账户 --U · 单笔上限 --U · 今日剩余风险 --%</span>
+        <span class="guard" id="guard-line">PAPER · PaperBroker · 基准单笔 --U · 理论上限 --U</span>
         <button class="btn" id="btn-pause-opening">暂停开仓</button>
         <button class="btn ghost" id="btn-reduce-only">只减仓模式</button>
         <button class="btn warn" id="btn-emergency-stop">紧急退出</button>
@@ -30,27 +30,27 @@
     </header>
 
     <section class="panel budget-card">
-      <div class="head"><h2>今日风险预算</h2><span class="mono" id="budget-meta">已使用 --% · 剩余 --% · 预计可开仓 -- 次</span></div>
+      <div class="head"><h2>账本概况</h2><span class="mono" id="budget-meta">槽位 --/-- · 名义金额 --U · 钱包池 --</span></div>
       <div class="budget-line">
-        <div class="budget-fill" id="budget-fill" style="width:32%"></div>
+        <div class="budget-fill" id="budget-fill" style="width:0%"></div>
       </div>
     </section>
 
     <section class="kpi-row">
       <article class="panel kpi">
-        <h3>今日收益</h3>
-        <p class="num good" id="kpi-pnl">$0.00</p>
-        <small id="kpi-equity">权益：-- USDC</small>
+        <h3>执行模式</h3>
+        <p class="num" id="kpi-mode">PAPER</p>
+        <small id="kpi-mode-note">不会发送真实订单</small>
       </article>
       <article class="panel kpi">
-        <h3>当前持仓</h3>
+        <h3>持仓槽位</h3>
         <p class="num" id="kpi-pos">0 / 0</p>
-        <small id="kpi-exp">总敞口：0.00%</small>
+        <small id="kpi-slot-note">槽位利用率 0.00%</small>
       </article>
       <article class="panel kpi">
-        <h3>共识信号</h3>
-        <p class="num" id="kpi-signals">0</p>
-        <small id="kpi-signals-note">每轮最多 0 条</small>
+        <h3>账本名义本金</h3>
+        <p class="num" id="kpi-notional">$0.00</p>
+        <small id="kpi-notional-note">内存账本，不含外部对账</small>
       </article>
       <article class="panel kpi">
         <h3>风控模式</h3>
@@ -60,47 +60,21 @@
     </section>
 
     <section class="main-grid">
-      <div class="col">
-        <article class="panel card">
-          <div class="head"><h2>策略参数</h2><span class="mono" id="param-wallet-pool">wallet_pool=0</span></div>
-          <ul class="list tight">
-            <li><span>单钱包净加仓阈值</span><b id="param-min-increase">-</b></li>
-            <li><span>每轮最大信号数</span><b id="param-max-signals">-</b></li>
-            <li><span>单笔风险</span><b id="param-risk-trade">-</b></li>
-            <li><span>日止损</span><b id="param-risk-day">-</b></li>
-            <li><span>价格带</span><b id="param-price-band">-</b></li>
-            <li><span>加仓冷却</span><b id="param-add-cooldown">-</b></li>
-          </ul>
-        </article>
-
-        <article class="panel card">
-          <div class="head"><h2>钱包监控</h2><span class="mono">可交易视图</span></div>
-          <div class="table-wrap small-scroll">
-            <table class="table">
-              <thead><tr><th>钱包</th><th>可用</th><th>今日PnL</th><th>交易次数</th><th>状态</th><th>最近异常</th></tr></thead>
-              <tbody id="wallets-body">
-                <tr><td colspan="6">等待数据...</td></tr>
-              </tbody>
-            </table>
-          </div>
-        </article>
-      </div>
-
-      <div class="col">
-        <article class="panel card">
+      <div class="main-col primary-col">
+        <article class="panel card card-positions">
           <div class="head"><h2>持仓详情</h2><span class="mono">含退出条件</span></div>
           <div class="table-wrap">
             <table class="table">
-              <thead><tr><th>市场</th><th>方向</th><th>数量</th><th>持仓</th><th>结算</th><th>Edge</th><th>未实现</th><th>理由</th><th>退出条件</th></tr></thead>
+              <thead><tr><th>市场</th><th>方向</th><th>数量</th><th>名义金额</th><th>记录价</th><th>已持有</th><th>理由</th><th>退出条件</th></tr></thead>
               <tbody id="positions-body">
-                <tr><td colspan="9">等待数据...</td></tr>
+                <tr><td colspan="8">等待数据...</td></tr>
               </tbody>
             </table>
           </div>
         </article>
 
-        <article class="panel card">
-          <div class="head"><h2>订单管理</h2><span class="mono">失败原因 + 重试次数</span></div>
+        <article class="panel card card-orders">
+          <div class="head"><h2>订单管理</h2><span class="mono">最近账本事件</span></div>
           <div class="chips">
             <span class="chip active" id="chip-pending">进行中 0</span>
             <span class="chip" id="chip-filled">已成交 0</span>
@@ -109,8 +83,20 @@
           </div>
           <div class="table-wrap small-scroll">
             <table class="table">
-              <thead><tr><th>时间</th><th>市场</th><th>动作</th><th>状态</th><th>重试</th><th>耗时</th><th>原因</th></tr></thead>
+              <thead><tr><th>时间</th><th>市场</th><th>动作</th><th>状态</th><th>原因</th></tr></thead>
               <tbody id="orders-body">
+                <tr><td colspan="5">等待数据...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="panel card card-wallets">
+          <div class="head"><h2>钱包监控</h2><span class="mono">含真实历史表现</span></div>
+          <div class="table-wrap small-scroll">
+            <table class="table">
+              <thead><tr><th>钱包</th><th>评分 / 等级</th><th>历史样本</th><th>ROI</th><th>胜率</th><th>已解析</th><th>最大集中度</th></tr></thead>
+              <tbody id="wallets-body">
                 <tr><td colspan="7">等待数据...</td></tr>
               </tbody>
             </table>
@@ -118,19 +104,65 @@
         </article>
       </div>
 
-      <div class="col">
-        <article class="panel card">
+      <div class="main-col secondary-col">
+        <article class="panel card card-alerts">
           <div class="head"><h2>异常告警中心</h2><span class="mono">Alerts</span></div>
           <ul class="alert-list" id="alerts-list">
             <li><span class="level green">正常</span><span>等待数据...</span></li>
           </ul>
         </article>
 
-        <article class="panel card">
-          <div class="head"><h2>信号源可用性</h2><span class="mono">权重色阶 + 在线状态</span></div>
+        <article class="panel card card-wallet-detail">
+          <div class="head"><h2>聪明钱包画像</h2><span class="mono" id="wallet-detail-title">未选择</span></div>
+          <div class="profile-head" id="wallet-detail-head">
+            <span class="tag danger">等待</span>
+            <span class="mono">点击钱包行查看详情</span>
+          </div>
+          <p class="profile-summary" id="wallet-detail-summary">这里会展示单个钱包的评分逻辑、历史样本和真实表现。</p>
+          <ul class="list tight" id="wallet-detail-list">
+            <li><span>状态</span><b>等待数据...</b></li>
+          </ul>
+          <div class="component-grid" id="wallet-component-grid">
+            <div class="component-card"><span>评分拆解</span><b>等待数据...</b></div>
+          </div>
+          <div class="head compact-head"><h2>题材偏好画像</h2><span class="mono" id="wallet-topic-meta">0 themes</span></div>
+          <div class="topic-grid" id="wallet-topic-grid">
+            <div class="topic-card"><span>题材偏好</span><b>等待数据...</b></div>
+          </div>
+          <div class="head compact-head"><h2>最近已结算样本</h2><span class="mono" id="wallet-detail-history-meta">0 samples</span></div>
           <div class="table-wrap small-scroll">
             <table class="table">
-              <thead><tr><th>来源</th><th>权重</th><th>状态</th><th>更新</th><th>命中率</th></tr></thead>
+              <thead><tr><th>市场</th><th>方向</th><th>结果</th><th>ROI</th><th>盈亏</th></tr></thead>
+              <tbody id="wallet-detail-history-body">
+                <tr><td colspan="5">等待数据...</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="panel card card-strategy">
+          <div class="head"><h2>策略参数</h2><span class="mono" id="param-wallet-pool">wallet_pool=0</span></div>
+          <ul class="list tight">
+            <li><span>单钱包净加仓阈值</span><b id="param-min-increase">-</b></li>
+            <li><span>每轮最大信号数</span><b id="param-max-signals">-</b></li>
+            <li><span>最低钱包评分</span><b id="param-min-wallet-score">-</b></li>
+            <li><span>评分仓位倍率</span><b id="param-score-multipliers">-</b></li>
+            <li><span>历史刷新 / 样本门槛</span><b id="param-history-window">-</b></li>
+            <li><span>题材加权</span><b id="param-topic-bias">-</b></li>
+            <li><span>钱包池偏置</span><b id="param-discovery-bias">-</b></li>
+            <li><span>聪明钱包减仓</span><b id="param-wallet-exit">-</b></li>
+            <li><span>单笔风险</span><b id="param-risk-trade">-</b></li>
+            <li><span>日止损</span><b id="param-risk-day">-</b></li>
+            <li><span>价格带</span><b id="param-price-band">-</b></li>
+            <li><span>加仓冷却</span><b id="param-add-cooldown">-</b></li>
+          </ul>
+        </article>
+
+        <article class="panel card card-sources">
+          <div class="head"><h2>信号源可用性</h2><span class="mono">权重 + 历史质量 + 钱包池优先级</span></div>
+          <div class="table-wrap small-scroll">
+            <table class="table">
+              <thead><tr><th>来源</th><th>评分 / 等级</th><th>权重</th><th>历史概况</th><th>更新</th></tr></thead>
               <tbody id="sources-body">
                 <tr><td colspan="5">等待数据...</td></tr>
               </tbody>
@@ -141,50 +173,242 @@
     </section>
 
     <section class="bottom-grid">
-      <article class="panel chart">
-        <div class="head"><h2>收益曲线</h2><span class="mono">PnL Curve</span></div>
-        <div class="chips">
-          <span class="chip active">1h</span>
-          <span class="chip">6h</span>
-          <span class="chip">24h</span>
-          <span class="chip">7d</span>
+      <article class="panel chart chart-exit-review">
+        <div class="head"><h2>退出复盘</h2><span class="mono" id="exit-review-meta">recent 0 exits</span></div>
+        <div class="review-summary" id="exit-review-summary">
+          <div class="review-chip"><span>最近退出</span><b>等待数据...</b></div>
+          <div class="review-chip"><span>已成交</span><b>--</b></div>
+          <div class="review-chip"><span>已拒绝</span><b>--</b></div>
+          <div class="review-chip"><span>退出金额</span><b>--</b></div>
         </div>
-        <div class="plot">
-          <svg viewBox="0 0 320 92" preserveAspectRatio="none" aria-label="收益曲线">
-            <polyline points="0,65 35,62 70,58 105,60 140,50 175,43 210,37 245,31 280,29 320,24" />
-          </svg>
+        <div class="review-grid">
+          <section class="review-column">
+            <h3>按退出类型</h3>
+            <ul class="review-list" id="exit-review-kind">
+              <li><div class="review-main"><span>等待数据...</span><b>--</b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3>按题材</h3>
+            <ul class="review-list" id="exit-review-topic">
+              <li><div class="review-main"><span>等待数据...</span><b>--</b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3>按来源</h3>
+            <ul class="review-list" id="exit-review-source">
+              <li><div class="review-main"><span>等待数据...</span><b>--</b></div></li>
+            </ul>
+          </section>
+        </div>
+        <div class="review-filter-bar">
+          <span class="mono" id="exit-review-filter-state">全部退出样本</span>
+          <button class="btn ghost btn-mini" id="exit-review-filter-reset">清空筛选</button>
+        </div>
+        <div class="head compact-head"><h2>最近退出样本</h2><span class="mono" id="exit-review-samples-meta">0 samples</span></div>
+        <div class="table-wrap small-scroll">
+          <table class="table">
+            <thead><tr><th>时间</th><th>市场</th><th>退出</th><th>来源 / 题材</th><th>金额 / 摘要</th></tr></thead>
+            <tbody id="exit-review-samples-body">
+              <tr><td colspan="5">等待数据...</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="head compact-head"><h2>退出样本详情</h2><span class="mono" id="exit-review-detail-meta">未选择</span></div>
+        <div class="review-detail">
+          <div class="profile-head" id="exit-review-detail-head">
+            <span class="tag danger">等待</span>
+            <span class="mono">点击退出样本查看详情</span>
+          </div>
+          <p class="profile-summary" id="exit-review-detail-summary">这里会展示单条退出样本的来源钱包、题材、当前持仓上下文和最近一次退出记录。</p>
+          <ul class="list tight" id="exit-review-detail-list">
+            <li><span>状态</span><b>等待数据...</b></li>
+          </ul>
+          <div class="head compact-head"><h2>同 Token 事件链</h2><span class="mono" id="exit-review-detail-chain-meta">0 events</span></div>
+          <ul class="timeline review-chain" id="exit-review-detail-chain">
+            <li><span>--:--</span><b>等待数据...</b></li>
+          </ul>
         </div>
       </article>
 
-      <article class="panel chart">
+      <article class="panel chart chart-risk">
         <div class="head"><h2>风险监控</h2><span class="mono">Drawdown / Exposure</span></div>
         <div class="meters">
-          <div><label>回撤</label><progress id="meter-dd" value="0" max="100"></progress><span id="meter-dd-text">0.0% / 0.0%</span></div>
-          <div><label>总敞口</label><progress id="meter-exp" value="0" max="100"></progress><span id="meter-exp-text">0.0% / 100%</span></div>
+          <div><label>已实现损失使用</label><progress id="meter-dd" value="0" max="100"></progress><span id="meter-dd-text">0.0% / 日损上限</span></div>
+          <div><label>槽位利用率</label><progress id="meter-exp" value="0" max="100"></progress><span id="meter-exp-text">0 / 0</span></div>
           <div><label>加仓冷却命中</label><progress id="meter-cooldown" value="0" max="100"></progress><span id="meter-cooldown-text">0 / 0</span></div>
-          <div><label>仓位利用率</label><progress id="meter-util" value="0" max="100"></progress><span id="meter-util-text">0.0% / 100%</span></div>
+          <div><label>状态时效</label><progress id="meter-util" value="0" max="100"></progress><span id="meter-util-text">0s / 0s</span></div>
         </div>
       </article>
 
-      <article class="panel chart">
-        <div class="head"><h2>系统健康</h2><span class="mono" id="health-runtime">运行中</span></div>
+      <article class="panel chart chart-runtime">
+        <div class="head"><h2>运行概况</h2><span class="mono" id="health-runtime">等待状态</span></div>
         <ul class="health">
-          <li><span>Data API</span><b class="good" id="health-dataapi">-</b></li>
-          <li><span>Polymarket API</span><b class="good" id="health-polyapi">-</b></li>
+          <li><span>状态年龄</span><b class="good" id="health-state-age">-</b></li>
+          <li><span>执行代理</span><b class="good" id="health-broker">-</b></li>
           <li><span>钱包池规模</span><b class="good" id="health-wallet-pool">-</b></li>
           <li><span>Discovery</span><b class="good" id="health-discovery">-</b></li>
-          <li><span>Order Gateway</span><b class="good" id="health-gateway">正常</b></li>
+          <li><span>控制状态</span><b class="good" id="health-control">-</b></li>
         </ul>
       </article>
 
-      <article class="panel chart">
+      <article class="panel chart chart-timeline">
         <div class="head"><h2>自动交易状态时间轴</h2><span class="mono">System Timeline</span></div>
         <ul class="timeline" id="timeline-list">
           <li><span>--:--</span><b>等待数据...</b></li>
         </ul>
       </article>
+
+      <article class="panel chart chart-signal-review chart-span-2">
+        <div class="head"><h2>Signal 快照回放</h2><span class="mono" id="trace-review-meta">recent 0 cycles</span></div>
+        <div class="review-summary" id="trace-review-summary">
+          <div class="review-chip"><span>最近轮次</span><b>等待数据...</b></div>
+          <div class="review-chip"><span>候选信号</span><b>--</b></div>
+          <div class="review-chip"><span>已成交</span><b>--</b></div>
+          <div class="review-chip"><span>已拒绝</span><b>--</b></div>
+          <div class="review-chip"><span>活跃 Trace</span><b>--</b></div>
+          <div class="review-chip"><span>已关闭 Trace</span><b>--</b></div>
+        </div>
+        <div class="signal-review-grid">
+          <section class="review-column">
+            <h3>最近信号轮次</h3>
+            <ul class="review-list" id="trace-review-cycles">
+              <li><div class="review-main"><span>等待数据...</span><b>--</b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <div class="head compact-head"><h2>轮次候选信号</h2><span class="mono" id="trace-review-cycle-meta">0 candidates</span></div>
+            <div class="table-wrap small-scroll">
+              <table class="table">
+                <thead><tr><th>市场</th><th>钱包</th><th>动作</th><th>决策</th><th>订单</th></tr></thead>
+                <tbody id="trace-review-cycle-body">
+                  <tr><td colspan="5">等待数据...</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+        <div class="head compact-head"><h2>Trace 决策链</h2><span class="mono" id="trace-review-detail-meta">未选择</span></div>
+        <div class="review-detail">
+          <div class="profile-head" id="trace-review-detail-head">
+            <span class="tag danger">等待</span>
+            <span class="mono">点击持仓、退出样本或候选信号查看完整链路</span>
+          </div>
+          <p class="profile-summary" id="trace-review-detail-summary">这里会展示同一条 trace 从首次入场到追加、减仓、退出的完整决策链。</p>
+          <ul class="list tight" id="trace-review-detail-list">
+            <li><span>状态</span><b>等待数据...</b></li>
+          </ul>
+          <div class="head compact-head"><h2>决策链</h2><span class="mono" id="trace-review-detail-chain-meta">0 events</span></div>
+          <ul class="timeline review-chain" id="trace-review-detail-chain">
+            <li><span>--:--</span><b>等待数据...</b></li>
+          </ul>
+        </div>
+      </article>
+
+      <article class="panel chart chart-attribution-review chart-span-2">
+        <div class="head"><h2>联合归因报表</h2><span class="mono" id="attribution-review-meta">recent 0 orders</span></div>
+        <div class="review-filter-bar">
+          <div class="chips" id="attribution-window-chips">
+            <span class="chip active" data-window="24h">24h</span>
+            <span class="chip" data-window="7d">7d</span>
+            <span class="chip" data-window="30d">30d</span>
+            <span class="chip" data-window="all">全部</span>
+          </div>
+          <span class="mono" id="attribution-window-meta">24h</span>
+        </div>
+        <div class="review-summary" id="attribution-review-summary">
+          <div class="review-chip"><span>订单数</span><b>等待数据...</b></div>
+          <div class="review-chip"><span>已成交</span><b>--</b></div>
+          <div class="review-chip"><span>已拒绝</span><b>--</b></div>
+          <div class="review-chip"><span>退出数</span><b>--</b></div>
+          <div class="review-chip"><span>高分拒单</span><b>--</b></div>
+          <div class="review-chip"><span>题材数</span><b>--</b></div>
+        </div>
+        <div class="review-grid">
+          <section class="review-column">
+            <h3>按钱包</h3>
+            <ul class="review-list" id="attr-by-wallet">
+              <li><div class="review-main"><span>等待数据...</span><b>--</b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3>按题材</h3>
+            <ul class="review-list" id="attr-by-topic">
+              <li><div class="review-main"><span>等待数据...</span><b>--</b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3>按退出类型</h3>
+            <ul class="review-list" id="attr-by-exit-kind">
+              <li><div class="review-main"><span>等待数据...</span><b>--</b></div></li>
+            </ul>
+          </section>
+        </div>
+        <div class="head compact-head"><h2>钱包 x 题材</h2><span class="mono" id="attr-wallet-topic-meta">0 rows</span></div>
+        <div class="table-wrap small-scroll">
+          <table class="table">
+            <thead><tr><th>钱包</th><th>题材</th><th>成交 / 拒单</th><th>金额</th><th>持有</th></tr></thead>
+            <tbody id="attr-wallet-topic-body">
+              <tr><td colspan="5">等待数据...</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="head compact-head"><h2>题材 x 退出类型</h2><span class="mono" id="attr-topic-exit-meta">0 rows</span></div>
+        <div class="table-wrap small-scroll">
+          <table class="table">
+            <thead><tr><th>题材</th><th>退出类型</th><th>成交 / 拒单</th><th>金额</th><th>持有</th></tr></thead>
+            <tbody id="attr-topic-exit-body">
+              <tr><td colspan="5">等待数据...</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="head compact-head"><h2>来源 x 结果</h2><span class="mono" id="attr-source-result-meta">0 rows</span></div>
+        <div class="table-wrap small-scroll">
+          <table class="table">
+            <thead><tr><th>来源</th><th>结果</th><th>次数</th><th>金额</th><th>拒单率</th></tr></thead>
+            <tbody id="attr-source-result-body">
+              <tr><td colspan="5">等待数据...</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="review-grid">
+          <section class="review-column">
+            <h3>拒单归因</h3>
+            <ul class="review-list" id="attr-reject-reasons">
+              <li><div class="review-main"><span>等待数据...</span><b>--</b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3>持有时长</h3>
+            <ul class="review-list" id="attr-hold-buckets">
+              <li><div class="review-main"><span>等待数据...</span><b>--</b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3>Top / Bottom</h3>
+            <div class="component-grid">
+              <div class="component-card">
+                <span>Top Wallets</span>
+                <div class="rank-list" id="attr-top-wallets"><span>等待数据...</span></div>
+              </div>
+              <div class="component-card">
+                <span>Bottom Wallets</span>
+                <div class="rank-list" id="attr-bottom-wallets"><span>等待数据...</span></div>
+              </div>
+              <div class="component-card">
+                <span>Top Topics</span>
+                <div class="rank-list" id="attr-top-topics"><span>等待数据...</span></div>
+              </div>
+              <div class="component-card">
+                <span>Bottom Topics</span>
+                <div class="rank-list" id="attr-bottom-topics"><span>等待数据...</span></div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </article>
     </section>
   </main>
-  <script src="./app.js?v=20260313a"></script>
+  <script src="./app.js?v=20260317q"></script>
 </body>
 </html>

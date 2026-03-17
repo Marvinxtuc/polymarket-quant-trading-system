@@ -33,6 +33,8 @@ class _FakeClient:
 
 def _signal(side: str) -> Signal:
     return Signal(
+        signal_id="",
+        trace_id="",
         wallet="0x1111111111111111111111111111111111111111",
         market_slug="demo",
         token_id="token-1",

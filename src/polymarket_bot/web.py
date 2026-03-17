@@ -10,6 +10,11 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 
+class ReusableThreadingHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
+
+
 def _safe_write_json(path: str, payload: dict) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp_path = f"{path}.tmp"
@@ -22,6 +27,9 @@ def _empty_state() -> dict:
     return {
         "ts": 0,
         "config": {
+            "dry_run": True,
+            "execution_mode": "paper",
+            "broker_name": "PaperBroker",
             "poll_interval_seconds": 0,
             "bankroll_usd": 0.0,
             "risk_per_trade_pct": 0.0,
@@ -30,6 +38,30 @@ def _empty_state() -> dict:
             "min_wallet_increase_usd": 0.0,
             "max_signals_per_cycle": 0,
             "wallet_pool_size": 0,
+            "min_wallet_score": 0.0,
+            "wallet_history_refresh_seconds": 0,
+            "wallet_history_max_wallets": 0,
+            "history_min_closed_positions": 0,
+            "history_strong_closed_positions": 0,
+            "history_strong_resolved_markets": 0,
+            "wallet_score_watch_multiplier": 0.0,
+            "wallet_score_trade_multiplier": 0.0,
+            "wallet_score_core_multiplier": 0.0,
+            "topic_bias_enabled": False,
+            "topic_min_samples": 0,
+            "topic_positive_roi": 0.0,
+            "topic_positive_win_rate": 0.0,
+            "topic_negative_roi": 0.0,
+            "topic_negative_win_rate": 0.0,
+            "topic_boost_multiplier": 0.0,
+            "topic_penalty_multiplier": 0.0,
+            "wallet_exit_follow_enabled": False,
+            "min_wallet_decrease_usd": 0.0,
+            "resonance_exit_enabled": False,
+            "resonance_min_wallets": 0,
+            "resonance_min_wallet_score": 0.0,
+            "resonance_trim_fraction": 0.0,
+            "resonance_core_exit_fraction": 0.0,
             "token_add_cooldown_seconds": 0,
             "token_reentry_cooldown_seconds": 0,
             "stale_position_minutes": 0,
@@ -43,6 +75,10 @@ def _empty_state() -> dict:
             "max_price": 0.0,
             "wallet_discovery_enabled": False,
             "wallet_discovery_mode": "",
+            "wallet_discovery_quality_bias_enabled": False,
+            "wallet_discovery_quality_top_n": 0,
+            "wallet_discovery_history_bonus": 0.0,
+            "wallet_discovery_topic_bonus": 0.0,
         },
         "control": {
             "pause_opening": False,
@@ -55,12 +91,19 @@ def _empty_state() -> dict:
             "equity": 0.0,
             "open_positions": 0,
             "max_open_positions": 0,
+            "slot_utilization_pct": 0.0,
             "exposure_pct": 0.0,
             "signals": 0,
+            "tracked_notional_usd": 0.0,
+            "available_notional_usd": 0.0,
+            "notional_utilization_pct": 0.0,
+            "base_per_trade_notional": 0.0,
+            "theoretical_max_order_notional": 0.0,
             "per_trade_notional": 0.0,
             "daily_loss_budget_usd": 0.0,
             "daily_loss_used_pct": 0.0,
             "daily_loss_remaining_pct": 0.0,
+            "slot_remaining": 0,
             "est_openings": 0,
         },
         "positions": [],
@@ -69,6 +112,158 @@ def _empty_state() -> dict:
         "sources": [],
         "alerts": [],
         "timeline": [],
+        "exit_review": {
+            "summary": {
+                "total_exit_orders": 0,
+                "filled_exit_orders": 0,
+                "rejected_exit_orders": 0,
+                "total_notional": 0.0,
+                "latest_exit_ts": 0,
+                "topics": 0,
+                "sources": 0,
+                "avg_hold_minutes": 0.0,
+                "max_hold_minutes": 0,
+            },
+            "by_kind": [],
+            "by_topic": [],
+            "by_source": [],
+            "recent_exits": [],
+        },
+        "signal_review": {
+            "summary": {
+                "cycles": 0,
+                "candidates": 0,
+                "filled": 0,
+                "rejected": 0,
+                "skipped": 0,
+                "traces": 0,
+                "open_traces": 0,
+                "closed_traces": 0,
+            },
+            "cycles": [],
+            "traces": [],
+        },
+        "attribution_review": {
+            "summary": {
+                "windows": ["24h", "7d", "30d", "all"],
+                "available_orders": 0,
+                "available_exits": 0,
+            },
+            "windows": {
+                "24h": {
+                    "key": "24h",
+                    "label": "24h",
+                    "summary": {
+                        "order_count": 0,
+                        "filled_count": 0,
+                        "rejected_count": 0,
+                        "exit_count": 0,
+                        "wallets": 0,
+                        "topics": 0,
+                        "exit_types": 0,
+                        "reject_high_score_count": 0,
+                    },
+                    "by_wallet": [],
+                    "by_topic": [],
+                    "by_exit_kind": [],
+                    "wallet_topic": [],
+                    "topic_exit": [],
+                    "source_result": [],
+                    "reject_reasons": [],
+                    "hold_buckets": [],
+                    "rankings": {
+                        "top_wallets": [],
+                        "bottom_wallets": [],
+                        "top_topics": [],
+                        "bottom_topics": [],
+                    },
+                },
+                "7d": {
+                    "key": "7d",
+                    "label": "7d",
+                    "summary": {
+                        "order_count": 0,
+                        "filled_count": 0,
+                        "rejected_count": 0,
+                        "exit_count": 0,
+                        "wallets": 0,
+                        "topics": 0,
+                        "exit_types": 0,
+                        "reject_high_score_count": 0,
+                    },
+                    "by_wallet": [],
+                    "by_topic": [],
+                    "by_exit_kind": [],
+                    "wallet_topic": [],
+                    "topic_exit": [],
+                    "source_result": [],
+                    "reject_reasons": [],
+                    "hold_buckets": [],
+                    "rankings": {
+                        "top_wallets": [],
+                        "bottom_wallets": [],
+                        "top_topics": [],
+                        "bottom_topics": [],
+                    },
+                },
+                "30d": {
+                    "key": "30d",
+                    "label": "30d",
+                    "summary": {
+                        "order_count": 0,
+                        "filled_count": 0,
+                        "rejected_count": 0,
+                        "exit_count": 0,
+                        "wallets": 0,
+                        "topics": 0,
+                        "exit_types": 0,
+                        "reject_high_score_count": 0,
+                    },
+                    "by_wallet": [],
+                    "by_topic": [],
+                    "by_exit_kind": [],
+                    "wallet_topic": [],
+                    "topic_exit": [],
+                    "source_result": [],
+                    "reject_reasons": [],
+                    "hold_buckets": [],
+                    "rankings": {
+                        "top_wallets": [],
+                        "bottom_wallets": [],
+                        "top_topics": [],
+                        "bottom_topics": [],
+                    },
+                },
+                "all": {
+                    "key": "all",
+                    "label": "全部",
+                    "summary": {
+                        "order_count": 0,
+                        "filled_count": 0,
+                        "rejected_count": 0,
+                        "exit_count": 0,
+                        "wallets": 0,
+                        "topics": 0,
+                        "exit_types": 0,
+                        "reject_high_score_count": 0,
+                    },
+                    "by_wallet": [],
+                    "by_topic": [],
+                    "by_exit_kind": [],
+                    "wallet_topic": [],
+                    "topic_exit": [],
+                    "source_result": [],
+                    "reject_reasons": [],
+                    "hold_buckets": [],
+                    "rankings": {
+                        "top_wallets": [],
+                        "bottom_wallets": [],
+                        "top_topics": [],
+                        "bottom_topics": [],
+                    },
+                },
+            },
+        },
     }
 
 
@@ -217,7 +412,7 @@ def main() -> None:
     frontend = frontend.resolve()
 
     handler = build_handler(str(frontend), args.state_path, args.control_path, args.control_token)
-    server = ThreadingHTTPServer((args.host, args.port), handler)
+    server = ReusableThreadingHTTPServer((args.host, args.port), handler)
     try:
         server.serve_forever()
     finally:

@@ -12,6 +12,7 @@ __pycache__/
 # Secrets / local config
 .env
 **/.env
+.env.bak_*
 !.env.example
 !**/.env.example
 

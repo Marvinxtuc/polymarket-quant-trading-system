@@ -23,7 +23,10 @@ def setup_logger(level: str) -> None:
 
 
 def build_trader(settings: Settings) -> Trader:
-    data_client = PolymarketDataClient(settings.polymarket_data_api)
+    data_client = PolymarketDataClient(
+        settings.polymarket_data_api,
+        market_base_url=settings.polymarket_clob_host,
+    )
     strategy = WalletFollowerStrategy(
         client=data_client,
         min_increase_usd=settings.min_wallet_increase_usd,
@@ -32,6 +35,14 @@ def build_trader(settings: Settings) -> Trader:
         min_unique_markets=settings.min_wallet_unique_markets,
         min_total_notional_usd=settings.min_wallet_total_notional_usd,
         max_top_market_share=settings.max_wallet_top_market_share,
+        min_wallet_score=settings.min_wallet_score,
+        min_decrease_usd=settings.min_wallet_decrease_usd,
+        follow_wallet_exits=settings.wallet_exit_follow_enabled,
+        resonance_exit_enabled=settings.resonance_exit_enabled,
+        resonance_min_wallets=settings.resonance_min_wallets,
+        resonance_min_wallet_score=settings.resonance_min_wallet_score,
+        resonance_trim_fraction=settings.resonance_trim_fraction,
+        resonance_core_exit_fraction=settings.resonance_core_exit_fraction,
     )
     risk = RiskManager(settings)
 

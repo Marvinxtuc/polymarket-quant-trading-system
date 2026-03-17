@@ -1,0 +1,213 @@
+from __future__ import annotations
+
+import unittest
+from typing import Any
+
+from polymarket_bot.clients.data_api import PolymarketDataClient
+
+
+class _StubDataClient(PolymarketDataClient):
+    def __init__(self, responder):
+        self.base_url = "https://data-api.polymarket.com"
+        self.market_base_url = "https://clob.polymarket.com"
+        self.gamma_base_url = "https://gamma-api.polymarket.com"
+        self._responder = responder
+        self.calls: list[tuple[str, str, dict[str, Any]]] = []
+
+    def close(self) -> None:
+        return None
+
+    def _get_json_from_base(
+        self,
+        base_url: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+    ) -> Any:
+        normalized = dict(params or {})
+        self.calls.append((base_url, path, normalized))
+        return self._responder(base_url, path, normalized)
+
+
+class DataApiClientTests(unittest.TestCase):
+    def test_get_user_trades_parses_rows_and_requests_maker_fills(self):
+        def responder(base_url: str, path: str, params: dict[str, Any]) -> Any:
+            self.assertEqual(base_url, "https://data-api.polymarket.com")
+            self.assertEqual(path, "/trades")
+            self.assertFalse(params["takerOnly"])
+            return [
+                {
+                    "proxyWallet": "0x1111111111111111111111111111111111111111",
+                    "side": "BUY",
+                    "asset": "token-1",
+                    "conditionId": "condition-1",
+                    "size": 25,
+                    "price": 0.61,
+                    "timestamp": 123456,
+                    "slug": "market-1",
+                    "outcome": "YES",
+                    "transactionHash": "0xabc",
+                }
+            ]
+
+        client = _StubDataClient(responder)
+
+        fills = client.get_user_trades("0x1111111111111111111111111111111111111111")
+
+        self.assertEqual(len(fills), 1)
+        self.assertEqual(fills[0].wallet, "0x1111111111111111111111111111111111111111")
+        self.assertEqual(fills[0].token_id, "token-1")
+        self.assertEqual(fills[0].condition_id, "condition-1")
+        self.assertEqual(fills[0].price, 0.61)
+        self.assertEqual(fills[0].tx_hash, "0xabc")
+
+    def test_iter_closed_positions_paginates_with_offset(self):
+        pages = {
+            0: [
+                {
+                    "proxyWallet": "0x1111111111111111111111111111111111111111",
+                    "asset": "token-1",
+                    "conditionId": "condition-1",
+                    "slug": "market-1",
+                    "outcome": "YES",
+                    "avgPrice": 0.55,
+                    "totalBought": 100,
+                    "realizedPnl": 18,
+                    "timestamp": 101,
+                    "endDate": "2026-03-01T00:00:00Z",
+                },
+                {
+                    "proxyWallet": "0x1111111111111111111111111111111111111111",
+                    "asset": "token-2",
+                    "conditionId": "condition-2",
+                    "slug": "market-2",
+                    "outcome": "NO",
+                    "avgPrice": 0.45,
+                    "totalBought": 80,
+                    "realizedPnl": -4,
+                    "timestamp": 102,
+                    "endDate": "2026-03-02T00:00:00Z",
+                },
+            ],
+            2: [
+                {
+                    "proxyWallet": "0x1111111111111111111111111111111111111111",
+                    "asset": "token-3",
+                    "conditionId": "condition-3",
+                    "slug": "market-3",
+                    "outcome": "YES",
+                    "avgPrice": 0.38,
+                    "totalBought": 60,
+                    "realizedPnl": 12,
+                    "timestamp": 103,
+                    "endDate": "2026-03-03T00:00:00Z",
+                }
+            ],
+        }
+
+        def responder(base_url: str, path: str, params: dict[str, Any]) -> Any:
+            self.assertEqual(base_url, "https://data-api.polymarket.com")
+            self.assertEqual(path, "/closed-positions")
+            return pages[params["offset"]]
+
+        client = _StubDataClient(responder)
+
+        positions = list(
+            client.iter_closed_positions(
+                "0x1111111111111111111111111111111111111111",
+                page_size=2,
+                max_pages=5,
+            )
+        )
+
+        self.assertEqual(len(positions), 3)
+        self.assertEqual([call[2]["offset"] for call in client.calls], [0, 2])
+        self.assertEqual(positions[-1].condition_id, "condition-3")
+
+    def test_build_resolution_map_prefers_gamma_market_lookup(self):
+        def responder(base_url: str, path: str, params: dict[str, Any]) -> Any:
+            self.assertEqual(path, "/markets")
+            self.assertEqual(base_url, "https://gamma-api.polymarket.com")
+            self.assertEqual(params["slug"], "market-3")
+            return [
+                {
+                    "conditionId": "condition-3",
+                    "closed": True,
+                    "outcomes": "[\"YES\", \"NO\"]",
+                    "outcomePrices": "[\"0\", \"1\"]",
+                    "clobTokenIds": "[\"token-x\", \"token-y\"]",
+                }
+            ]
+
+        client = _StubDataClient(responder)
+
+        resolution_map = client.build_resolution_map(
+            {"condition-3"},
+            market_slugs={"condition-3": "market-3"},
+        )
+
+        self.assertEqual(set(resolution_map), {"condition-3"})
+        self.assertEqual(resolution_map["condition-3"].winner_token_id, "token-y")
+        self.assertEqual(resolution_map["condition-3"].winner_outcome, "NO")
+        self.assertTrue(resolution_map["condition-3"].closed)
+        self.assertEqual([(call[0], call[1]) for call in client.calls], [("https://gamma-api.polymarket.com", "/markets")])
+
+    def test_build_resolution_map_extracts_winner_from_simplified_markets(self):
+        def responder(base_url: str, path: str, params: dict[str, Any]) -> Any:
+            if base_url == "https://gamma-api.polymarket.com":
+                self.assertEqual(path, "/markets")
+                return []
+
+            self.assertEqual(base_url, "https://clob.polymarket.com")
+            self.assertEqual(path, "/simplified-markets")
+            if params.get("next_cursor") == "cursor-2":
+                return {
+                    "limit": 100,
+                    "count": 1,
+                    "next_cursor": "LTE=",
+                    "data": [
+                        {
+                            "condition_id": "condition-3",
+                            "closed": True,
+                            "tokens": [
+                                {"token_id": "token-x", "outcome": "YES", "winner": False},
+                                {"token_id": "token-y", "outcome": "NO", "winner": True},
+                            ],
+                        }
+                    ],
+                }
+            return {
+                "limit": 100,
+                "count": 2,
+                "next_cursor": "cursor-2",
+                "data": [
+                    {
+                        "condition_id": "condition-1",
+                        "closed": True,
+                        "tokens": [
+                            {"token_id": "token-a", "outcome": "YES", "winner": True},
+                            {"token_id": "token-b", "outcome": "NO", "winner": False},
+                        ],
+                    }
+                ],
+            }
+
+        client = _StubDataClient(responder)
+
+        resolution_map = client.build_resolution_map({"condition-3"})
+
+        self.assertEqual(set(resolution_map), {"condition-3"})
+        self.assertEqual(resolution_map["condition-3"].winner_token_id, "token-y")
+        self.assertEqual(resolution_map["condition-3"].winner_outcome, "NO")
+        self.assertTrue(resolution_map["condition-3"].closed)
+        self.assertEqual(
+            [(call[0], call[2].get("next_cursor"), call[2].get("conditionId")) for call in client.calls],
+            [
+                ("https://gamma-api.polymarket.com", None, "condition-3"),
+                ("https://clob.polymarket.com", None, None),
+                ("https://clob.polymarket.com", "cursor-2", None),
+            ],
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
