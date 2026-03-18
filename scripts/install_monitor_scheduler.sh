@@ -8,10 +8,12 @@ LABEL="com.poly.market.monitor-reports"
 PLIST="$LAUNCHD_DIR/$LABEL.plist"
 UID_NUM="$(id -u)"
 RUNTIME_DIR="/tmp/poly_monitor_reports"
+BUNDLE_DIR="/tmp/poly_monitor_scheduler_bundle"
 MODE="${MONITOR_MODE:-both}"
 ROTATE_KEEP="${ROTATE_KEEP:-24}"
 METHOD_FILE="$RUNTIME_DIR/method"
 START_TS="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+FORCE_NOHUP="${MONITOR_FORCE_NOHUP:-0}"
 
 if [[ ! -x "$LAUNCHCTL_BIN" ]]; then
   echo "launchctl not available" >&2
@@ -22,9 +24,11 @@ mkdir -p "$RUNTIME_DIR"
 if [[ ! -d "$LAUNCHD_DIR" ]]; then
   mkdir -p "$LAUNCHD_DIR"
 fi
-if [[ ! -w "$LAUNCHD_DIR" ]]; then
-  echo "LaunchAgents directory not writable: $LAUNCHD_DIR" >&2
-  echo "Fallback to nohup background mode: run monitor reports directly via launch script." >&2
+
+start_nohup_monitor() {
+  if [[ -n "${1:-}" ]]; then
+    echo "$1" >&2
+  fi
 
   # ensure old launcher is stopped before fallback start
   "$BASE/scripts/stop_monitor_reports.sh" >/dev/null 2>&1 || true
@@ -41,7 +45,28 @@ EOF_METHOD
   echo "monitor reports started via nohup: mode=$MODE pid=$nohup_pid"
   echo "nohup_stdout=$RUNTIME_DIR/monitor-reports-nohup.log"
   exit 0
+}
+
+prepare_launchd_bundle() {
+  mkdir -p "$BUNDLE_DIR/scripts"
+  cp "$BASE/scripts/run_monitor_reports.sh" "$BUNDLE_DIR/scripts/run_monitor_reports.sh"
+  cp "$BASE/scripts/monitor_thresholds_30m.sh" "$BUNDLE_DIR/scripts/monitor_thresholds_30m.sh"
+  cp "$BASE/scripts/monitor_thresholds_12h.sh" "$BUNDLE_DIR/scripts/monitor_thresholds_12h.sh"
+  chmod +x \
+    "$BUNDLE_DIR/scripts/run_monitor_reports.sh" \
+    "$BUNDLE_DIR/scripts/monitor_thresholds_30m.sh" \
+    "$BUNDLE_DIR/scripts/monitor_thresholds_12h.sh"
+}
+
+if [[ "$FORCE_NOHUP" == "1" ]]; then
+  start_nohup_monitor "MONITOR_FORCE_NOHUP=1, using nohup background mode."
 fi
+
+if [[ ! -w "$LAUNCHD_DIR" ]]; then
+  start_nohup_monitor "LaunchAgents directory not writable: $LAUNCHD_DIR"
+fi
+
+prepare_launchd_bundle
 
 cat > "$PLIST" <<EOF_INNER
 <?xml version="1.0" encoding="UTF-8"?>
@@ -51,17 +76,17 @@ cat > "$PLIST" <<EOF_INNER
   <key>Label</key><string>$LABEL</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
-  <key>WorkingDirectory</key><string>$BASE</string>
+  <key>WorkingDirectory</key><string>$BUNDLE_DIR</string>
   <key>ProgramArguments</key>
   <array>
     <string>/bin/bash</string>
-    <string>$BASE/scripts/run_monitor_reports.sh</string>
+    <string>$BUNDLE_DIR/scripts/run_monitor_reports.sh</string>
     <string>$MODE</string>
   </array>
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
     <key>ROTATE_KEEP</key>
     <string>$ROTATE_KEEP</string>
   </dict>

@@ -50,8 +50,14 @@ class Settings(BaseSettings):
     resonance_min_wallet_score: float = Field(default=65.0, ge=0.0, le=100.0)
     resonance_trim_fraction: float = Field(default=0.35, gt=0.0, le=1.0)
     resonance_core_exit_fraction: float = Field(default=0.6, gt=0.0, le=1.0)
+    wallet_signal_source: str = "hybrid"
+    wallet_signal_lookback_seconds: int = Field(default=900, ge=60, le=86400)
+    wallet_signal_page_size: int = Field(default=100, ge=10, le=500)
+    wallet_signal_max_pages: int = Field(default=2, ge=1, le=10)
     min_wallet_increase_usd: float = Field(default=300.0, ge=1.0)
     max_signals_per_cycle: int = Field(default=5, ge=1)
+    portfolio_netting_enabled: bool = True
+    max_condition_exposure_pct: float = Field(default=0.015, gt=0.0, le=0.25)
     min_wallet_active_positions: int = Field(default=2, ge=1)
     min_wallet_unique_markets: int = Field(default=2, ge=1)
     min_wallet_total_notional_usd: float = Field(default=500.0, ge=0.0)
@@ -65,6 +71,13 @@ class Settings(BaseSettings):
     congested_utilization_threshold: float = Field(default=0.8, gt=0, le=1)
     congested_stale_minutes: int = Field(default=10, ge=1, le=1440)
     congested_trim_pct: float = Field(default=0.75, gt=0, lt=1)
+    replay_entry_slippage_bps: float = Field(default=0.0, ge=0.0, le=500.0)
+    replay_exit_slippage_bps: float = Field(default=0.0, ge=0.0, le=500.0)
+    replay_taker_fee_bps: float = Field(default=0.0, ge=0.0, le=500.0)
+    replay_entry_spread_multiplier: float = Field(default=0.0, ge=0.0, le=2.0)
+    replay_exit_spread_multiplier: float = Field(default=0.0, ge=0.0, le=2.0)
+    replay_edge_price_penalty_bps: float = Field(default=0.0, ge=0.0, le=200.0)
+    replay_fee_keywords: str = "crypto,加密,ncaab,serie a,serie-a,seriea"
 
     # Risk
     bankroll_usd: float = Field(default=5000.0, ge=100.0)
@@ -80,11 +93,26 @@ class Settings(BaseSettings):
     polymarket_clob_host: str = "https://clob.polymarket.com"
     runtime_state_path: str = "/tmp/poly_runtime_data/runtime_state.json"
     event_log_path: str = "/tmp/poly_runtime_data/events.ndjson"
+    ledger_path: str = "/tmp/poly_runtime_data/ledger.jsonl"
     runtime_reconcile_interval_seconds: int = Field(default=180, ge=60, le=3600)
+    account_sync_refresh_seconds: int = Field(default=300, ge=60, le=3600)
     order_dedup_ttl_seconds: int = Field(default=120, ge=1, le=3600)
+    pending_order_timeout_seconds: int = Field(default=1800, ge=60, le=86400)
+    user_stream_enabled: bool = True
+    user_stream_url: str = "wss://ws-subscriptions-clob.polymarket.com/ws/user"
+    user_stream_ping_interval_seconds: int = Field(default=10, ge=5, le=120)
+    user_stream_reconnect_seconds: int = Field(default=5, ge=1, le=120)
+    user_stream_buffer_size: int = Field(default=1000, ge=100, le=10000)
+
+    # Live admission gate
+    live_network_smoke_max_age_seconds: int = Field(default=43200, ge=60, le=604800)
+    live_allowance_ready: bool = False
+    live_geoblock_ready: bool = False
+    live_account_ready: bool = False
 
     # Optional live-trading auth
     chain_id: int = 137
+    clob_signature_type: int = Field(default=0, ge=0, le=2)
     private_key: str = ""
     funder_address: str = ""
 
@@ -103,3 +131,7 @@ class Settings(BaseSettings):
                 value = f"/{value}"
             values.append(value)
         return values
+
+    @property
+    def replay_fee_keyword_list(self) -> list[str]:
+        return [value.strip().lower() for value in self.replay_fee_keywords.split(",") if value.strip()]

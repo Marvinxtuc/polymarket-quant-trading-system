@@ -88,7 +88,8 @@ def main() -> int:
     if recommended:
         print("\nrecommended:")
         print(
-            f"{recommended.get('scenario')} | cashflow_proxy={float(recommended.get('cashflow_proxy') or 0.0):.2f} "
+            f"{recommended.get('scenario')} | gross_cashflow={float(recommended.get('cashflow_proxy') or 0.0):.2f} "
+            f"| net_cashflow={float(recommended.get('net_cashflow_proxy') or 0.0):.2f} "
             f"| reject_rate={float(recommended.get('reject_rate') or 0.0):.1%} "
             f"| avg_hold={float(recommended.get('avg_hold_minutes') or 0.0):.1f}m"
         )

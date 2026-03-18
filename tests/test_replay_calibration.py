@@ -157,6 +157,179 @@ class ReplayCalibrationTests(unittest.TestCase):
         self.assertEqual(matrix["rows"][0]["sample_count"], 1)
         self.assertEqual(matrix["rows"][0]["topic_filter"], ["加密"])
 
+    def test_fee_and_slippage_reduce_net_cashflow(self) -> None:
+        samples = [
+            {
+                "status": "FILLED",
+                "flow": "entry",
+                "decision_max_notional": 100.0,
+                "wallet_score": 80.0,
+                "topic_label": "加密",
+                "market_slug": "btc-market",
+            },
+            {
+                "status": "FILLED",
+                "flow": "exit",
+                "exit_kind": "smart_wallet_exit",
+                "filled_notional": 60.0,
+                "topic_label": "加密",
+                "market_slug": "btc-market",
+            },
+        ]
+        scenario = ReplayScenario.from_mapping(
+            {
+                "name": "fees-on",
+                "entry_slippage_bps": 10,
+                "exit_slippage_bps": 20,
+                "taker_fee_bps": 50,
+                "fee_keywords": ["加密"],
+            },
+            self.settings,
+        )
+
+        row = evaluate_replay_scenario(samples, scenario)
+
+        self.assertAlmostEqual(row["fee_enabled_entry_notional"], 100.0, places=4)
+        self.assertAlmostEqual(row["fee_enabled_exit_notional"], 60.0, places=4)
+        self.assertAlmostEqual(row["estimated_fees"], 0.8, places=4)
+        self.assertAlmostEqual(row["slippage_cost"], 0.22, places=4)
+        self.assertAlmostEqual(row["cashflow_proxy"], -40.0, places=4)
+        self.assertAlmostEqual(row["net_cashflow_proxy"], -41.02, places=4)
+
+    def test_fee_keywords_only_apply_to_matching_topics(self) -> None:
+        samples = [
+            {
+                "status": "FILLED",
+                "flow": "entry",
+                "decision_max_notional": 100.0,
+                "wallet_score": 80.0,
+                "topic_label": "加密",
+                "market_slug": "btc-market",
+            },
+            {
+                "status": "FILLED",
+                "flow": "entry",
+                "decision_max_notional": 80.0,
+                "wallet_score": 80.0,
+                "topic_label": "政治",
+                "market_slug": "election-market",
+            },
+        ]
+        scenario = ReplayScenario.from_mapping(
+            {
+                "name": "crypto-fees",
+                "taker_fee_bps": 50,
+                "fee_keywords": "加密,crypto",
+            },
+            self.settings,
+        )
+
+        row = evaluate_replay_scenario(samples, scenario)
+
+        self.assertAlmostEqual(row["fee_enabled_entry_notional"], 100.0, places=4)
+        self.assertAlmostEqual(row["estimated_fees"], 0.5, places=4)
+
+    def test_load_replay_samples_derives_market_spread_metrics(self) -> None:
+        events_path = _write_events(
+            [
+                {
+                    "type": "order_reconciled",
+                    "ts": 1700000000,
+                    "market_slug": "btc-market",
+                    "token_id": "token-a",
+                    "side": "BUY",
+                    "decision_max_notional": 100.0,
+                    "requested_price": 0.51,
+                    "price": 0.51,
+                    "best_bid": 0.48,
+                    "best_ask": 0.52,
+                    "midpoint": 0.50,
+                    "wallet_score": 80.0,
+                    "topic_label": "加密",
+                }
+            ]
+        )
+
+        samples = load_replay_samples(events_path)
+
+        self.assertEqual(len(samples), 1)
+        self.assertEqual(samples[0]["status"], "FILLED")
+        self.assertAlmostEqual(samples[0]["market_spread_bps"], 800.0, places=4)
+        self.assertAlmostEqual(samples[0]["requested_vs_mid_bps"], 200.0, places=4)
+        self.assertEqual(samples[0]["market_slug"], "btc-market")
+
+    def test_spread_aware_slippage_uses_sample_market_context(self) -> None:
+        samples = [
+            {
+                "status": "FILLED",
+                "flow": "entry",
+                "decision_max_notional": 100.0,
+                "wallet_score": 80.0,
+                "topic_label": "加密",
+                "market_slug": "btc-market",
+                "requested_price": 0.51,
+                "best_bid": 0.48,
+                "best_ask": 0.52,
+                "midpoint": 0.50,
+                "market_spread_bps": 800.0,
+            },
+            {
+                "status": "FILLED",
+                "flow": "exit",
+                "exit_kind": "smart_wallet_exit",
+                "filled_notional": 60.0,
+                "topic_label": "加密",
+                "market_slug": "btc-market",
+                "requested_price": 0.49,
+                "best_bid": 0.49,
+                "best_ask": 0.51,
+                "midpoint": 0.50,
+                "market_spread_bps": 400.0,
+            },
+        ]
+        scenario = ReplayScenario.from_mapping(
+            {
+                "name": "spread-aware",
+                "entry_spread_multiplier": 0.25,
+                "exit_spread_multiplier": 0.1,
+            },
+            self.settings,
+        )
+
+        row = evaluate_replay_scenario(samples, scenario)
+
+        self.assertAlmostEqual(row["avg_effective_entry_slippage_bps"], 200.0, places=4)
+        self.assertAlmostEqual(row["avg_effective_exit_slippage_bps"], 40.0, places=4)
+        self.assertEqual(row["spread_aware_samples"], 2)
+        self.assertAlmostEqual(row["slippage_cost"], 2.24, places=4)
+        self.assertAlmostEqual(row["cashflow_proxy"], -40.0, places=4)
+        self.assertAlmostEqual(row["net_cashflow_proxy"], -42.24, places=4)
+
+    def test_edge_price_penalty_adds_slippage_for_extreme_price_band(self) -> None:
+        samples = [
+            {
+                "status": "FILLED",
+                "flow": "entry",
+                "decision_max_notional": 100.0,
+                "wallet_score": 80.0,
+                "topic_label": "政治",
+                "market_slug": "election-market",
+                "requested_price": 0.9,
+            }
+        ]
+        scenario = ReplayScenario.from_mapping(
+            {
+                "name": "edge-penalty",
+                "edge_price_penalty_bps": 10.0,
+            },
+            self.settings,
+        )
+
+        row = evaluate_replay_scenario(samples, scenario)
+
+        self.assertAlmostEqual(row["avg_effective_entry_slippage_bps"], 10.0, places=4)
+        self.assertAlmostEqual(row["slippage_cost"], 0.1, places=4)
+
     def test_samples_can_be_filtered_by_wallet_pool_version(self) -> None:
         events_path = _write_events(
             [

@@ -43,6 +43,10 @@ def build_trader(settings: Settings) -> Trader:
         resonance_min_wallet_score=settings.resonance_min_wallet_score,
         resonance_trim_fraction=settings.resonance_trim_fraction,
         resonance_core_exit_fraction=settings.resonance_core_exit_fraction,
+        signal_source=settings.wallet_signal_source,
+        signal_lookback_seconds=settings.wallet_signal_lookback_seconds,
+        signal_page_size=settings.wallet_signal_page_size,
+        signal_max_pages=settings.wallet_signal_max_pages,
     )
     risk = RiskManager(settings)
 
@@ -56,6 +60,13 @@ def build_trader(settings: Settings) -> Trader:
             chain_id=settings.chain_id,
             private_key=settings.private_key,
             funder=settings.funder_address,
+            market_client=data_client,
+            signature_type=settings.clob_signature_type,
+            user_stream_enabled=settings.user_stream_enabled,
+            user_stream_url=settings.user_stream_url,
+            user_stream_ping_interval_seconds=settings.user_stream_ping_interval_seconds,
+            user_stream_reconnect_seconds=settings.user_stream_reconnect_seconds,
+            user_stream_buffer_size=settings.user_stream_buffer_size,
         )
 
     return Trader(
@@ -79,6 +90,7 @@ def main() -> None:
     try:
         trader.run(once=args.once)
     finally:
+        trader.broker.close()
         trader.data_client.close()
 
 

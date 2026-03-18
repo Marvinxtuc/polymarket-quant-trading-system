@@ -1,4 +1,4 @@
-.PHONY: venv install env-check test verify-stack verify one-click verify_one_click run-once run start-stack replay replay-calibrate stop-stack ops-12h rehearse-10h rehearse-12h rehearse-progress monitor-12h monitor-30m monitor-reports stop-monitor-reports monitor-scheduler-install monitor-scheduler-uninstall monitor-scheduler-status network-smoke
+.PHONY: venv install env-check test verify-stack verify one-click verify_one_click run-once run start-stack replay replay-calibrate reconciliation-report full-validate stop-stack ops-12h rehearse-10h rehearse-12h rehearse-progress monitor-12h monitor-30m monitor-reports stop-monitor-reports monitor-scheduler-install monitor-scheduler-uninstall monitor-scheduler-status network-smoke git-autosync-start git-autosync-stop git-autosync-status git-autosync-install git-autosync-uninstall
 
 VENV_DIR := .venv
 PYTHON := $(VENV_DIR)/bin/python
@@ -44,6 +44,12 @@ replay:
 
 replay-calibrate:
 	PYTHONPATH=src $(PYTHON) scripts/replay_calibration.py
+
+reconciliation-report:
+	PYTHONPATH=src $(PYTHON) scripts/generate_reconciliation_report.py
+
+full-validate:
+	PYTHONPATH=src $(PYTHON) scripts/full_flow_validate.py --bootstrap-stack
 
 stop-stack:
 	./scripts/stop_poly_stack.sh
@@ -97,3 +103,18 @@ run:
 
 start-stack:
 	./scripts/start_poly_stack.sh
+
+git-autosync-start:
+	./scripts/start_git_autosync.sh
+
+git-autosync-stop:
+	./scripts/stop_git_autosync.sh
+
+git-autosync-status:
+	./scripts/git_autosync_status.sh
+
+git-autosync-install:
+	./scripts/install_git_autosync_launchd.sh
+
+git-autosync-uninstall:
+	./scripts/uninstall_git_autosync_launchd.sh

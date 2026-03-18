@@ -7,15 +7,19 @@ ROTATE_KEEP="${ROTATE_KEEP:-24}"
 PID_FILE="$LOG_DIR/run_monitor_reports.pid"
 
 MODE="${1:-both}"
+MONITOR_DAEMON_LOG="${MONITOR_DAEMON_LOG:-/tmp/poly_runtime_data/poly_bot.log}"
+STATE_JSON="${STATE_JSON:-/tmp/poly_runtime_data/state.json}"
 
 MON30M_OUT="/tmp/poly_monitor_30m_report.txt"
-MON30M_LOG="/tmp/poly_daemon.log"
-MON30M_WINDOW=1800
+MON30M_JSON="/tmp/poly_monitor_30m_report.json"
+MON30M_LOG="${MON30M_LOG:-$MONITOR_DAEMON_LOG}"
+MON30M_WINDOW="${MON30M_WINDOW_SECONDS:-1800}"
 MON30M_STATE="/tmp/poly_monitor_30m_inconclusive_state"
 
 MON12H_OUT="/tmp/poly_monitor_12h_report.txt"
-MON12H_LOG="/tmp/poly_daemon.log"
-MON12H_WINDOW=43200
+MON12H_JSON="/tmp/poly_monitor_12h_report.json"
+MON12H_LOG="${MON12H_LOG:-$MONITOR_DAEMON_LOG}"
+MON12H_WINDOW="${MON12H_WINDOW_SECONDS:-43200}"
 MON12H_STATE="/tmp/poly_monitor_12h_inconclusive_state"
 
 mkdir -p "$LOG_DIR"
@@ -86,7 +90,9 @@ loop_30m() {
     "$MON30M_OUT" \
     "$MON30M_LOG" \
     "$MON30M_WINDOW" \
-    "$MON30M_STATE"
+    "$MON30M_STATE" \
+    "$STATE_JSON" \
+    "$MON30M_JSON"
   rotate_logs "monitor-30m-*.log"
 }
 
@@ -99,7 +105,9 @@ loop_12h() {
     "$MON12H_OUT" \
     "$MON12H_LOG" \
     "$MON12H_WINDOW" \
-    "$MON12H_STATE"
+    "$MON12H_STATE" \
+    "$STATE_JSON" \
+    "$MON12H_JSON"
   rotate_logs "monitor-12h-*.log"
 }
 

@@ -224,6 +224,39 @@ class DaemonStateTests(unittest.TestCase):
                     }
                 ]
             ),
+            pending_orders={
+                "sig-4:BUY:token-c": {
+                    "key": "sig-4:BUY:token-c",
+                    "ts": int(time.time()) - 240,
+                    "cycle_id": "cyc-4",
+                    "signal_id": "sig-4",
+                    "trace_id": "trc-3",
+                    "order_id": "ord-123",
+                    "broker_status": "live",
+                    "market_slug": "eth-above-5k",
+                    "token_id": "token-c",
+                    "condition_id": "cond-c",
+                    "outcome": "YES",
+                    "side": "BUY",
+                    "flow": "entry",
+                    "wallet": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "wallet_score": 68.0,
+                    "wallet_tier": "WATCH",
+                    "topic_label": "加密",
+                    "requested_notional": 30.0,
+                    "requested_price": 0.42,
+                    "matched_notional_hint": 12.0,
+                    "matched_size_hint": 28.0,
+                    "matched_price_hint": 0.43,
+                    "reason": "resting on book",
+                    "message": "maker order live",
+                    "entry_wallet": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "entry_wallet_score": 68.0,
+                    "entry_wallet_tier": "WATCH",
+                    "entry_topic_label": "加密",
+                    "last_heartbeat_ts": int(time.time()) - 60,
+                }
+            },
             state=SimpleNamespace(daily_realized_pnl=0.0, open_positions=1),
             last_wallets=["0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"],
             last_signals=[],
@@ -355,8 +388,54 @@ class DaemonStateTests(unittest.TestCase):
                 pause_opening=False,
                 reduce_only=False,
                 emergency_stop=False,
+                clear_stale_pending_requested_ts=int(time.time()) - 10,
                 updated_ts=0,
             ),
+            last_operator_action={
+                "name": "clear_stale_pending",
+                "requested_ts": int(time.time()) - 10,
+                "processed_ts": int(time.time()) - 5,
+                "status": "cleared",
+                "cleared_count": 1,
+                "remaining_pending_orders": 0,
+                "message": "cleared 1 stale pending orders",
+            },
+            startup_ready=False,
+            startup_warning_count=1,
+            startup_failure_count=1,
+            startup_checks=[
+                {"name": "network_smoke", "status": "FAIL", "message": "network smoke indicates geoblock/restriction"},
+                {"name": "user_stream", "status": "WARN", "message": "websocket-client missing"},
+            ],
+            reconciliation_summary=lambda now=None: {
+                "day_key": "2026-03-17",
+                "status": "warn",
+                "issues": ["stale_pending_orders=1"],
+                "startup_ready": False,
+                "internal_realized_pnl": 0.0,
+                "ledger_realized_pnl": 0.0,
+                "broker_closed_pnl_today": 0.0,
+                "effective_daily_realized_pnl": 0.0,
+                "internal_vs_ledger_diff": 0.0,
+                "broker_floor_gap_vs_internal": 0.0,
+                "fill_count_today": 1,
+                "fill_notional_today": 48.8,
+                "account_sync_count_today": 0,
+                "startup_checks_count_today": 1,
+                "last_fill_ts": int(time.time()) - 60,
+                "last_account_sync_ts": 0,
+                "last_startup_checks_ts": int(time.time()) - 30,
+                "pending_orders": 1,
+                "pending_entry_orders": 1,
+                "pending_exit_orders": 0,
+                "stale_pending_orders": 1,
+                "open_positions": 1,
+                "tracked_notional_usd": 48.8,
+                "ledger_available": True,
+                "account_snapshot_age_seconds": 0,
+                "broker_reconcile_age_seconds": 0,
+                "broker_event_sync_age_seconds": 180,
+            },
         )
         settings = Settings(_env_file=None)
 
@@ -381,9 +460,21 @@ class DaemonStateTests(unittest.TestCase):
         self.assertEqual(payload["wallets"][0]["topic_profiles"][0]["label"], "加密")
         self.assertEqual(payload["positions"][0]["last_exit_kind"], "resonance_exit")
         self.assertEqual(payload["positions"][0]["last_exit_label"], "共振退出")
+        self.assertEqual(payload["pending_order_details"][0]["order_id"], "ord-123")
+        self.assertEqual(payload["pending_order_details"][0]["broker_status"], "live")
+        self.assertEqual(payload["pending_order_details"][0]["matched_notional_hint"], 12.0)
+        self.assertEqual(payload["operator_feedback"]["last_action"]["name"], "clear_stale_pending")
+        self.assertEqual(payload["operator_feedback"]["last_action"]["cleared_count"], 1)
+        self.assertFalse(payload["startup"]["ready"])
+        self.assertEqual(payload["startup"]["failure_count"], 1)
+        self.assertEqual(payload["startup"]["checks"][0]["name"], "network_smoke")
+        self.assertEqual(payload["reconciliation"]["status"], "warn")
+        self.assertEqual(payload["reconciliation"]["fill_count_today"], 1)
         self.assertEqual(first_exit_order["exit_kind"], "resonance_exit")
         self.assertIn("部分减仓 will-btc-close-above-100k", [item["text"] for item in payload["timeline"]])
         self.assertEqual(payload["alerts"][0]["tag"], "处理")
+        self.assertIn("自检", [alert["tag"] for alert in payload["alerts"]])
+        self.assertIn("对账", [alert["tag"] for alert in payload["alerts"]])
         self.assertIn("共振", [alert["tag"] for alert in payload["alerts"]])
         self.assertEqual(payload["exit_review"]["summary"]["total_exit_orders"], 2)
         self.assertEqual(payload["exit_review"]["summary"]["filled_exit_orders"], 1)

@@ -903,6 +903,40 @@ def _build_state(trader, settings: Settings) -> dict[str, Any]:
     now = int(time.time())
     execution_mode = "paper" if settings.dry_run else "live"
     broker_name = type(trader.broker).__name__
+    reconciliation_builder = getattr(trader, "reconciliation_summary", None)
+    reconciliation = (
+        reconciliation_builder(now=now)
+        if callable(reconciliation_builder)
+        else {
+            "day_key": "",
+            "status": "ok",
+            "issues": [],
+            "startup_ready": bool(getattr(trader, "startup_ready", True)),
+            "internal_realized_pnl": 0.0,
+            "ledger_realized_pnl": 0.0,
+            "broker_closed_pnl_today": 0.0,
+            "effective_daily_realized_pnl": 0.0,
+            "internal_vs_ledger_diff": 0.0,
+            "broker_floor_gap_vs_internal": 0.0,
+            "fill_count_today": 0,
+            "fill_notional_today": 0.0,
+            "account_sync_count_today": 0,
+            "startup_checks_count_today": 0,
+            "last_fill_ts": 0,
+            "last_account_sync_ts": 0,
+            "last_startup_checks_ts": 0,
+            "pending_orders": 0,
+            "pending_entry_orders": 0,
+            "pending_exit_orders": 0,
+            "stale_pending_orders": 0,
+            "open_positions": int(getattr(getattr(trader, "state", None), "open_positions", 0) or 0),
+            "tracked_notional_usd": float(getattr(getattr(trader, "state", None), "tracked_notional_usd", 0.0) or 0.0),
+            "ledger_available": False,
+            "account_snapshot_age_seconds": 0,
+            "broker_reconcile_age_seconds": 0,
+            "broker_event_sync_age_seconds": 0,
+        }
+    )
     wallet_metrics = trader.strategy.latest_wallet_metrics()
     scorer = getattr(trader.strategy, "scorer", None)
     history_min_closed_positions = int(getattr(scorer, "min_realized_sample", 5) or 5)
@@ -1058,6 +1092,54 @@ def _build_state(trader, settings: Settings) -> dict[str, Any]:
         order["exit_result"] = str(order.get("exit_result") or "")
         order["exit_result_label"] = str(order.get("exit_result_label") or "")
         orders.append(order)
+
+    pending_order_details = []
+    pending_orders_raw = getattr(trader, "pending_orders", {}) or {}
+    if isinstance(pending_orders_raw, dict):
+        for raw_pending in sorted(
+            pending_orders_raw.values(),
+            key=lambda item: int(item.get("ts") or 0) if isinstance(item, dict) else 0,
+            reverse=True,
+        )[:20]:
+            if not isinstance(raw_pending, dict):
+                continue
+            pending_order_details.append(
+                {
+                    "key": str(raw_pending.get("key") or ""),
+                    "ts": int(raw_pending.get("ts") or 0),
+                    "cycle_id": str(raw_pending.get("cycle_id") or ""),
+                    "signal_id": str(raw_pending.get("signal_id") or ""),
+                    "trace_id": str(raw_pending.get("trace_id") or ""),
+                    "order_id": str(raw_pending.get("order_id") or ""),
+                    "broker_status": str(raw_pending.get("broker_status") or ""),
+                    "title": str(raw_pending.get("market_slug") or raw_pending.get("token_id") or "-"),
+                    "market_slug": str(raw_pending.get("market_slug") or ""),
+                    "token_id": str(raw_pending.get("token_id") or ""),
+                    "condition_id": str(raw_pending.get("condition_id") or ""),
+                    "outcome": str(raw_pending.get("outcome") or ""),
+                    "side": str(raw_pending.get("side") or ""),
+                    "flow": str(raw_pending.get("flow") or ("exit" if str(raw_pending.get("side") or "").upper() == "SELL" else "entry")),
+                    "wallet": str(raw_pending.get("wallet") or ""),
+                    "wallet_score": float(raw_pending.get("wallet_score") or 0.0),
+                    "wallet_tier": str(raw_pending.get("wallet_tier") or ""),
+                    "topic_label": str(raw_pending.get("topic_label") or ""),
+                    "requested_notional": float(raw_pending.get("requested_notional") or 0.0),
+                    "requested_price": float(raw_pending.get("requested_price") or 0.0),
+                    "matched_notional_hint": float(raw_pending.get("matched_notional_hint") or 0.0),
+                    "matched_size_hint": float(raw_pending.get("matched_size_hint") or 0.0),
+                    "matched_price_hint": float(raw_pending.get("matched_price_hint") or 0.0),
+                    "reason": str(raw_pending.get("reason") or raw_pending.get("message") or ""),
+                    "message": str(raw_pending.get("message") or ""),
+                    "entry_wallet": str(raw_pending.get("entry_wallet") or ""),
+                    "entry_wallet_score": float(raw_pending.get("entry_wallet_score") or 0.0),
+                    "entry_wallet_tier": str(raw_pending.get("entry_wallet_tier") or ""),
+                    "entry_topic_label": str(raw_pending.get("entry_topic_label") or ""),
+                    "last_heartbeat_ts": int(raw_pending.get("last_heartbeat_ts") or 0),
+                }
+            )
+    operator_feedback = {
+        "last_action": dict(getattr(trader, "last_operator_action", {}) or {}),
+    }
     exit_review = _build_exit_review(orders, positions)
     signal_review = _build_signal_review(
         list(getattr(trader, "recent_signal_cycles", []) or []),
@@ -1086,6 +1168,38 @@ def _build_state(trader, settings: Settings) -> dict[str, Any]:
         alerts.append({"cls": "yellow", "tag": "观察", "message": "当前钱包池质量分偏低，建议复核 seed 钱包或 discovery 来源"})
     if any(str(o.get("status")) == "REJECTED" for o in orders[:5]):
         alerts.append({"cls": "red", "tag": "处理", "message": "最近存在下单失败，请检查风控与流动性"})
+    if not bool(getattr(trader, "startup_ready", True)):
+        alerts.append(
+            {
+                "cls": "red",
+                "tag": "自检",
+                "message": f"启动自检存在 {int(getattr(trader, 'startup_failure_count', 0) or 0)} 个失败项，请先处理 allowance / geoblock / account readiness 或 network smoke 后再切 live",
+            }
+        )
+    elif int(getattr(trader, "startup_warning_count", 0) or 0) > 0:
+        alerts.append(
+            {
+                "cls": "yellow",
+                "tag": "自检",
+                "message": f"启动自检存在 {int(getattr(trader, 'startup_warning_count', 0) or 0)} 个警告项，建议复核 user stream / heartbeat support",
+            }
+        )
+    if str(reconciliation.get("status") or "").lower() == "fail":
+        alerts.append(
+            {
+                "cls": "red",
+                "tag": "对账",
+                "message": "执行对账存在失败项，请先处理账本漂移或陈旧同步",
+            }
+        )
+    elif str(reconciliation.get("status") or "").lower() == "warn":
+        alerts.append(
+            {
+                "cls": "yellow",
+                "tag": "对账",
+                "message": "执行对账存在警告项，建议复核 pending 单、snapshot age 和 broker floor gap",
+            }
+        )
     recent_exit = next(
         (
             o
@@ -1112,12 +1226,16 @@ def _build_state(trader, settings: Settings) -> dict[str, Any]:
     if settings.max_open_positions > 0:
         slot_utilization_pct = min(100.0, trader.state.open_positions / settings.max_open_positions * 100.0)
     tracked_notional_usd = sum(max(0.0, float(pos.get("notional") or 0.0)) for pos in trader.positions_book.values())
-    available_notional_usd = max(0.0, settings.bankroll_usd - tracked_notional_usd)
+    cash_balance_usd = float(getattr(trader.state, "cash_balance_usd", 0.0) or 0.0)
+    positions_value_usd = float(getattr(trader.state, "positions_value_usd", 0.0) or tracked_notional_usd)
+    effective_pnl_today = float(getattr(trader.state, "effective_daily_realized_pnl", getattr(trader.state, "daily_realized_pnl", 0.0)))
+    equity_usd = float(getattr(trader.state, "equity_usd", 0.0) or (settings.bankroll_usd + effective_pnl_today))
+    available_notional_usd = max(0.0, cash_balance_usd if cash_balance_usd > 0.0 else (settings.bankroll_usd - tracked_notional_usd))
     notional_utilization_pct = 0.0 if settings.bankroll_usd <= 0 else min(100.0, tracked_notional_usd / settings.bankroll_usd * 100.0)
     base_per_trade_notional = settings.bankroll_usd * settings.risk_per_trade_pct
     theoretical_max_order_notional = base_per_trade_notional * 1.65
     daily_loss_budget_usd = settings.bankroll_usd * settings.daily_max_loss_pct
-    daily_loss_used_usd = min(daily_loss_budget_usd, max(0.0, -trader.state.daily_realized_pnl))
+    daily_loss_used_usd = min(daily_loss_budget_usd, max(0.0, -effective_pnl_today))
     daily_loss_used_pct = 0.0 if daily_loss_budget_usd <= 0 else (daily_loss_used_usd / daily_loss_budget_usd * 100.0)
     daily_loss_remaining_pct = max(0.0, 100.0 - daily_loss_used_pct)
     risk_budget_openings = (
@@ -1183,16 +1301,31 @@ def _build_state(trader, settings: Settings) -> dict[str, Any]:
             "wallet_discovery_quality_top_n": int(settings.wallet_discovery_quality_top_n),
             "wallet_discovery_history_bonus": float(settings.wallet_discovery_history_bonus),
             "wallet_discovery_topic_bonus": float(settings.wallet_discovery_topic_bonus),
+            "account_sync_refresh_seconds": int(settings.account_sync_refresh_seconds),
+            "user_stream_enabled": bool(settings.user_stream_enabled),
         },
+        "startup": {
+            "ready": bool(getattr(trader, "startup_ready", True)),
+            "warning_count": int(getattr(trader, "startup_warning_count", 0) or 0),
+            "failure_count": int(getattr(trader, "startup_failure_count", 0) or 0),
+            "checks": list(getattr(trader, "startup_checks", []) or []),
+        },
+        "reconciliation": reconciliation,
         "control": {
             "pause_opening": bool(trader.control_state.pause_opening),
             "reduce_only": bool(trader.control_state.reduce_only),
             "emergency_stop": bool(trader.control_state.emergency_stop),
+            "clear_stale_pending_requested_ts": int(getattr(trader.control_state, "clear_stale_pending_requested_ts", 0) or 0),
             "updated_ts": int(trader.control_state.updated_ts),
         },
         "summary": {
-            "pnl_today": float(trader.state.daily_realized_pnl),
-            "equity": float(settings.bankroll_usd + trader.state.daily_realized_pnl),
+            "pnl_today": effective_pnl_today,
+            "internal_pnl_today": float(trader.state.daily_realized_pnl),
+            "broker_closed_pnl_today": float(getattr(trader.state, "broker_closed_pnl_today", 0.0) or 0.0),
+            "equity": equity_usd,
+            "cash_balance_usd": cash_balance_usd,
+            "positions_value_usd": positions_value_usd,
+            "account_snapshot_ts": int(getattr(trader.state, "account_snapshot_ts", 0) or 0),
             "open_positions": int(trader.state.open_positions),
             "max_open_positions": int(settings.max_open_positions),
             "slot_utilization_pct": float(round(slot_utilization_pct, 2)),
@@ -1210,8 +1343,10 @@ def _build_state(trader, settings: Settings) -> dict[str, Any]:
             "slot_remaining": int(slot_remaining),
             "est_openings": int(max(0, est_openings)),
         },
+        "operator_feedback": operator_feedback,
         "positions": positions,
         "orders": orders,
+        "pending_order_details": pending_order_details,
         "wallets": wallets,
         "sources": sources,
         "alerts": alerts,
@@ -1300,6 +1435,7 @@ def main() -> None:
                 return
             time.sleep(settings.poll_interval_seconds)
     finally:
+        trader.broker.close()
         trader.data_client.close()
 
 

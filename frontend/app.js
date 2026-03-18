@@ -18,6 +18,8 @@
   let selectedTraceId = "";
   let selectedSignalCycleId = "";
   let selectedAttributionWindow = "24h";
+  let selectedDiagnosticFocusKind = "";
+  let selectedDiagnosticFocusKey = "";
   const exitReviewFilter = {
     kind: "",
     topic: "",
@@ -30,6 +32,46 @@
   let lastSignalReviewNow = 0;
   let lastAttributionReview = null;
   let lastAttributionReviewNow = 0;
+  let lastDiagnosticsState = null;
+  let lastDiagnosticsMonitor30 = null;
+  let lastDiagnosticsMonitor12 = null;
+  let lastDiagnosticsEod = null;
+  let lastDiagnosticsNow = 0;
+  const EMPTY_MONITOR_REPORT = (reportType) => ({
+    report_type: reportType,
+    generated_ts: 0,
+    window_start: "",
+    window_end: "",
+    window_seconds: 0,
+    log_file: "",
+    sample_status: "unknown",
+    counts: {},
+    ratios: {},
+    recommendation: "",
+    final_recommendation: "",
+    consecutive_inconclusive_windows: 0,
+    daemon_state_file: "",
+    startup_ready: null,
+    startup: {},
+    reconciliation_status: "unknown",
+    reconciliation_issue_summary: "",
+    reconciliation: {},
+  });
+  const EMPTY_RECONCILIATION_EOD_REPORT = {
+    report_version: 1,
+    generated_ts: 0,
+    generated_at: "",
+    day_key: "",
+    state_path: "",
+    ledger_path: "",
+    status: "unknown",
+    issues: [],
+    startup: {},
+    reconciliation: {},
+    state_summary: {},
+    ledger_summary: {},
+    recommendations: [],
+  };
 
   function loadUiState() {
     try {
@@ -103,6 +145,18 @@
     if (s < 60) return `${s}s`;
     if (s < 3600) return `${Math.floor(s / 60)}m`;
     return `${Math.floor(s / 3600)}h`;
+  }
+
+  function fmtDateTime(ts) {
+    const value = Number(ts || 0);
+    if (value <= 0) return "--";
+    const d = new Date(value * 1000);
+    const yyyy = d.getFullYear();
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    const hh = String(d.getHours()).padStart(2, "0");
+    const min = String(d.getMinutes()).padStart(2, "0");
+    return `${yyyy}-${mm}-${dd} ${hh}:${min}`;
   }
 
   function fmtHoldMinutes(minutes) {
@@ -259,6 +313,344 @@
     return ["cancel", fallbackLabel || "未标记"];
   }
 
+  function reportStatusMeta(status) {
+    const value = String(status || "").trim().toLowerCase();
+    if (value === "ok" || value === "ready") return ["ok", "OK"];
+    if (value === "warn" || value === "warning") return ["wait", "WARN"];
+    if (value === "fail" || value === "blocked" || value === "error") return ["danger", "FAIL"];
+    if (value === "conclusive") return ["ok", "CONCLUSIVE"];
+    if (value === "inconclusive") return ["cancel", "INCONCLUSIVE"];
+    return ["cancel", String(status || "UNKNOWN").toUpperCase() || "UNKNOWN"];
+  }
+
+  function startupCheckMeta(status) {
+    const value = String(status || "").trim().toUpperCase();
+    if (value === "PASS") return ["ok", "PASS"];
+    if (value === "WARN") return ["wait", "WARN"];
+    if (value === "FAIL") return ["danger", "FAIL"];
+    return ["cancel", value || "UNKNOWN"];
+  }
+
+  function reportDecisionMeta(text, fallbackStatus = "") {
+    const value = String(text || "").trim();
+    const upper = value.toUpperCase();
+    if (upper.startsWith("BLOCK")) return ["danger", "BLOCK"];
+    if (upper.startsWith("ESCALATE")) return ["danger", "ESCALATE"];
+    if (upper.startsWith("OBSERVE")) return ["wait", "OBSERVE"];
+    if (upper.startsWith("NO ESCALATION")) return ["ok", "OK"];
+    if (upper.startsWith("CONSECUTIVE_INCONCLUSIVE")) return ["cancel", "INCONCLUSIVE"];
+    return reportStatusMeta(fallbackStatus || "unknown");
+  }
+
+  function recommendationKind(text) {
+    const upper = String(text || "").trim().toUpperCase();
+    if (upper.startsWith("BLOCK")) return "block";
+    if (upper.startsWith("ESCALATE")) return "escalate";
+    if (upper.startsWith("OBSERVE")) return "observe";
+    if (upper.startsWith("CONSECUTIVE_INCONCLUSIVE")) return "observe";
+    return "ready";
+  }
+
+  async function fetchJson(path, fallback) {
+    try {
+      const res = await fetch(path, { cache: "no-store" });
+      if (!res.ok) return fallback;
+      const data = await res.json();
+      if (!data || typeof data !== "object") return fallback;
+      return data;
+    } catch (_err) {
+      return fallback;
+    }
+  }
+
+  async function copyText(text) {
+    const value = String(text || "");
+    if (!value) return false;
+    try {
+      if (navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+        await navigator.clipboard.writeText(value);
+        return true;
+      }
+    } catch (_err) {
+      // fall through
+    }
+    try {
+      const textarea = document.createElement("textarea");
+      textarea.value = value;
+      textarea.setAttribute("readonly", "true");
+      textarea.style.position = "fixed";
+      textarea.style.opacity = "0";
+      document.body.appendChild(textarea);
+      textarea.focus();
+      textarea.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(textarea);
+      return !!ok;
+    } catch (_err) {
+      return false;
+    }
+  }
+
+  function computeOpsGate(data, monitor30m, monitor12h, eodReport) {
+    const startup = data && data.startup && typeof data.startup === "object" ? data.startup : {};
+    const reconciliation = data && data.reconciliation && typeof data.reconciliation === "object" ? data.reconciliation : {};
+    const eod = eodReport && typeof eodReport === "object" ? eodReport : EMPTY_RECONCILIATION_EOD_REPORT;
+    const report30 = monitor30m && typeof monitor30m === "object" ? monitor30m : EMPTY_MONITOR_REPORT("monitor_30m");
+    const report12 = monitor12h && typeof monitor12h === "object" ? monitor12h : EMPTY_MONITOR_REPORT("monitor_12h");
+    const checks = Array.isArray(startup.checks) ? startup.checks : [];
+    const eodIssues = Array.isArray(eod.issues) ? eod.issues : [];
+    const actions = [];
+    const actionKeys = new Set();
+
+    const pushAction = (cls, title, detail, controls = []) => {
+      const safeTitle = String(title || "").trim();
+      const safeDetail = String(detail || "").trim();
+      if (!safeTitle || !safeDetail) return;
+      const key = `${safeTitle}::${safeDetail}`;
+      if (actionKeys.has(key)) return;
+      actionKeys.add(key);
+      const normalizedControls = Array.isArray(controls)
+        ? controls
+            .filter((item) => item && typeof item === "object")
+            .map((item) => ({
+              type: String(item.type || "").trim(),
+              label: String(item.label || "").trim(),
+              value: String(item.value || "").trim(),
+            }))
+            .filter((item) => item.type && item.label && item.value)
+        : [];
+      actions.push({ cls, title: safeTitle, detail: safeDetail, controls: normalizedControls });
+    };
+
+    let level = "ready";
+    if (startup.ready === false || recommendationKind(report30.final_recommendation) === "block" || recommendationKind(report12.final_recommendation) === "block") {
+      level = "block";
+    } else if (String(reconciliation.status || "").toLowerCase() === "fail" || String(eod.status || "").toLowerCase() === "fail" || recommendationKind(report30.final_recommendation) === "escalate" || recommendationKind(report12.final_recommendation) === "escalate") {
+      level = "escalate";
+    } else if (String(reconciliation.status || "").toLowerCase() === "warn" || String(eod.status || "").toLowerCase() === "warn" || recommendationKind(report30.final_recommendation) === "observe" || recommendationKind(report12.final_recommendation) === "observe") {
+      level = "observe";
+    }
+
+    let title = "执行门禁已就绪";
+    let detail = "startup、自检、monitor 和 reconciliation 当前没有阻断项，可以继续观察策略与执行质量。";
+    if (level === "block") {
+      title = "运行门禁阻断";
+      detail = String(report12.final_recommendation || report30.final_recommendation || "启动自检未通过，或 live 前置条件缺失。优先修复环境与账户问题。");
+    } else if (level === "escalate") {
+      title = "执行对账需要升级处理";
+      detail = String(report12.final_recommendation || report30.final_recommendation || "账本与 broker 事实层可能已经漂移，建议先停参数变更。");
+    } else if (level === "observe") {
+      title = "运行中有警告，先观察再调参";
+      detail = String(report12.final_recommendation || report30.final_recommendation || "当前更多像执行告警而不是策略信号结论。");
+    }
+
+    const items = [
+      {
+        label: "启动自检",
+        value: startup.ready === false ? `${Number(startup.failure_count || 0)} fail / ${Number(startup.warning_count || 0)} warn` : startup.ready === true ? "ready" : "unknown",
+      },
+      {
+        label: "30m",
+        value: String(report30.final_recommendation || report30.recommendation || report30.sample_status || "unknown"),
+      },
+      {
+        label: "12h",
+        value: String(report12.final_recommendation || report12.recommendation || report12.sample_status || "unknown"),
+      },
+      {
+        label: "对账",
+        value: String(reconciliation.status || eod.status || "unknown"),
+      },
+    ];
+
+    const issueParts = [];
+    for (const row of checks.slice(0, 4)) {
+      const status = String(row && row.status || "");
+      if (status === "FAIL" || status === "WARN") {
+        issueParts.push(`${String(row.name || "startup")}: ${String(row.message || status)}`);
+      }
+    }
+    for (const item of eodIssues.slice(0, 4)) {
+      issueParts.push(String(item));
+    }
+
+    for (const row of checks) {
+      const name = String(row && row.name || "").trim();
+      const status = String(row && row.status || "").trim().toUpperCase();
+      const message = String(row && row.message || "").trim();
+      if (status !== "FAIL" && status !== "WARN") continue;
+      if (name === "network_smoke") {
+        pushAction(
+          status === "FAIL" ? "danger" : "wait",
+          "重跑 network smoke",
+          `先执行 <code>make network-smoke</code>，确认 geoblock / endpoint 正常；当前提示: ${message || "network smoke 需要复核"}.`,
+          [
+            { type: "copy", label: "复制命令", value: "make network-smoke" },
+            { type: "open", label: "打开状态 JSON", value: "/api/state" },
+            { type: "jump", label: "跳到诊断", value: "diagnostics-panel" },
+          ]
+        );
+      } else if (name === "api_credentials" || name === "funder_address" || name === "signature_type") {
+        pushAction(
+          "danger",
+          "核对 live 账户与签名配置",
+          `检查 <code>PRIVATE_KEY</code>、<code>FUNDER_ADDRESS</code>、<code>CLOB_SIGNATURE_TYPE</code>，确保 API credentials 能稳定派生；当前提示: ${message || name}.`,
+          [
+            { type: "open", label: "打开状态 JSON", value: "/api/state" },
+            { type: "jump", label: "跳到诊断", value: "diagnostics-panel" },
+          ]
+        );
+      } else if (name === "market_preflight") {
+        pushAction(
+          "danger",
+          "恢复 market preflight",
+          `确认 live broker 已配置 market client，否则 book / midpoint / tick preflight 会直接拒单；当前提示: ${message || name}.`,
+          [
+            { type: "open", label: "打开状态 JSON", value: "/api/state" },
+            { type: "jump", label: "跳到诊断", value: "diagnostics-panel" },
+          ]
+        );
+      } else if (name === "order_status_support") {
+        pushAction(
+          "danger",
+          "修复 broker 订单查询能力",
+          `先确认 <code>py-clob-client</code> 版本和适配层，保证 <code>get_order</code> / <code>get_orders</code> 可用；当前提示: ${message || name}.`,
+          [
+            { type: "open", label: "打开状态 JSON", value: "/api/state" },
+            { type: "jump", label: "跳到诊断", value: "diagnostics-panel" },
+          ]
+        );
+      } else if (name === "heartbeat_support") {
+        pushAction(
+          "wait",
+          "确认 heartbeat 策略",
+          `当前 SDK 可能缺少 heartbeat 能力，先避免依赖长时间 resting orders；当前提示: ${message || name}.`,
+          [
+            { type: "open", label: "打开状态 JSON", value: "/api/state" },
+            { type: "jump", label: "跳到诊断", value: "diagnostics-panel" },
+          ]
+        );
+      } else if (name === "user_stream") {
+        pushAction(
+          "wait",
+          "检查 user stream 依赖",
+          `安装 <code>websocket-client</code> 并确认 <code>USER_STREAM_*</code> 配置；否则只会退回 polling reconcile；当前提示: ${message || name}.`,
+          [
+            { type: "copy", label: "复制安装命令", value: ".venv/bin/pip install websocket-client" },
+            { type: "open", label: "打开状态 JSON", value: "/api/state" },
+            { type: "jump", label: "跳到诊断", value: "diagnostics-panel" },
+          ]
+        );
+      } else if (name === "clob_host") {
+        pushAction(
+          "danger",
+          "确认 CLOB host",
+          `检查 live CLOB host 配置与网络连通性；当前提示: ${message || name}.`,
+          [
+            { type: "open", label: "打开状态 JSON", value: "/api/state" },
+            { type: "jump", label: "跳到诊断", value: "diagnostics-panel" },
+          ]
+        );
+      }
+    }
+
+    const internalDiff = Math.abs(Number(reconciliation.internal_vs_ledger_diff || (eod.reconciliation && eod.reconciliation.internal_vs_ledger_diff) || 0));
+    const stalePending = Number(reconciliation.stale_pending_orders || (eod.reconciliation && eod.reconciliation.stale_pending_orders) || 0);
+    const accountAge = Number(reconciliation.account_snapshot_age_seconds || (eod.reconciliation && eod.reconciliation.account_snapshot_age_seconds) || 0);
+    const reconcileAge = Number(reconciliation.broker_reconcile_age_seconds || (eod.reconciliation && eod.reconciliation.broker_reconcile_age_seconds) || 0);
+    const eventAge = Number(reconciliation.broker_event_sync_age_seconds || (eod.reconciliation && eod.reconciliation.broker_event_sync_age_seconds) || 0);
+
+    if (internalDiff > 0.01) {
+      pushAction(
+        level === "block" || level === "escalate" ? "danger" : "wait",
+        "先核对 ledger 漂移",
+        `当前 internal vs ledger 差异为 <code>${fmtUsd(internalDiff)}</code>，先生成 <code>make reconciliation-report</code> 并核对当日 realized PnL。`,
+        [
+          { type: "api", label: "刷新 EOD 报告", value: "generate_reconciliation_report" },
+          { type: "copy", label: "复制命令", value: "make reconciliation-report" },
+          { type: "open", label: "打开 EOD JSON", value: "/api/reconciliation/eod" },
+          { type: "jump", label: "跳到诊断", value: "diagnostics-panel" },
+          { type: "jump", label: "跳到监控面板", value: "monitor-report-panel" },
+        ]
+      );
+    }
+    if (stalePending > 0) {
+      pushAction(
+        stalePending >= 2 ? "danger" : "wait",
+        "处理陈旧 pending 单",
+        `当前仍有 <code>${stalePending}</code> 个 stale pending orders，先核对 broker open orders / recent fills，必要时撤单后再继续。`,
+        [
+          { type: "api", label: "清理 stale pending", value: "clear_stale_pending" },
+          { type: "jump", label: "跳到订单", value: "orders-panel" },
+          { type: "jump", label: "跳到诊断", value: "diagnostics-panel" },
+          { type: "jump", label: "跳到监控面板", value: "monitor-report-panel" },
+        ]
+      );
+    }
+    if (accountAge > 1800 || reconcileAge > 900 || eventAge > 900) {
+      pushAction(
+        "wait",
+        "刷新 broker / account sync",
+        `当前同步时效偏老：account <code>${fmtAge(accountAge)}</code>、reconcile <code>${fmtAge(reconcileAge)}</code>、events <code>${fmtAge(eventAge)}</code>，先确认 daemon 与 user stream 仍在刷新。`,
+        [
+          { type: "jump", label: "跳到诊断", value: "diagnostics-panel" },
+          { type: "jump", label: "跳到监控面板", value: "monitor-report-panel" },
+          { type: "open", label: "打开状态 JSON", value: "/api/state" },
+        ]
+      );
+    }
+
+    if (String(report30.sample_status || "").toUpperCase() === "INCONCLUSIVE" || String(report12.sample_status || "").toUpperCase() === "INCONCLUSIVE") {
+      const maxInconclusive = Math.max(Number(report30.consecutive_inconclusive_windows || 0), Number(report12.consecutive_inconclusive_windows || 0));
+      pushAction(
+        "wait",
+        "补足样本窗口",
+        `当前 monitor 仍有 <code>${maxInconclusive}</code> 个连续 INCONCLUSIVE 窗口，先继续观察 EXEC 样本，不要基于 0 样本调参数。`,
+        [
+          { type: "jump", label: "跳到诊断", value: "diagnostics-panel" },
+          { type: "jump", label: "跳到监控面板", value: "monitor-report-panel" },
+        ]
+      );
+    }
+
+    if (recommendationKind(report30.final_recommendation) !== "ready" || recommendationKind(report12.final_recommendation) !== "ready") {
+      pushAction(
+        level === "block" || level === "escalate" ? "danger" : "wait",
+        "先处理 monitor 摘要里的执行问题",
+        `优先阅读 30m / 12h monitor 的最终建议，先解决 skip / reject / exit 比例异常，再讨论策略参数是否要调整。`,
+        [
+          { type: "jump", label: "跳到诊断", value: "diagnostics-panel" },
+          { type: "jump", label: "跳到监控面板", value: "monitor-report-panel" },
+          { type: "open", label: "打开 30m JSON", value: "/api/monitor/30m" },
+          { type: "open", label: "打开 12h JSON", value: "/api/monitor/12h" },
+        ]
+      );
+    }
+
+    if (actions.length === 0) {
+      pushAction(
+        "ok",
+        "继续观察 shadow / live 一致性",
+        `当前门禁通过，继续对比 12h monitor 与 EOD reconciliation 是否保持一致，并关注下一次 startup / broker sync 是否仍然稳定。`,
+        [
+          { type: "api", label: "刷新 EOD 报告", value: "generate_reconciliation_report" },
+          { type: "jump", label: "跳到诊断", value: "diagnostics-panel" },
+          { type: "jump", label: "跳到监控面板", value: "monitor-report-panel" },
+          { type: "open", label: "打开 EOD JSON", value: "/api/reconciliation/eod" },
+        ]
+      );
+    }
+
+    return {
+      level,
+      title,
+      detail,
+      items,
+      issues: issueParts,
+      actions,
+    };
+  }
+
   function orderActionMeta(order) {
     const flow = String(order && order.flow || "");
     const side = String(order && order.side || "").toUpperCase();
@@ -331,6 +723,53 @@
       String(sample && sample.exit_kind || ""),
       String(sample && sample.status || ""),
     ].join("::");
+  }
+
+  function pendingOrderRowKey(row, index = 0) {
+    return [
+      String(row && row.key || ""),
+      String(row && row.order_id || ""),
+      String(row && row.trace_id || ""),
+      String(row && row.token_id || ""),
+      String(row && row.side || ""),
+      String(index),
+    ].join("::");
+  }
+
+  function pendingOrderStatusMeta(status) {
+    const value = String(status || "").trim().toLowerCase();
+    if (value === "filled" || value === "matched" || value === "confirmed") return ["ok", "FILLED"];
+    if (value === "partially_filled" || value === "partial_fill" || value === "delayed") return ["wait", "PARTIAL"];
+    if (value === "live" || value === "pending" || value === "submitted" || value === "accepted") return ["wait", "LIVE"];
+    if (value === "canceled" || value === "cancelled" || value === "unmatched") return ["cancel", "CANCELED"];
+    if (value === "failed" || value === "rejected" || value === "error") return ["danger", "FAILED"];
+    return ["cancel", String(status || "UNKNOWN").toUpperCase() || "UNKNOWN"];
+  }
+
+  function operatorActionMeta(action) {
+    const status = String(action && action.status || "").trim().toLowerCase();
+    const cleared = Number(action && action.cleared_count || 0);
+    if (status === "requested") return { cls: "wait", label: "REQUESTED", valueCls: "warn" };
+    if (status === "cleared") return { cls: "ok", label: cleared > 0 ? `CLEARED ${cleared}` : "CLEARED", valueCls: "value-positive" };
+    if (status === "noop") return { cls: "cancel", label: "NOOP", valueCls: "value-neutral" };
+    return { cls: "cancel", label: "IDLE", valueCls: "value-neutral" };
+  }
+
+  function selectDefaultDiagnosticFocus(startupChecks, pendingOrders) {
+    const problematicStartup = startupChecks.find((row) => {
+      const status = String(row && row.status || "").trim().toUpperCase();
+      return status === "FAIL" || status === "WARN";
+    });
+    if (problematicStartup) {
+      return { kind: "startup", key: String(problematicStartup.name || "startup") };
+    }
+    if (pendingOrders.length > 0) {
+      return { kind: "pending", key: String(pendingOrders[0]._diagKey || "") };
+    }
+    if (startupChecks.length > 0) {
+      return { kind: "startup", key: String(startupChecks[0].name || "startup") };
+    }
+    return { kind: "", key: "" };
   }
 
   function syncExitReviewFilter(review) {
@@ -936,6 +1375,492 @@
     persistExitReviewUiState();
   }
 
+  function renderOpsGate(gate) {
+    const bannerEl = $("ops-banner");
+    const tagEl = $("ops-gate-tag");
+    const titleEl = $("ops-gate-title");
+    const detailEl = $("ops-gate-detail");
+    const checksEl = $("ops-gate-checks");
+    const actionsMetaEl = $("ops-gate-actions-meta");
+    const actionsEl = $("ops-gate-actions");
+    const pillEl = $("ops-gate-pill");
+    const liveStatusLabelEl = $("live-status-label");
+    const liveDotEl = $("live-status-dot");
+    const emergencyBtn = $("btn-emergency-stop");
+    if (!bannerEl || !tagEl || !titleEl || !detailEl || !checksEl || !actionsMetaEl || !actionsEl || !pillEl || !liveStatusLabelEl || !liveDotEl || !emergencyBtn) return;
+
+    const level = String(gate && gate.level || "observe");
+    const levelMap = {
+      ready: { cls: "ok", label: "READY", dot: "dot-ok", guard: "guard-ok" },
+      observe: { cls: "wait", label: "OBSERVE", dot: "dot-wait", guard: "guard-wait" },
+      escalate: { cls: "danger", label: "ESCALATE", dot: "dot-danger", guard: "guard-danger" },
+      block: { cls: "danger", label: "BLOCK", dot: "dot-danger", guard: "guard-danger" },
+    };
+    const meta = levelMap[level] || levelMap.observe;
+
+    bannerEl.classList.remove("ops-ok", "ops-wait", "ops-danger");
+    bannerEl.classList.add(level === "ready" ? "ops-ok" : level === "observe" ? "ops-wait" : "ops-danger");
+
+    tagEl.className = `tag ${meta.cls}`;
+    tagEl.textContent = meta.label;
+    titleEl.textContent = String(gate && gate.title || "运行门禁等待数据");
+    detailEl.textContent = String(gate && gate.detail || "这里会把 startup、自检、monitor 和 reconciliation 的综合结论顶到最上层。");
+
+    const items = Array.isArray(gate && gate.items) ? gate.items : [];
+    const issues = Array.isArray(gate && gate.issues) ? gate.issues : [];
+    const actions = Array.isArray(gate && gate.actions) ? gate.actions : [];
+    checksEl.innerHTML = items.length > 0
+      ? items.map((item) => `<li><span>${String(item.label || "-")}</span><b>${String(item.value || "-")}</b></li>`).join("")
+      : '<li><span>状态</span><b>等待数据...</b></li>';
+    if (issues.length > 0) {
+      checksEl.innerHTML += issues.slice(0, 2).map((item) => `<li><span>重点问题</span><b>${String(item)}</b></li>`).join("");
+    }
+
+    actionsMetaEl.textContent = `${actions.length} actions`;
+    actionsEl.innerHTML = actions.length > 0
+      ? actions.slice(0, 5).map((item) => {
+          const cls = String(item && item.cls || "wait");
+          const tag = cls === "danger" ? "优先" : cls === "ok" ? "继续" : "观察";
+          const controls = Array.isArray(item && item.controls) ? item.controls : [];
+          const controlsHtml = controls.length > 0
+            ? `<div class="ops-action-buttons">${controls.map((control) => `<button class="btn ghost" data-ops-action="${String(control.type || "")}" data-ops-value="${attrToken(control.value || "")}">${String(control.label || "")}</button>`).join("")}</div>`
+            : "";
+          return `<li><span class="tag ${cls}">${tag}</span><div class="ops-action-body"><b>${String(item && item.title || "-")}</b><p>${String(item && item.detail || "")}</p>${controlsHtml}</div></li>`;
+        }).join("")
+      : '<li><span class="tag wait">等待</span><div><b>等待运行门禁建议</b><p>这里会根据 startup、monitor 和 reconciliation 自动给出下一步动作。</p></div></li>';
+
+    pillEl.className = `guard ${meta.guard}`;
+    pillEl.textContent = `OPS ${meta.label}`;
+    liveStatusLabelEl.textContent = meta.label;
+    liveDotEl.classList.remove("dot-ok", "dot-wait", "dot-danger");
+    liveDotEl.classList.add(meta.dot);
+    emergencyBtn.classList.toggle("recommended", level === "block" || level === "escalate");
+  }
+
+  function renderMonitorReports(monitor30m, monitor12h, eodReport, now) {
+    const metaEl = $("monitor-report-meta");
+    const summaryEl = $("monitor-report-summary");
+    const calloutEl = $("monitor-report-callout");
+    const list30El = $("monitor-30m-list");
+    const list12El = $("monitor-12h-list");
+    const eodListEl = $("reconciliation-eod-list");
+    const breakdownMetaEl = $("reconciliation-eod-breakdown-meta");
+    const breakdownEl = $("reconciliation-eod-breakdown");
+    if (!metaEl || !summaryEl || !calloutEl || !list30El || !list12El || !eodListEl || !breakdownMetaEl || !breakdownEl) return;
+
+    const report30 = monitor30m || EMPTY_MONITOR_REPORT("monitor_30m");
+    const report12 = monitor12h || EMPTY_MONITOR_REPORT("monitor_12h");
+    const eod = eodReport || EMPTY_RECONCILIATION_EOD_REPORT;
+    const eodStartup = eod.startup && typeof eod.startup === "object" ? eod.startup : {};
+    const eodReconciliation = eod.reconciliation && typeof eod.reconciliation === "object" ? eod.reconciliation : {};
+    const ledgerSummary = eod.ledger_summary && typeof eod.ledger_summary === "object" ? eod.ledger_summary : {};
+    const recommendations = Array.isArray(eod.recommendations) ? eod.recommendations.filter((item) => String(item || "").trim()) : [];
+    const issues = Array.isArray(eod.issues) ? eod.issues.filter((item) => String(item || "").trim()) : [];
+    const fillBySource = Array.isArray(ledgerSummary.fill_by_source) ? ledgerSummary.fill_by_source : [];
+    const fillBySide = Array.isArray(ledgerSummary.fill_by_side) ? ledgerSummary.fill_by_side : [];
+
+    const startupReady = eodStartup.ready === false
+      ? false
+      : report30.startup_ready === false || report12.startup_ready === false
+        ? false
+        : eodStartup.ready === true || report30.startup_ready === true || report12.startup_ready === true;
+    const [startupCls, startupTag] = startupReady === false
+      ? ["danger", "NOT READY"]
+      : startupReady === true
+        ? ["ok", "READY"]
+        : ["cancel", "UNKNOWN"];
+    const [recon30Cls, recon30Tag] = reportDecisionMeta(report30.final_recommendation || report30.recommendation, report30.reconciliation_status);
+    const [recon12Cls, recon12Tag] = reportDecisionMeta(report12.final_recommendation || report12.recommendation, report12.reconciliation_status);
+    const [eodCls, eodTag] = reportStatusMeta(eod.status || eodReconciliation.status || "unknown");
+    const internalDiff = Number(eodReconciliation.internal_vs_ledger_diff || 0);
+    const fillCount = Number(ledgerSummary.fill_count || 0);
+    const generatedTs = Math.max(Number(report30.generated_ts || 0), Number(report12.generated_ts || 0), Number(eod.generated_ts || 0));
+
+    metaEl.textContent = generatedTs > 0
+      ? `latest ${fmtDateTime(generatedTs)} · ${fmtAge(Math.max(0, Math.floor(Date.now() / 1000) - generatedTs))}前`
+      : "30m / 12h / EOD";
+
+    summaryEl.innerHTML = [
+      `<div class="review-chip"><span>启动就绪</span><b><span class="tag ${startupCls}">${startupTag}</span></b></div>`,
+      `<div class="review-chip"><span>30m</span><b><span class="tag ${recon30Cls}">${recon30Tag}</span></b></div>`,
+      `<div class="review-chip"><span>12h</span><b><span class="tag ${recon12Cls}">${recon12Tag}</span></b></div>`,
+      `<div class="review-chip"><span>EOD</span><b><span class="tag ${eodCls}">${eodTag}</span></b></div>`,
+      `<div class="review-chip"><span>账本差异</span><b class="${clsForValue(internalDiff)}">${fmtUsd(internalDiff)}</b></div>`,
+      `<div class="review-chip"><span>当日成交</span><b>${fillCount} fills / ${fmtUsd(ledgerSummary.fill_notional || 0, false)}</b></div>`,
+    ].join("");
+
+    let calloutCls = "ok";
+    let calloutTag = "对齐";
+    let calloutTitle = "执行与监控链路已接通";
+    let calloutBody = "可以直接从 dashboard 读取 30m、12h 和 EOD 摘要，不再需要人工翻 shell 文本。";
+    if (startupReady === false) {
+      calloutCls = "danger";
+      calloutTag = "阻断";
+      calloutTitle = "启动自检未就绪";
+      calloutBody = "先修复 smoke、账户或 broker 前置条件，再讨论参数或策略表现。";
+    } else if (String(eod.status || "").toLowerCase() === "fail" || String(report12.reconciliation_status || "").toLowerCase() === "fail" || String(report30.reconciliation_status || "").toLowerCase() === "fail") {
+      calloutCls = "danger";
+      calloutTag = "对账失败";
+      calloutTitle = "执行事实层存在漂移";
+      calloutBody = String(report12.final_recommendation || report30.final_recommendation || recommendations[0] || "请优先检查 ledger 漂移、broker 同步和陈旧 pending 单。");
+    } else if (String(eod.status || "").toLowerCase() === "warn" || String(report12.reconciliation_status || "").toLowerCase() === "warn" || String(report30.reconciliation_status || "").toLowerCase() === "warn") {
+      calloutCls = "wait";
+      calloutTag = "观察";
+      calloutTitle = "执行层有警告，暂不适合调参数";
+      calloutBody = String(report12.final_recommendation || report30.final_recommendation || recommendations[0] || "先处理 stale pending orders、snapshot age 和 reconcile age。");
+    }
+    calloutEl.innerHTML = `<span class="tag ${calloutCls}">${calloutTag}</span><div><b>${calloutTitle}</b><p>${calloutBody}</p></div>`;
+
+    const renderMonitorWindow = (el, report, label) => {
+      const counts = report.counts && typeof report.counts === "object" ? report.counts : {};
+      const ratios = report.ratios && typeof report.ratios === "object" ? report.ratios : {};
+      const reconciliation = report.reconciliation && typeof report.reconciliation === "object" ? report.reconciliation : {};
+      const [sampleCls, sampleTag] = reportStatusMeta(report.sample_status || "unknown");
+      const [decisionCls, decisionTag] = reportDecisionMeta(report.final_recommendation || report.recommendation, report.reconciliation_status || reconciliation.status || "unknown");
+      const [reconCls, reconTag] = reportStatusMeta(report.reconciliation_status || reconciliation.status || "unknown");
+      const issueText = String(report.reconciliation_issue_summary || "").trim() || "(none)";
+      const generated = Number(report.generated_ts || 0);
+      const exec = Number(counts.exec || 0);
+      const skipMax = Number(counts.skip_max_open || 0);
+      const addCd = Number(counts.skip_token_add_cooldown || 0);
+      const timeExit = Number(counts.time_exit_close || 0);
+      const reject = Number(counts.reject_wallet_failures || 0);
+      const skipRatio = ratios.skip_max_open_per_exec == null ? "--" : fmtRatioPct(ratios.skip_max_open_per_exec, 0);
+      const exitRatio = ratios.time_exit_close_per_exec == null ? "--" : fmtRatioPct(ratios.time_exit_close_per_exec, 0);
+      const rejectRatio = ratios.reject_wallet_failures_per_exec == null ? "--" : fmtRatioPct(ratios.reject_wallet_failures_per_exec, 0);
+      const recAge = Number(reconciliation.broker_reconcile_age_seconds || 0);
+      const eventAge = Number(reconciliation.broker_event_sync_age_seconds || 0);
+      el.innerHTML = [
+        `<li><div class="review-main"><span>${label} 窗口</span><b><span class="tag ${sampleCls}">${sampleTag}</span> <span class="tag ${decisionCls}">${decisionTag}</span></b></div><div class="review-sub">${generated > 0 ? `${fmtDateTime(generated)} · ${fmtAge(Math.max(0, Math.floor(Date.now() / 1000) - generated))}前` : "尚未生成报告"}</div></li>`,
+        `<li><div class="review-main"><span>样本与计数</span><b>${exec} EXEC</b></div><div class="review-sub">skip max ${skipMax} · cooldown ${addCd} · time exit ${timeExit}${reject > 0 ? ` · reject ${reject}` : ""}</div></li>`,
+        `<li><div class="review-main"><span>比例与同步</span><b><span class="tag ${reconCls}">${reconTag}</span></b></div><div class="review-sub">skip ${skipRatio} · exit ${exitRatio}${reject > 0 || ratios.reject_wallet_failures_per_exec != null ? ` · reject ${rejectRatio}` : ""} · reconcile ${recAge > 0 ? fmtAge(recAge) : "--"} · events ${eventAge > 0 ? fmtAge(eventAge) : "--"}</div></li>`,
+        `<li><div class="review-main"><span>最终建议</span><b>${decisionTag}</b></div><div class="review-sub">${String(report.final_recommendation || report.recommendation || issueText || "暂无建议")}</div></li>`,
+      ].join("");
+    };
+
+    renderMonitorWindow(list30El, report30, "30m");
+    renderMonitorWindow(list12El, report12, "12h");
+
+    const startupFailures = Number(eodStartup.failure_count || 0);
+    const startupWarnings = Number(eodStartup.warning_count || 0);
+    const stalePending = Number(eodReconciliation.stale_pending_orders || 0);
+    const latestFillTs = Number(ledgerSummary.latest_ts || 0);
+    const eodRecommendationText = recommendations.length > 0 ? recommendations.join(" / ") : "暂无 EOD 建议";
+    eodListEl.innerHTML = [
+      `<li><div class="review-main"><span>日终状态</span><b><span class="tag ${eodCls}">${eodTag}</span></b></div><div class="review-sub">${eod.day_key || "--"} · ${Number(eod.generated_ts || 0) > 0 ? fmtDateTime(eod.generated_ts) : "尚未生成"} · latest fill ${latestFillTs > 0 ? historyAgeLabel(latestFillTs, now || latestFillTs) : "未记录"}</div></li>`,
+      `<li><div class="review-main"><span>盈亏与差异</span><b class="${clsForValue(ledgerSummary.realized_pnl || 0)}">${fmtUsd(ledgerSummary.realized_pnl || 0)}</b></div><div class="review-sub">internal vs ledger ${fmtUsd(eodReconciliation.internal_vs_ledger_diff || 0)} · broker floor gap ${fmtUsd(eodReconciliation.broker_floor_gap_vs_internal || 0)}</div></li>`,
+      `<li><div class="review-main"><span>启动与 pending</span><b>${startupFailures} fail / ${startupWarnings} warn</b></div><div class="review-sub">stale pending ${stalePending} · open ${Number(eod.state_summary && eod.state_summary.open_positions || 0)} · tracked ${fmtUsd(eod.state_summary && eod.state_summary.tracked_notional_usd || 0, false)}</div></li>`,
+      `<li><div class="review-main"><span>推荐动作</span><b>${recommendations.length}</b></div><div class="review-sub">${issues.length > 0 ? `${issues.join("; ")} · ` : ""}${eodRecommendationText}</div></li>`,
+    ].join("");
+
+    const breakdownCards = [];
+    fillBySource.slice(0, 4).forEach((bucket) => {
+      breakdownCards.push(`<div class="component-card">
+        <span>来源 ${String(bucket.source || "unknown")}</span>
+        <b>${Number(bucket.fill_count || 0)} fills</b>
+        <div class="tiny-list">
+          <span><i>金额</i><strong>${fmtUsd(bucket.notional || 0, false)}</strong></span>
+          <span><i>已实现</i><strong class="${clsForValue(bucket.realized_pnl || 0)}">${fmtUsd(bucket.realized_pnl || 0)}</strong></span>
+        </div>
+      </div>`);
+    });
+    fillBySide.slice(0, 2).forEach((bucket) => {
+      breakdownCards.push(`<div class="component-card">
+        <span>方向 ${String(bucket.side || "UNKNOWN")}</span>
+        <b>${Number(bucket.fill_count || 0)} fills</b>
+        <div class="tiny-list">
+          <span><i>金额</i><strong>${fmtUsd(bucket.notional || 0, false)}</strong></span>
+          <span><i>已实现</i><strong class="${clsForValue(bucket.realized_pnl || 0)}">${fmtUsd(bucket.realized_pnl || 0)}</strong></span>
+        </div>
+      </div>`);
+    });
+    breakdownMetaEl.textContent = `${fillBySource.length} sources / ${fillBySide.length} sides`;
+    breakdownEl.innerHTML = breakdownCards.length > 0
+      ? breakdownCards.join("")
+      : '<div class="component-card"><span>成交分解</span><b>当日暂无 fill</b></div>';
+  }
+
+  function renderDiagnostics(data, monitor30m, monitor12h, eodReport, now) {
+    const metaEl = $("diagnostics-meta");
+    const startupListEl = $("startup-checks-list");
+    const factsListEl = $("reconciliation-facts-list");
+    const issuesListEl = $("diagnostics-issues-list");
+    const pendingMetaEl = $("diagnostic-pending-meta");
+    const pendingBodyEl = $("diagnostic-pending-body");
+    const focusMetaEl = $("diagnostic-focus-meta");
+    const focusHeadEl = $("diagnostic-focus-head");
+    const focusSummaryEl = $("diagnostic-focus-summary");
+    const focusListEl = $("diagnostic-focus-list");
+    if (!metaEl || !startupListEl || !factsListEl || !issuesListEl || !pendingMetaEl || !pendingBodyEl || !focusMetaEl || !focusHeadEl || !focusSummaryEl || !focusListEl) return;
+
+    const state = data && typeof data === "object" ? data : {};
+    const startup = state.startup && typeof state.startup === "object" ? state.startup : {};
+    const reconciliation = state.reconciliation && typeof state.reconciliation === "object" ? state.reconciliation : {};
+    const control = state.control && typeof state.control === "object" ? state.control : {};
+    const operatorFeedback = state.operator_feedback && typeof state.operator_feedback === "object" ? state.operator_feedback : {};
+    const lastOperatorAction = operatorFeedback.last_action && typeof operatorFeedback.last_action === "object" ? operatorFeedback.last_action : {};
+    const report30 = monitor30m && typeof monitor30m === "object" ? monitor30m : EMPTY_MONITOR_REPORT("monitor_30m");
+    const report12 = monitor12h && typeof monitor12h === "object" ? monitor12h : EMPTY_MONITOR_REPORT("monitor_12h");
+    const eod = eodReport && typeof eodReport === "object" ? eodReport : EMPTY_RECONCILIATION_EOD_REPORT;
+    const eodRecommendations = Array.isArray(eod.recommendations) ? eod.recommendations : [];
+    const eodIssues = Array.isArray(eod.issues) ? eod.issues : [];
+    const startupChecks = Array.isArray(startup.checks) ? startup.checks : [];
+    const pendingOrders = Array.isArray(state.pending_order_details)
+      ? state.pending_order_details.map((row, index) => ({ ...row, _diagKey: pendingOrderRowKey(row, index) }))
+      : [];
+    const operatorRequestTs = Number(control.clear_stale_pending_requested_ts || 0);
+    const operatorActionProcessedTs = Number(lastOperatorAction.processed_ts || 0);
+    const operatorActionStatus = operatorRequestTs > operatorActionProcessedTs
+      ? { ...lastOperatorAction, status: "requested" }
+      : lastOperatorAction;
+    const operatorMeta = operatorActionMeta(operatorActionStatus);
+    const generatedTs = Math.max(Number(report30.generated_ts || 0), Number(report12.generated_ts || 0), Number(eod.generated_ts || 0), Number(state.ts || 0));
+
+    lastDiagnosticsState = state;
+    lastDiagnosticsMonitor30 = report30;
+    lastDiagnosticsMonitor12 = report12;
+    lastDiagnosticsEod = eod;
+    lastDiagnosticsNow = now;
+
+    metaEl.textContent = generatedTs > 0
+      ? `${fmtDateTime(generatedTs)} · ${fmtAge(Math.max(0, Math.floor(Date.now() / 1000) - generatedTs))}前`
+      : "startup / reconciliation / monitor";
+
+    const startupKeys = new Set(startupChecks.map((row) => String(row && row.name || "startup")));
+    const pendingKeys = new Set(pendingOrders.map((row) => String(row._diagKey || "")));
+    const selectedStartupExists = selectedDiagnosticFocusKind === "startup" && startupKeys.has(selectedDiagnosticFocusKey);
+    const selectedPendingExists = selectedDiagnosticFocusKind === "pending" && pendingKeys.has(selectedDiagnosticFocusKey);
+    if (!selectedStartupExists && !selectedPendingExists) {
+      const nextFocus = selectDefaultDiagnosticFocus(startupChecks, pendingOrders);
+      selectedDiagnosticFocusKind = nextFocus.kind;
+      selectedDiagnosticFocusKey = nextFocus.key;
+    }
+
+    startupListEl.innerHTML = startupChecks.length > 0
+      ? startupChecks.slice(0, 8).map((row) => {
+          const [cls, tag] = startupCheckMeta(row && row.status);
+          const details = row && row.details && typeof row.details === "object" ? row.details : null;
+          const detailText = details
+            ? Object.entries(details)
+                .slice(0, 3)
+                .map(([key, value]) => `${key}=${String(value)}`)
+                .join(" · ")
+            : "";
+          const rowKey = String(row && row.name || "startup");
+          const active = selectedDiagnosticFocusKind === "startup" && selectedDiagnosticFocusKey === rowKey;
+          return `<li class="review-selectable${active ? " active" : ""}" data-diagnostic-kind="startup" data-diagnostic-key="${attrToken(rowKey)}">
+            <div class="review-main">
+              <span>${String(row && row.name || "startup")}</span>
+              <b><span class="tag ${cls}">${tag}</span></b>
+            </div>
+            <div class="review-sub">${String(row && row.message || "no message")}${detailText ? ` · ${detailText}` : ""}</div>
+          </li>`;
+        }).join("")
+      : '<li><div class="review-main"><span>暂无 startup checks</span><b>--</b></div></li>';
+
+    const facts = [
+      {
+        label: "internal vs ledger",
+        value: fmtUsd(reconciliation.internal_vs_ledger_diff || 0),
+        sub: `broker floor gap ${fmtUsd(reconciliation.broker_floor_gap_vs_internal || 0)}`,
+        cls: clsForValue(reconciliation.internal_vs_ledger_diff || 0),
+      },
+      {
+        label: "pending / stale",
+        value: `${Number(reconciliation.pending_orders || 0)} / ${Number(reconciliation.stale_pending_orders || 0)}`,
+        sub: `entry ${Number(reconciliation.pending_entry_orders || 0)} · exit ${Number(reconciliation.pending_exit_orders || 0)}`,
+        cls: Number(reconciliation.stale_pending_orders || 0) > 0 ? "value-negative" : "value-neutral",
+      },
+      {
+        label: "snapshot age",
+        value: fmtAge(reconciliation.account_snapshot_age_seconds || 0),
+        sub: `reconcile ${fmtAge(reconciliation.broker_reconcile_age_seconds || 0)} · events ${fmtAge(reconciliation.broker_event_sync_age_seconds || 0)}`,
+        cls: Number(reconciliation.account_snapshot_age_seconds || 0) > 1800 ? "value-negative" : "value-neutral",
+      },
+      {
+        label: "fills today",
+        value: `${Number(reconciliation.fill_count_today || 0)}`,
+        sub: `notional ${fmtUsd(reconciliation.fill_notional_today || 0, false)} · account sync ${Number(reconciliation.account_sync_count_today || 0)}`,
+        cls: "value-neutral",
+      },
+      {
+        label: "startup checks today",
+        value: `${Number(reconciliation.startup_checks_count_today || 0)}`,
+        sub: `last fill ${Number(reconciliation.last_fill_ts || 0) > 0 ? historyAgeLabel(reconciliation.last_fill_ts, now) : "未记录"}`,
+        cls: "value-neutral",
+      },
+      {
+        label: "open / tracked",
+        value: `${Number(reconciliation.open_positions || 0)} / ${fmtUsd(reconciliation.tracked_notional_usd || 0, false)}`,
+        sub: `status ${String(reconciliation.status || "unknown")}`,
+        cls: "value-neutral",
+      },
+      {
+        label: "operator cleanup",
+        value: operatorMeta.label,
+        sub: operatorRequestTs > 0
+          ? `${operatorActionProcessedTs > 0 ? `processed ${fmtDateTime(operatorActionProcessedTs)}` : "request queued"} · request ${fmtDateTime(operatorRequestTs)}${operatorActionStatus.remaining_pending_orders != null ? ` · remain ${Number(operatorActionStatus.remaining_pending_orders || 0)}` : ""}`
+          : "尚未请求 clear_stale_pending",
+        cls: operatorMeta.valueCls,
+      },
+    ];
+    factsListEl.innerHTML = facts.map((item) => `<li>
+      <div class="review-main">
+        <span>${item.label}</span>
+        <b class="${item.cls}">${item.value}</b>
+      </div>
+      <div class="review-sub">${item.sub}</div>
+    </li>`).join("");
+
+    const issueRows = [];
+    const pushIssue = (title, detail, status = "wait") => {
+      const safeTitle = String(title || "").trim();
+      const safeDetail = String(detail || "").trim();
+      if (!safeTitle || !safeDetail) return;
+      issueRows.push({ title: safeTitle, detail: safeDetail, status });
+    };
+
+    const stateIssues = Array.isArray(reconciliation.issues) ? reconciliation.issues : [];
+    stateIssues.slice(0, 4).forEach((item) => pushIssue("state reconciliation", String(item), String(reconciliation.status || "wait")));
+    if (report30.final_recommendation) pushIssue("30m monitor", String(report30.final_recommendation), recommendationKind(report30.final_recommendation) === "ready" ? "ok" : recommendationKind(report30.final_recommendation));
+    if (report12.final_recommendation) pushIssue("12h monitor", String(report12.final_recommendation), recommendationKind(report12.final_recommendation) === "ready" ? "ok" : recommendationKind(report12.final_recommendation));
+    eodIssues.slice(0, 3).forEach((item) => pushIssue("EOD issue", String(item), String(eod.status || "wait")));
+    eodRecommendations.slice(0, 3).forEach((item) => pushIssue("EOD recommendation", String(item), String(eod.status || "wait")));
+    if (operatorRequestTs > 0) {
+      if (operatorRequestTs > operatorActionProcessedTs) {
+        pushIssue("operator action", "clear_stale_pending 已发出请求，等待下一轮 runner 周期消费。", "wait");
+      } else if (String(operatorActionStatus.message || "").trim()) {
+        const operatorIssueStatus = String(operatorActionStatus.status || "wait");
+        pushIssue(
+          "operator action",
+          String(operatorActionStatus.message || ""),
+          operatorIssueStatus === "cleared" || operatorIssueStatus === "noop" ? "ok" : "wait"
+        );
+      }
+    }
+    if (issueRows.length === 0) {
+      pushIssue("current diagnosis", "当前 startup、自检、monitor 和 reconciliation 没有突出异常，继续观察下一轮报告。", "ok");
+    }
+
+    issuesListEl.innerHTML = issueRows.slice(0, 8).map((item) => {
+      const [cls, tag] = reportStatusMeta(item.status);
+      return `<li>
+        <div class="review-main">
+          <span>${item.title}</span>
+          <b><span class="tag ${cls}">${tag}</span></b>
+        </div>
+        <div class="review-sub">${item.detail}</div>
+      </li>`;
+    }).join("");
+
+    const stalePending = Number(reconciliation.stale_pending_orders || 0);
+    pendingMetaEl.textContent = `${pendingOrders.length} orders${stalePending > 0 ? ` · stale ${stalePending}` : ""}`;
+    replaceRows(
+      pendingBodyEl,
+      pendingOrders.slice(0, 12).map((row) => {
+        const [statusCls, statusTag] = pendingOrderStatusMeta(row.broker_status || "live");
+        const [flowCls, flowTag] = actionTagMeta(row.flow === "exit" ? "exit" : "entry", row.flow === "exit" ? "退出" : "入场");
+        const requestedText = row.requested_notional > 0
+          ? `${fmtUsd(row.requested_notional || 0, false)} @ ${Number(row.requested_price || 0).toFixed(4)}`
+          : "--";
+        const matchedText = row.matched_notional_hint > 0
+          ? `${fmtUsd(row.matched_notional_hint || 0, false)} @ ${Number(row.matched_price_hint || 0).toFixed(4)}`
+          : "--";
+        const reasonText = String(row.reason || row.message || "--");
+        const rowClass = selectedDiagnosticFocusKind === "pending" && selectedDiagnosticFocusKey === row._diagKey
+          ? "click-row active-row"
+          : "click-row";
+        return `<tr class="${rowClass}" data-diagnostic-kind="pending" data-diagnostic-key="${attrToken(row._diagKey)}">
+          <td class="wrap">
+            <div class="cell-stack">
+              <span class="cell-main">${Number(row.ts || 0) > 0 ? hhmm(row.ts) : "--:--"}</span>
+              <span class="cell-sub">${Number(row.ts || 0) > 0 ? historyAgeLabel(row.ts, now) : "未记录"}</span>
+            </div>
+          </td>
+          <td class="wrap">
+            <div class="cell-stack">
+              <span class="cell-main">${String(row.title || row.market_slug || row.token_id || "-")}</span>
+              <span class="cell-sub">${String(row.outcome || row.side || "-")}${row.condition_id ? ` · ${row.condition_id}` : ""}</span>
+            </div>
+          </td>
+          <td class="wrap">
+            <div class="cell-stack">
+              <span><span class="tag ${flowCls}">${flowTag}</span> <span class="tag ${statusCls}">${statusTag}</span></span>
+              <span class="cell-sub">${String(row.broker_status || "pending")}${row.order_id ? ` · ${row.order_id}` : ""}</span>
+            </div>
+          </td>
+          <td class="wrap">
+            <div class="cell-stack">
+              <span class="cell-main">${requestedText}</span>
+              <span class="cell-sub">${matchedText}</span>
+            </div>
+          </td>
+          <td class="wrap">${reasonText}</td>
+        </tr>`;
+      }),
+      '<tr><td colspan="5">当前没有活跃 pending / stale 订单</td></tr>'
+    );
+
+    const selectedStartup = selectedDiagnosticFocusKind === "startup"
+      ? startupChecks.find((row) => String(row && row.name || "startup") === selectedDiagnosticFocusKey) || null
+      : null;
+    const selectedPending = selectedDiagnosticFocusKind === "pending"
+      ? pendingOrders.find((row) => String(row._diagKey || "") === selectedDiagnosticFocusKey) || null
+      : null;
+
+    if (selectedStartup) {
+      const [cls, tag] = startupCheckMeta(selectedStartup.status);
+      const details = selectedStartup.details && typeof selectedStartup.details === "object" ? selectedStartup.details : {};
+      const rows = [
+        `<li><span>检查项</span><b>${String(selectedStartup.name || "startup")}</b></li>`,
+        `<li><span>状态</span><b>${tag}</b></li>`,
+        `<li><span>提示</span><b>${String(selectedStartup.message || "暂无说明")}</b></li>`,
+      ];
+      Object.entries(details).forEach(([key, value]) => {
+        rows.push(`<li><span>${String(key)}</span><b>${String(value)}</b></li>`);
+      });
+      focusMetaEl.textContent = `startup · ${String(selectedStartup.name || "startup")}`;
+      focusHeadEl.innerHTML = `<span class="tag ${cls}">${tag}</span><span class="mono">${String(selectedStartup.name || "startup")}</span>`;
+      focusSummaryEl.textContent = String(selectedStartup.message || "当前启动检查没有额外说明");
+      focusListEl.innerHTML = rows.join("");
+      return;
+    }
+
+    if (selectedPending) {
+      const [statusCls, statusTag] = pendingOrderStatusMeta(selectedPending.broker_status || "live");
+      const [flowCls, flowTag] = actionTagMeta(selectedPending.flow === "exit" ? "exit" : "entry", selectedPending.flow === "exit" ? "退出 pending" : "入场 pending");
+      const focusRows = [
+        `<li><span>市场 / 方向</span><b>${String(selectedPending.title || selectedPending.market_slug || selectedPending.token_id || "-")} · ${String(selectedPending.outcome || selectedPending.side || "-")}</b></li>`,
+        `<li><span>订单 / Trace</span><b>${String(selectedPending.order_id || "--")} · ${String(selectedPending.trace_id || "--")}</b></li>`,
+        `<li><span>请求金额</span><b>${fmtUsd(selectedPending.requested_notional || 0, false)} @ ${Number(selectedPending.requested_price || 0).toFixed(4)}</b></li>`,
+        `<li><span>已匹配提示</span><b>${selectedPending.matched_notional_hint > 0 ? `${fmtUsd(selectedPending.matched_notional_hint || 0, false)} @ ${Number(selectedPending.matched_price_hint || 0).toFixed(4)}` : "暂无 matched hint"}</b></li>`,
+        `<li><span>来源钱包</span><b>${selectedPending.wallet ? `${sourceWalletLabel(selectedPending.wallet)}${selectedPending.wallet_tier ? ` · ${selectedPending.wallet_tier}` : ""}${Number(selectedPending.wallet_score || 0) > 0 ? ` · ${Number(selectedPending.wallet_score || 0).toFixed(1)}` : ""}` : "未标记来源"}</b></li>`,
+        `<li><span>入场钱包</span><b>${selectedPending.entry_wallet ? `${sourceWalletLabel(selectedPending.entry_wallet)}${selectedPending.entry_wallet_tier ? ` · ${selectedPending.entry_wallet_tier}` : ""}${Number(selectedPending.entry_wallet_score || 0) > 0 ? ` · ${Number(selectedPending.entry_wallet_score || 0).toFixed(1)}` : ""}` : "未标记 entry wallet"}</b></li>`,
+        `<li><span>Cycle / Signal</span><b>${String(selectedPending.cycle_id || "--")} · ${String(selectedPending.signal_id || "--")}</b></li>`,
+        `<li><span>时间 / 心跳</span><b>${Number(selectedPending.ts || 0) > 0 ? `${fmtDateTime(selectedPending.ts)} · ${historyAgeLabel(selectedPending.ts, now)}` : "未记录"}${Number(selectedPending.last_heartbeat_ts || 0) > 0 ? ` / heartbeat ${historyAgeLabel(selectedPending.last_heartbeat_ts, now)}` : ""}</b></li>`,
+      ];
+      if (selectedPending.topic_label) {
+        focusRows.push(`<li><span>题材</span><b>${String(selectedPending.topic_label)}</b></li>`);
+      }
+      if (selectedPending.condition_id || selectedPending.token_id) {
+        focusRows.push(`<li><span>Condition / Token</span><b>${String(selectedPending.condition_id || "--")} · ${String(selectedPending.token_id || "--")}</b></li>`);
+      }
+      focusMetaEl.textContent = `pending · ${String(selectedPending.order_id || selectedPending.title || "order")}`;
+      focusHeadEl.innerHTML =
+        `<span class="tag ${flowCls}">${flowTag}</span>` +
+        `<span class="tag ${statusCls}">${statusTag}</span>` +
+        `<span class="mono">${String(selectedPending.broker_status || "pending")}</span>`;
+      focusSummaryEl.textContent = String(selectedPending.reason || selectedPending.message || "当前 pending 订单没有额外说明");
+      focusListEl.innerHTML = focusRows.join("");
+      return;
+    }
+
+    focusMetaEl.textContent = "未选择";
+    focusHeadEl.innerHTML = '<span class="tag danger">等待</span><span class="mono">点击 startup check 或 pending 订单查看详情</span>';
+    focusSummaryEl.textContent = "这里会展示启动自检或 pending 订单的结构化细节，帮助 operator 快速判断下一步。";
+    focusListEl.innerHTML = "<li><span>状态</span><b>等待数据...</b></li>";
+  }
+
   function bindExitReviewFilters() {
     const bindList = (id) => {
       const el = $(id);
@@ -1047,6 +1972,81 @@
       persistExitReviewUiState();
       renderAttributionReview(lastAttributionReview || {}, lastAttributionReviewNow || 0);
     });
+  }
+
+  function bindOpsGateActions() {
+    const actionsEl = $("ops-gate-actions");
+    if (!actionsEl || actionsEl.dataset.bound === "1") return;
+    actionsEl.dataset.bound = "1";
+    actionsEl.addEventListener("click", async (event) => {
+      const button = event.target.closest("button[data-ops-action][data-ops-value]");
+      if (!button) return;
+      const action = String(button.getAttribute("data-ops-action") || "");
+      const value = readAttrToken(button.getAttribute("data-ops-value") || "");
+      if (!action || !value) return;
+
+      const original = button.textContent || "";
+      if (action === "copy") {
+        const ok = await copyText(value);
+        button.textContent = ok ? "已复制" : "复制失败";
+        window.setTimeout(() => {
+          button.textContent = original;
+        }, 1200);
+        return;
+      }
+      if (action === "jump") {
+        const target = document.getElementById(value);
+        if (target && typeof target.scrollIntoView === "function") {
+          target.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+        return;
+      }
+      if (action === "open") {
+        window.open(value, "_blank", "noopener,noreferrer");
+        return;
+      }
+      if (action === "api") {
+        button.disabled = true;
+        try {
+          await runOperator(value);
+          button.textContent = "已刷新";
+          await refresh();
+        } catch (_err) {
+          button.textContent = "刷新失败";
+        } finally {
+          window.setTimeout(() => {
+            button.disabled = false;
+            button.textContent = original;
+          }, 1200);
+        }
+      }
+    });
+  }
+
+  function bindDiagnosticsInteractions() {
+    const startupList = $("startup-checks-list");
+    if (startupList && startupList.dataset.bound !== "1") {
+      startupList.dataset.bound = "1";
+      startupList.addEventListener("click", (event) => {
+        const item = event.target.closest("li[data-diagnostic-kind][data-diagnostic-key]");
+        if (!item) return;
+        selectedDiagnosticFocusKind = String(item.getAttribute("data-diagnostic-kind") || "");
+        selectedDiagnosticFocusKey = readAttrToken(item.getAttribute("data-diagnostic-key") || "");
+        renderDiagnostics(lastDiagnosticsState || {}, lastDiagnosticsMonitor30 || {}, lastDiagnosticsMonitor12 || {}, lastDiagnosticsEod || {}, lastDiagnosticsNow || 0);
+      });
+    }
+
+    const pendingBody = $("diagnostic-pending-body");
+    if (pendingBody && pendingBody.dataset.bound !== "1") {
+      pendingBody.dataset.bound = "1";
+      pendingBody.addEventListener("click", (event) => {
+        const row = event.target.closest("tr[data-diagnostic-kind][data-diagnostic-key]");
+        if (!row) return;
+        selectedDiagnosticFocusKind = String(row.getAttribute("data-diagnostic-kind") || "");
+        selectedDiagnosticFocusKey = readAttrToken(row.getAttribute("data-diagnostic-key") || "");
+        renderDiagnostics(lastDiagnosticsState || {}, lastDiagnosticsMonitor30 || {}, lastDiagnosticsMonitor12 || {}, lastDiagnosticsEod || {}, lastDiagnosticsNow || 0);
+      });
+    }
   }
 
   function bindWalletSelection() {
@@ -1334,6 +2334,19 @@
     renderControlState(payload || {});
   }
 
+  async function runOperator(command, extra = {}) {
+    const res = await fetch("/api/operator", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ command, ...extra }),
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok || !payload || payload.ok !== true) {
+      throw new Error(`operator request failed: ${res.status}`);
+    }
+    return payload;
+  }
+
   function bindControlActions() {
     const pauseBtn = $("btn-pause-opening");
     if (pauseBtn) {
@@ -1380,9 +2393,13 @@
 
   async function refresh() {
     try {
-      const res = await fetch("/api/state", { cache: "no-store" });
-      if (!res.ok) return;
-      const data = await res.json();
+      const [data, monitor30m, monitor12h, reconciliationEod] = await Promise.all([
+        fetchJson("/api/state", null),
+        fetchJson("/api/monitor/30m", EMPTY_MONITOR_REPORT("monitor_30m")),
+        fetchJson("/api/monitor/12h", EMPTY_MONITOR_REPORT("monitor_12h")),
+        fetchJson("/api/reconciliation/eod", EMPTY_RECONCILIATION_EOD_REPORT),
+      ]);
+      if (!data) return;
 
       const summary = data.summary || {};
       const config = data.config || {};
@@ -1393,8 +2410,10 @@
       const slotUtil = Number(summary.slot_utilization_pct || summary.exposure_pct || 0);
       const mode = String(config.execution_mode || (config.dry_run ? "paper" : "live")).toLowerCase();
       const brokerName = String(config.broker_name || (mode === "live" ? "LiveClobBroker" : "PaperBroker"));
+      const opsGate = computeOpsGate(data, monitor30m, monitor12h, reconciliationEod);
       renderControlState(control);
       updateModeBadge(config);
+      renderOpsGate(opsGate);
 
       if ($("status-line")) {
         $("status-line").textContent = `聪明钱包跟单账本 · 状态时间 ${hhmm(now)} · bot 轮询 ${pollSec}s · 前端刷新 ${FRONTEND_REFRESH_SECONDS}s`;
@@ -1472,7 +2491,7 @@
         $("orders-body"),
         orders.slice(0, 10).map((o) => {
           const st = String(o.status || "PENDING").toUpperCase();
-          const map = { FILLED: ["ok", "已成交"], PENDING: ["wait", "待成交"], REJECTED: ["danger", "已拒绝"], CANCELED: ["cancel", "已撤单"] };
+          const map = { FILLED: ["ok", "已成交"], PENDING: ["wait", "待成交"], REJECTED: ["danger", "已拒绝"], CANCELED: ["cancel", "已撤单"], CLEARED: ["cancel", "已清理"] };
           const [cls, txt] = map[st] || ["wait", st];
           const ts = hhmm(Number(o.ts || now));
           const [action, actionLabel] = orderActionMeta(o);
@@ -1595,6 +2614,8 @@
       renderExitReview(data.exit_review || {}, now);
       renderSignalReview(data.signal_review || {}, now);
       renderAttributionReview(data.attribution_review || {}, now);
+      renderMonitorReports(monitor30m, monitor12h, reconciliationEod, now);
+      renderDiagnostics(data, monitor30m, monitor12h, reconciliationEod, now);
 
       const alerts = (data.alerts || []).slice(0, 6);
       if ($("alerts-list")) {
@@ -1643,11 +2664,13 @@
 
   loadUiState();
   bindControlActions();
+  bindOpsGateActions();
   bindWalletSelection();
   bindExitReviewFilters();
   bindExitReviewSamples();
   bindTraceReviewInteractions();
   bindAttributionWindows();
+  bindDiagnosticsInteractions();
   refresh();
   setInterval(refresh, FRONTEND_REFRESH_SECONDS * 1000);
 })();

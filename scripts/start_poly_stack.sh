@@ -8,7 +8,6 @@ BOT_PID_FILE="$RUNTIME_DATA/poly_bot.pid"
 WEB_LOG="$RUNTIME_DATA/poly_web.log"
 BOT_LOG="$RUNTIME_DATA/poly_bot.log"
 STATE_PATH="$RUNTIME_DATA/state.json"
-WEB_URL="http://127.0.0.1:8787/api/state"
 VERIFY_SCRIPT="$BASE/scripts/verify_stack.sh"
 PY_BIN="$BASE/.venv/bin/python"
 CURL_BIN="/usr/bin/curl"
@@ -20,6 +19,28 @@ AGENT_DIR="$HOME/Library/LaunchAgents"
 WEB_PLIST="$AGENT_DIR/$WEB_LABEL.plist"
 BOT_PLIST="$AGENT_DIR/$BOT_LABEL.plist"
 STACK_WEB_PORT=8787
+
+read_dotenv_var() {
+  local key="$1"
+  local dotenv="$BASE/.env"
+  [[ -f "$dotenv" ]] || return 0
+  awk -F= -v key="$key" '
+    $0 ~ "^[[:space:]]*" key "=" {
+      sub(/^[[:space:]]*[^=]+=/, "", $0)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+      gsub(/^"|"$/, "", $0)
+      gsub(/^'\''|'\''$/, "", $0)
+      print $0
+      exit
+    }
+  ' "$dotenv"
+}
+
+CONTROL_TOKEN="${POLY_CONTROL_TOKEN:-$(read_dotenv_var POLY_CONTROL_TOKEN)}"
+WEB_URL="http://127.0.0.1:8787/api/state"
+if [[ -n "${CONTROL_TOKEN:-}" ]]; then
+  WEB_URL="${WEB_URL}?token=${CONTROL_TOKEN}"
+fi
 
 mkdir -p "$RUNTIME_DATA"
 
@@ -197,6 +218,7 @@ write_web_plist() {
   <key>EnvironmentVariables</key>
   <dict>
     <key>PYTHONPATH</key><string>$BASE/src</string>
+    <key>POLY_CONTROL_TOKEN</key><string>${CONTROL_TOKEN}</string>
   </dict>
   <key>StandardOutPath</key><string>$WEB_LOG</string>
   <key>StandardErrorPath</key><string>$WEB_LOG</string>
@@ -225,6 +247,7 @@ write_bot_plist() {
   <key>EnvironmentVariables</key>
   <dict>
     <key>PYTHONPATH</key><string>$BASE/src</string>
+    <key>POLY_CONTROL_TOKEN</key><string>${CONTROL_TOKEN}</string>
   </dict>
   <key>StandardOutPath</key><string>$BOT_LOG</string>
   <key>StandardErrorPath</key><string>$BOT_LOG</string>
@@ -258,7 +281,7 @@ start_direct_process() {
     rm -f "$pid_file"
   fi
 
-  nohup env "PYTHONPATH=$BASE/src" "$@" >>"$log_file" 2>&1 < /dev/null &
+  nohup env "PYTHONPATH=$BASE/src" "POLY_CONTROL_TOKEN=${CONTROL_TOKEN}" "$@" >>"$log_file" 2>&1 < /dev/null &
   local pid=$!
   echo "$pid" >"$pid_file"
 }
@@ -409,7 +432,7 @@ fi
 
 echo "--- runtime verify ---"
 VERIFY_STARTED_AT="$RUN_START_TS" \
-VERIFY_RETRIES="${START_STACK_VERIFY_RETRIES:-12}" \
+VERIFY_RETRIES="${START_STACK_VERIFY_RETRIES:-60}" \
 VERIFY_RETRY_INTERVAL_SECONDS="${START_STACK_VERIFY_INTERVAL_SECONDS:-3}" \
 "$VERIFY_SCRIPT" "$WEB_URL"
 

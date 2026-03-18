@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import io
 import unittest
 from typing import Any
+import zipfile
 
 from polymarket_bot.clients.data_api import PolymarketDataClient
 
@@ -27,8 +29,103 @@ class _StubDataClient(PolymarketDataClient):
         self.calls.append((base_url, path, normalized))
         return self._responder(base_url, path, normalized)
 
+    def _get_bytes_from_base(
+        self,
+        base_url: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+    ) -> bytes:
+        normalized = dict(params or {})
+        self.calls.append((base_url, path, normalized))
+        payload = self._responder(base_url, path, normalized)
+        if isinstance(payload, bytes):
+            return payload
+        raise TypeError("Stub responder must return bytes for _get_bytes_from_base")
+
 
 class DataApiClientTests(unittest.TestCase):
+    def test_get_order_book_parses_tick_and_min_size(self):
+        def responder(base_url: str, path: str, params: dict[str, Any]) -> Any:
+            self.assertEqual(base_url, "https://clob.polymarket.com")
+            self.assertEqual(path, "/book")
+            self.assertEqual(params["token_id"], "token-1")
+            return {
+                "market": "demo-market",
+                "asset_id": "token-1",
+                "timestamp": "123456",
+                "hash": "hash-1",
+                "bids": [{"price": "0.48", "size": "120"}],
+                "asks": [{"price": "0.52", "size": "95"}],
+                "min_order_size": "5",
+                "tick_size": "0.01",
+                "neg_risk": True,
+                "last_trade_price": "0.5",
+            }
+
+        client = _StubDataClient(responder)
+
+        book = client.get_order_book("token-1")
+
+        self.assertIsNotNone(book)
+        assert book is not None
+        self.assertEqual(book.market, "demo-market")
+        self.assertEqual(book.asset_id, "token-1")
+        self.assertEqual(book.best_bid, 0.48)
+        self.assertEqual(book.best_ask, 0.52)
+        self.assertEqual(book.tick_size, 0.01)
+        self.assertEqual(book.min_order_size, 5.0)
+        self.assertTrue(book.neg_risk)
+
+    def test_get_midpoint_price_parses_market_response(self):
+        def responder(base_url: str, path: str, params: dict[str, Any]) -> Any:
+            self.assertEqual(base_url, "https://clob.polymarket.com")
+            self.assertEqual(path, "/midpoint")
+            self.assertEqual(params["token_id"], "token-1")
+            return {"mid": "0.503"}
+
+        client = _StubDataClient(responder)
+
+        midpoint = client.get_midpoint_price("token-1")
+
+        self.assertEqual(midpoint, 0.503)
+
+    def test_get_accounting_snapshot_parses_zip_payload(self):
+        def responder(base_url: str, path: str, params: dict[str, Any]) -> Any:
+            self.assertEqual(base_url, "https://data-api.polymarket.com")
+            self.assertEqual(path, "/v1/accounting/snapshot")
+            self.assertEqual(params["user"], "0x1111111111111111111111111111111111111111")
+            payload = io.BytesIO()
+            with zipfile.ZipFile(payload, "w") as archive:
+                archive.writestr(
+                    "equity.csv",
+                    (
+                        "cashBalance,positionsValue,totalValue,valuationTime\n"
+                        "120.5,45.5,166.0,2026-03-17T12:34:56Z\n"
+                    ),
+                )
+                archive.writestr(
+                    "positions.csv",
+                    (
+                        "asset,conditionId,size,curPrice,currentValue,valuationTime\n"
+                        "token-1,condition-1,100,0.455,45.5,2026-03-17T12:34:56Z\n"
+                    ),
+                )
+            return payload.getvalue()
+
+        client = _StubDataClient(responder)
+
+        snapshot = client.get_accounting_snapshot("0x1111111111111111111111111111111111111111")
+
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertAlmostEqual(snapshot.cash_balance, 120.5, places=4)
+        self.assertAlmostEqual(snapshot.positions_value, 45.5, places=4)
+        self.assertAlmostEqual(snapshot.equity, 166.0, places=4)
+        self.assertEqual(snapshot.valuation_time, "2026-03-17T12:34:56Z")
+        self.assertEqual(len(snapshot.positions), 1)
+        self.assertEqual(snapshot.positions[0].token_id, "token-1")
+        self.assertAlmostEqual(snapshot.positions[0].value, 45.5, places=4)
+
     def test_get_user_trades_parses_rows_and_requests_maker_fills(self):
         def responder(base_url: str, path: str, params: dict[str, Any]) -> Any:
             self.assertEqual(base_url, "https://data-api.polymarket.com")

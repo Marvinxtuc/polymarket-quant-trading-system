@@ -7,7 +7,7 @@
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="./styles.css?v=20260317s" />
+  <link rel="stylesheet" href="./styles.css?v=20260317t" />
 </head>
 <body>
   <div class="bg-grid"></div>
@@ -21,13 +21,33 @@
         </div>
       </section>
       <section class="top-actions">
-        <span class="status"><span class="dot"></span>在线</span>
+        <span class="status" id="live-status"><span class="dot" id="live-status-dot"></span><span id="live-status-label">在线</span></span>
+        <span class="guard" id="ops-gate-pill">OPS WAIT</span>
         <span class="guard" id="guard-line">PAPER · PaperBroker · 基准单笔 --U · 理论上限 --U</span>
         <button class="btn" id="btn-pause-opening">暂停开仓</button>
         <button class="btn ghost" id="btn-reduce-only">只减仓模式</button>
         <button class="btn warn" id="btn-emergency-stop">紧急退出</button>
       </section>
     </header>
+
+    <section class="panel ops-banner ops-wait" id="ops-banner">
+      <div class="ops-banner-main">
+        <span class="tag wait" id="ops-gate-tag">等待</span>
+        <div>
+          <h2 id="ops-gate-title">运行门禁等待数据</h2>
+          <p id="ops-gate-detail">这里会把 startup、自检、monitor 和 reconciliation 的综合结论顶到最上层。</p>
+        </div>
+      </div>
+      <ul class="ops-checks" id="ops-gate-checks">
+        <li><span>状态</span><b>等待数据...</b></li>
+      </ul>
+      <div class="ops-actions-wrap">
+        <div class="head compact-head"><h2>建议动作</h2><span class="mono" id="ops-gate-actions-meta">0 actions</span></div>
+        <ul class="ops-actions" id="ops-gate-actions">
+          <li><span class="tag wait">等待</span><div><b>等待运行门禁建议</b><p>这里会根据 startup、monitor 和 reconciliation 自动给出下一步动作。</p></div></li>
+        </ul>
+      </div>
+    </section>
 
     <section class="panel budget-card">
       <div class="head"><h2>账本概况</h2><span class="mono" id="budget-meta">槽位 --/-- · 名义金额 --U · 钱包池 --</span></div>
@@ -73,7 +93,7 @@
           </div>
         </article>
 
-        <article class="panel card card-orders">
+        <article class="panel card card-orders" id="orders-panel">
           <div class="head"><h2>订单管理</h2><span class="mono">最近账本事件</span></div>
           <div class="chips">
             <span class="chip active" id="chip-pending">进行中 0</span>
@@ -173,6 +193,93 @@
     </section>
 
     <section class="bottom-grid">
+      <article class="panel chart chart-monitor-reports chart-span-2" id="monitor-report-panel">
+        <div class="head"><h2>执行监控与日终对账</h2><span class="mono" id="monitor-report-meta">30m / 12h / EOD</span></div>
+        <div class="review-summary" id="monitor-report-summary">
+          <div class="review-chip"><span>启动就绪</span><b>等待数据...</b></div>
+          <div class="review-chip"><span>30m</span><b>--</b></div>
+          <div class="review-chip"><span>12h</span><b>--</b></div>
+          <div class="review-chip"><span>EOD</span><b>--</b></div>
+          <div class="review-chip"><span>账本差异</span><b>--</b></div>
+          <div class="review-chip"><span>当日成交</span><b>--</b></div>
+        </div>
+        <div class="monitor-callout" id="monitor-report-callout">
+          <span class="tag wait">等待</span>
+          <div>
+            <b>等待 monitor / reconciliation 数据</b>
+            <p>这里会展示 30m、12h 和 EOD 对账的最终建议，以及可直接用于运营判断的执行摘要。</p>
+          </div>
+        </div>
+        <div class="review-grid monitor-grid">
+          <section class="review-column">
+            <h3>30m Monitor</h3>
+            <ul class="review-list" id="monitor-30m-list">
+              <li><div class="review-main"><span>等待数据...</span><b>--</b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3>12h Monitor</h3>
+            <ul class="review-list" id="monitor-12h-list">
+              <li><div class="review-main"><span>等待数据...</span><b>--</b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3>EOD 对账</h3>
+            <ul class="review-list" id="reconciliation-eod-list">
+              <li><div class="review-main"><span>等待数据...</span><b>--</b></div></li>
+            </ul>
+          </section>
+        </div>
+        <div class="head compact-head"><h2>成交分解</h2><span class="mono" id="reconciliation-eod-breakdown-meta">0 buckets</span></div>
+        <div class="component-grid monitor-breakdown-grid" id="reconciliation-eod-breakdown">
+          <div class="component-card"><span>成交分解</span><b>等待数据...</b></div>
+        </div>
+      </article>
+
+      <article class="panel chart chart-diagnostics chart-span-2" id="diagnostics-panel">
+        <div class="head"><h2>执行诊断明细</h2><span class="mono" id="diagnostics-meta">startup / reconciliation / monitor</span></div>
+        <div class="review-grid diagnostics-grid">
+          <section class="review-column">
+            <h3>启动自检明细</h3>
+            <ul class="review-list" id="startup-checks-list">
+              <li><div class="review-main"><span>等待数据...</span><b>--</b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3>对账事实</h3>
+            <ul class="review-list" id="reconciliation-facts-list">
+              <li><div class="review-main"><span>等待数据...</span><b>--</b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3>重点问题与建议</h3>
+            <ul class="review-list" id="diagnostics-issues-list">
+              <li><div class="review-main"><span>等待数据...</span><b>--</b></div></li>
+            </ul>
+          </section>
+        </div>
+        <div class="head compact-head"><h2>活跃 Pending / Stale 订单</h2><span class="mono" id="diagnostic-pending-meta">0 orders</span></div>
+        <div class="table-wrap small-scroll">
+          <table class="table">
+            <thead><tr><th>时间</th><th>市场</th><th>状态</th><th>请求 / 已匹配</th><th>原因</th></tr></thead>
+            <tbody id="diagnostic-pending-body">
+              <tr><td colspan="5">等待数据...</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="head compact-head"><h2>诊断焦点详情</h2><span class="mono" id="diagnostic-focus-meta">未选择</span></div>
+        <div class="review-detail">
+          <div class="profile-head" id="diagnostic-focus-head">
+            <span class="tag danger">等待</span>
+            <span class="mono">点击 startup check 或 pending 订单查看详情</span>
+          </div>
+          <p class="profile-summary" id="diagnostic-focus-summary">这里会展示启动自检或 pending 订单的结构化细节，帮助 operator 快速判断下一步。</p>
+          <ul class="list tight" id="diagnostic-focus-list">
+            <li><span>状态</span><b>等待数据...</b></li>
+          </ul>
+        </div>
+      </article>
+
       <article class="panel chart chart-exit-review">
         <div class="head"><h2>退出复盘</h2><span class="mono" id="exit-review-meta">recent 0 exits</span></div>
         <div class="review-summary" id="exit-review-summary">
@@ -409,6 +516,6 @@
       </article>
     </section>
   </main>
-  <script src="./app.js?v=20260317q"></script>
+  <script src="./app.js?v=20260317r"></script>
 </body>
 </html>

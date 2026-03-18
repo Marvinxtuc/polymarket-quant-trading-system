@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import csv
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import io
 import json
 from typing import Any
+import zipfile
 
 import httpx
 from tenacity import retry, stop_after_attempt, wait_exponential
@@ -38,6 +41,38 @@ class TradeFill:
 
 
 @dataclass(slots=True)
+class OrderBookLevel:
+    price: float
+    size: float
+
+
+@dataclass(slots=True)
+class OrderBookSummary:
+    market: str
+    asset_id: str
+    timestamp: str
+    hash: str
+    bids: tuple[OrderBookLevel, ...]
+    asks: tuple[OrderBookLevel, ...]
+    min_order_size: float
+    tick_size: float
+    neg_risk: bool
+    last_trade_price: float = 0.0
+
+    @property
+    def best_bid(self) -> float:
+        if not self.bids:
+            return 0.0
+        return float(self.bids[0].price)
+
+    @property
+    def best_ask(self) -> float:
+        if not self.asks:
+            return 0.0
+        return float(self.asks[0].price)
+
+
+@dataclass(slots=True)
 class ClosedPosition:
     wallet: str
     token_id: str
@@ -65,6 +100,26 @@ class ActivityEvent:
     usdc_size: float
     timestamp: int
     tx_hash: str
+
+
+@dataclass(slots=True)
+class AccountingPosition:
+    token_id: str
+    condition_id: str
+    size: float
+    price: float
+    value: float
+    valuation_time: str
+
+
+@dataclass(slots=True)
+class AccountingSnapshot:
+    wallet: str
+    cash_balance: float
+    positions_value: float
+    equity: float
+    valuation_time: str
+    positions: tuple[AccountingPosition, ...] = ()
 
 
 @dataclass(slots=True)
@@ -102,6 +157,18 @@ class PolymarketDataClient:
         r = self._client.get(url, params=params)
         r.raise_for_status()
         return r.json()
+
+    @retry(wait=wait_exponential(multiplier=0.5, min=0.5, max=4), stop=stop_after_attempt(4))
+    def _get_bytes_from_base(
+        self,
+        base_url: str,
+        path: str,
+        params: dict[str, Any] | None = None,
+    ) -> bytes:
+        url = f"{base_url}{path}"
+        r = self._client.get(url, params=params)
+        r.raise_for_status()
+        return r.content
 
     def _get_json(self, path: str, params: dict[str, Any] | None = None) -> Any:
         return self._get_json_from_base(self.base_url, path, params=params)
@@ -188,6 +255,68 @@ class PolymarketDataClient:
                 )
             )
         return positions
+
+    def get_order_book(self, token_id: str) -> OrderBookSummary | None:
+        normalized = str(token_id).strip()
+        if not normalized:
+            return None
+        data = self._get_json_from_base(
+            self.market_base_url,
+            "/book",
+            params={"token_id": normalized},
+        )
+        if not isinstance(data, dict):
+            return None
+        return self._parse_order_book(data)
+
+    def _parse_order_book(self, row: dict[str, Any]) -> OrderBookSummary | None:
+        asset_id = str(row.get("asset_id") or row.get("assetId") or "").strip()
+        market = str(row.get("market") or "").strip()
+        if not asset_id and not market:
+            return None
+
+        def parse_levels(value: Any) -> tuple[OrderBookLevel, ...]:
+            levels: list[OrderBookLevel] = []
+            if not isinstance(value, list):
+                return tuple(levels)
+            for raw_level in value:
+                if not isinstance(raw_level, dict):
+                    continue
+                price = self._coerce_float(raw_level.get("price"))
+                size = self._coerce_float(raw_level.get("size"))
+                if price <= 0.0 or size <= 0.0:
+                    continue
+                levels.append(OrderBookLevel(price=price, size=size))
+            return tuple(levels)
+
+        return OrderBookSummary(
+            market=market,
+            asset_id=asset_id,
+            timestamp=str(row.get("timestamp") or ""),
+            hash=str(row.get("hash") or ""),
+            bids=parse_levels(row.get("bids")),
+            asks=parse_levels(row.get("asks")),
+            min_order_size=self._coerce_float(row.get("min_order_size") or row.get("minOrderSize")),
+            tick_size=self._coerce_float(row.get("tick_size") or row.get("tickSize")),
+            neg_risk=bool(row.get("neg_risk") or row.get("negRisk")),
+            last_trade_price=self._coerce_float(row.get("last_trade_price") or row.get("lastTradePrice")),
+        )
+
+    def get_midpoint_price(self, token_id: str) -> float | None:
+        normalized = str(token_id).strip()
+        if not normalized:
+            return None
+        data = self._get_json_from_base(
+            self.market_base_url,
+            "/midpoint",
+            params={"token_id": normalized},
+        )
+        if not isinstance(data, dict):
+            return None
+        midpoint = self._coerce_float(data.get("mid_price") or data.get("mid"))
+        if midpoint <= 0.0:
+            return None
+        return midpoint
 
     def get_user_trades(
         self,
@@ -358,6 +487,92 @@ class PolymarketDataClient:
             yield from page
             if len(page) < size:
                 return
+
+    def get_accounting_snapshot(self, wallet: str) -> AccountingSnapshot | None:
+        normalized = self._normalize_wallet(wallet)
+        if not normalized:
+            return None
+
+        payload = self._get_bytes_from_base(
+            self.base_url,
+            "/v1/accounting/snapshot",
+            params={"user": normalized},
+        )
+        if not payload:
+            return None
+
+        try:
+            archive = zipfile.ZipFile(io.BytesIO(payload))
+        except zipfile.BadZipFile:
+            return None
+
+        with archive:
+            names = {name.rsplit("/", 1)[-1]: name for name in archive.namelist()}
+            positions: list[AccountingPosition] = []
+            valuation_time = ""
+            if "positions.csv" in names:
+                with archive.open(names["positions.csv"], "r") as raw:
+                    reader = csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8"))
+                    for row in reader:
+                        token_id = str(row.get("asset") or row.get("token_id") or "").strip()
+                        condition_id = str(row.get("conditionId") or row.get("condition_id") or "").strip()
+                        size = self._coerce_float(row.get("size"))
+                        price = self._coerce_float(row.get("curPrice") or row.get("price"))
+                        value = self._coerce_float(row.get("currentValue") or row.get("value"))
+                        if value <= 0.0 and size > 0.0 and price > 0.0:
+                            value = size * price
+                        if not token_id or size <= 0.0 or value <= 0.0:
+                            continue
+                        row_valuation_time = str(row.get("valuationTime") or row.get("valuation_time") or "").strip()
+                        if row_valuation_time and not valuation_time:
+                            valuation_time = row_valuation_time
+                        positions.append(
+                            AccountingPosition(
+                                token_id=token_id,
+                                condition_id=condition_id,
+                                size=size,
+                                price=price,
+                                value=value,
+                                valuation_time=row_valuation_time,
+                            )
+                        )
+
+            cash_balance = 0.0
+            positions_value = 0.0
+            equity = 0.0
+            equity_row_seen = False
+            if "equity.csv" in names:
+                with archive.open(names["equity.csv"], "r") as raw:
+                    reader = csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8"))
+                    row = next(reader, None)
+                    if row:
+                        equity_row_seen = True
+                        cash_balance = self._coerce_float(row.get("cashBalance") or row.get("cash_balance"))
+                        positions_value = self._coerce_float(row.get("positionsValue") or row.get("positions_value"))
+                        equity = self._coerce_float(row.get("totalValue") or row.get("equity"))
+                        valuation_time = (
+                            str(row.get("valuationTime") or row.get("valuation_time") or "").strip()
+                            or valuation_time
+                        )
+
+            if positions_value <= 0.0 and positions:
+                positions_value = sum(position.value for position in positions)
+            if equity <= 0.0 and (cash_balance > 0.0 or positions_value > 0.0):
+                equity = cash_balance + positions_value
+            if not valuation_time and positions:
+                valuation_time = str(positions[0].valuation_time or "")
+
+            if (not equity_row_seen) and not positions:
+                return None
+
+            return AccountingSnapshot(
+                wallet=normalized,
+                cash_balance=cash_balance,
+                positions_value=positions_value,
+                equity=equity,
+                valuation_time=valuation_time,
+                positions=tuple(positions),
+            )
 
     def get_user_activity(
         self,

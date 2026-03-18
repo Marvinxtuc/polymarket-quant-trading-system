@@ -14,7 +14,8 @@ dependencies = [
 
 [project.optional-dependencies]
 live = [
-  "py-clob-client>=0.20.0"
+  "py-clob-client>=0.20.0",
+  "websocket-client>=1.8.0"
 ]
 
 [project.scripts]

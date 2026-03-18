@@ -5,6 +5,21 @@ out="${1:-/tmp/poly_monitor_12h_report.txt}"
 log="${2:-/tmp/poly_daemon.log}"
 window_sec="${3:-43200}"
 state_file="${4:-/tmp/poly_monitor_12h_inconclusive_state}"
+daemon_state_file="${5:-/tmp/poly_runtime_data/state.json}"
+json_out="${6:-/tmp/poly_monitor_12h_report.json}"
+
+json_number_or_null() {
+  local value="$1"
+  if [[ -z "$value" || "$value" == "NA" || "$value" == "unknown" ]]; then
+    printf 'null'
+    return
+  fi
+  if [[ "$value" == *"NA ("* ]]; then
+    printf 'null'
+    return
+  fi
+  printf '%s' "$value"
+}
 
 start_ts="$(date '+%Y-%m-%d %H:%M:%S')"
 start_size=0
@@ -69,6 +84,40 @@ else
   recommendation="No escalation from sample rule."
 fi
 
+startup_ready="unknown"
+recon_status="unknown"
+recon_issues="(state unavailable)"
+recon_internal_ledger_diff="NA"
+recon_broker_floor_gap="NA"
+recon_stale_pending="NA"
+recon_account_age="NA"
+recon_broker_reconcile_age="NA"
+recon_event_age="NA"
+startup_json='{}'
+reconciliation_json='{}'
+if [[ -f "$daemon_state_file" ]]; then
+  startup_ready="$(jq -r 'if .startup.ready == true then "true" elif .startup.ready == false then "false" else "unknown" end' "$daemon_state_file" 2>/dev/null || printf 'unknown')"
+  recon_status="$(jq -r '.reconciliation.status // "unknown"' "$daemon_state_file" 2>/dev/null || printf 'unknown')"
+  recon_issues="$(jq -r '(.reconciliation.issues // []) | if length == 0 then "(none)" else join("; ") end' "$daemon_state_file" 2>/dev/null || printf '(state parse failed)')"
+  recon_internal_ledger_diff="$(jq -r '.reconciliation.internal_vs_ledger_diff // "NA"' "$daemon_state_file" 2>/dev/null || printf 'NA')"
+  recon_broker_floor_gap="$(jq -r '.reconciliation.broker_floor_gap_vs_internal // "NA"' "$daemon_state_file" 2>/dev/null || printf 'NA')"
+  recon_stale_pending="$(jq -r '.reconciliation.stale_pending_orders // "NA"' "$daemon_state_file" 2>/dev/null || printf 'NA')"
+  recon_account_age="$(jq -r '.reconciliation.account_snapshot_age_seconds // "NA"' "$daemon_state_file" 2>/dev/null || printf 'NA')"
+  recon_broker_reconcile_age="$(jq -r '.reconciliation.broker_reconcile_age_seconds // "NA"' "$daemon_state_file" 2>/dev/null || printf 'NA')"
+  recon_event_age="$(jq -r '.reconciliation.broker_event_sync_age_seconds // "NA"' "$daemon_state_file" 2>/dev/null || printf 'NA')"
+  startup_json="$(jq -c '.startup // {}' "$daemon_state_file" 2>/dev/null || printf '{}')"
+  reconciliation_json="$(jq -c '.reconciliation // {}' "$daemon_state_file" 2>/dev/null || printf '{}')"
+fi
+
+final_recommendation="$recommendation"
+if [[ "$startup_ready" != "true" && "$startup_ready" != "unknown" ]]; then
+  final_recommendation="BLOCK: startup self-check is not ready. Fix env / network smoke / broker prerequisites before tuning."
+elif [[ "$recon_status" == "fail" ]]; then
+  final_recommendation="ESCALATE: reconciliation failed. Investigate ledger drift or stale broker sync before strategy changes."
+elif [[ "$recon_status" == "warn" ]]; then
+  final_recommendation="OBSERVE: reconciliation has warnings. Review pending orders and sync freshness before parameter changes."
+fi
+
 cat >"$out" <<EOF
 Polymarket Threshold Report (12h)
 window_start: $start_ts
@@ -93,7 +142,90 @@ ratios:
 
 recommendation: $recommendation
 
+daemon_state_file: $daemon_state_file
+startup_ready: $startup_ready
+reconciliation:
+  status: $recon_status
+  internal_vs_ledger_diff: $recon_internal_ledger_diff
+  broker_floor_gap_vs_internal: $recon_broker_floor_gap
+  stale_pending_orders: $recon_stale_pending
+  account_snapshot_age_seconds: $recon_account_age
+  broker_reconcile_age_seconds: $recon_broker_reconcile_age
+  broker_event_sync_age_seconds: $recon_event_age
+  issues: $recon_issues
+
+final_recommendation: $final_recommendation
+
 consecutive_inconclusive_windows: $inconclusive_count
 EOF
+
+startup_ready_json='null'
+if [[ "$startup_ready" == "true" ]]; then
+  startup_ready_json='true'
+elif [[ "$startup_ready" == "false" ]]; then
+  startup_ready_json='false'
+fi
+
+ratio_skip_max_open_json="$(json_number_or_null "$ratio_skip_max_open")"
+ratio_time_exit_close_json="$(json_number_or_null "$ratio_time_exit_close")"
+ratio_skip_add_cd_json="$(json_number_or_null "$ratio_skip_add_cd")"
+ratio_reject_json="$(json_number_or_null "$ratio_reject")"
+
+jq -n \
+  --arg window_start "$start_ts" \
+  --arg window_end "$end_ts" \
+  --arg log_file "$log" \
+  --arg sample_status "$sample_status" \
+  --arg recommendation "$recommendation" \
+  --arg final_recommendation "$final_recommendation" \
+  --arg daemon_state_file "$daemon_state_file" \
+  --arg recon_status "$recon_status" \
+  --arg recon_issues "$recon_issues" \
+  --argjson generated_ts "$(date +%s)" \
+  --argjson window_seconds "$window_sec" \
+  --argjson exec_cnt "$exec_cnt" \
+  --argjson skip_max_open "$skip_max_open" \
+  --argjson time_exit_close "$time_exit_close" \
+  --argjson skip_add_cd "$skip_add_cd" \
+  --argjson reject_cnt "$reject_cnt" \
+  --argjson ratio_skip_max_open "$ratio_skip_max_open_json" \
+  --argjson ratio_time_exit_close "$ratio_time_exit_close_json" \
+  --argjson ratio_skip_add_cd "$ratio_skip_add_cd_json" \
+  --argjson ratio_reject "$ratio_reject_json" \
+  --argjson consecutive_inconclusive_windows "$inconclusive_count" \
+  --argjson startup_ready "$startup_ready_json" \
+  --argjson startup "$startup_json" \
+  --argjson reconciliation "$reconciliation_json" \
+  '{
+    report_type: "monitor_12h",
+    generated_ts: $generated_ts,
+    window_start: $window_start,
+    window_end: $window_end,
+    window_seconds: $window_seconds,
+    log_file: $log_file,
+    sample_status: $sample_status,
+    counts: {
+      exec: $exec_cnt,
+      skip_max_open: $skip_max_open,
+      time_exit_close: $time_exit_close,
+      skip_token_add_cooldown: $skip_add_cd,
+      reject_wallet_failures: $reject_cnt
+    },
+    ratios: {
+      skip_max_open_per_exec: $ratio_skip_max_open,
+      time_exit_close_per_exec: $ratio_time_exit_close,
+      skip_token_add_cooldown_per_exec: $ratio_skip_add_cd,
+      reject_wallet_failures_per_exec: $ratio_reject
+    },
+    recommendation: $recommendation,
+    final_recommendation: $final_recommendation,
+    consecutive_inconclusive_windows: $consecutive_inconclusive_windows,
+    daemon_state_file: $daemon_state_file,
+    startup_ready: $startup_ready,
+    startup: $startup,
+    reconciliation_status: $recon_status,
+    reconciliation_issue_summary: $recon_issues,
+    reconciliation: $reconciliation
+  }' > "$json_out"
 
 echo "$out"
