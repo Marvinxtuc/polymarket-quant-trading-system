@@ -13,6 +13,7 @@ __pycache__/
 .env
 **/.env
 .env.bak_*
+.env.bak.*
 !.env.example
 !**/.env.example
 
@@ -33,3 +34,8 @@ build/
 # Local editor settings
 .vscode/
 .idea/
+
+# Local scratch / backups
+tmp/
+.schema journal_entries
+scripts/*.bak-*
