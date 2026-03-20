@@ -1,22 +1,25 @@
-# Polymarket Automated Trading System
+# Polymarket Personal Decision Terminal
 
-A pragmatic, configurable auto-trader for Polymarket.
+A pragmatic, configurable personal trading terminal for Polymarket.
 
-Default mode is `paper trading` (safe). It can be switched to live CLOB execution once credentials are configured.
+Default mode is `paper trading` + `manual` decision review. The system now queues wallet-follow opportunities as candidates first, then lets you `ignore / watch / buy_small / follow` before execution. It can still be switched to live CLOB execution once credentials are configured.
 
 ## What It Does
 
 - Polls target wallets from `WATCH_WALLETS`
 - Detects new/increased positions from wallet events with position-diff fallback
-- Applies risk constraints
-- Executes via `PaperBroker` (default) or `LiveClobBroker` (optional, needs `py-clob-client` + key config)
+- Enriches them into a candidate queue with wallet score, spread/chase context, and suggested action
+- Adds 5m / 30m momentum context from `prices-history` so candidates show trend instead of only current spread
+- Persists candidates, wallet profiles, and journal entries in local SQLite
+- Executes via `PaperBroker` (default) or `LiveClobBroker` (optional, needs `py-clob-client` + key config) after decision-mode gating
 
-## Strategy (v1)
+## Strategy (Candidate-first)
 
-Signal:
+Candidate + signal flow:
 - Primary path: read wallet `/trades` and/or `/activity` events (`WALLET_SIGNAL_SOURCE=trades|activity|hybrid`) and emit follow signals from fresh wallet trade events.
 - Fallback path: if event data is missing or delayed, use active-position diffs so the bot still sees adds / trims / full exits.
 - Warm-up behavior remains conservative: the first cycle primes event cursors and current wallet state, instead of replaying already-open exposure.
+- Strategy internals now split into `detect_wallet_events() -> build_candidates() -> rank_candidates() -> generate_signals()`, so the UI can show why an idea is worth looking at before it becomes an execution signal.
 
 Wallet screening (Polymarket-native):
 - Candidate wallets come from static seed list `WATCH_WALLETS` plus optional dynamic discovery from `WALLET_DISCOVERY_PATHS`.
@@ -30,6 +33,14 @@ Risk checks:
 - Max open positions
 - Condition-level portfolio netting cap (`PORTFOLIO_NETTING_ENABLED`, `MAX_CONDITION_EXPOSURE_PCT`)
 - Price band guard (`MIN_PRICE` ~ `MAX_PRICE`)
+
+Decision terminal:
+- `DECISION_MODE=manual|semi_auto|auto`
+- Candidate queue persisted in `CANDIDATE_DB_PATH`
+- Candidate actions + journal exposed via `/api/candidates`, `/api/candidate/action`, `/api/journal`, `/api/wallet-profiles`, `/api/mode`
+- Runtime stats / archive / export endpoints: `/api/stats`, `/api/archive`, `/api/export`
+- Optional A-grade notifications via `CANDIDATE_NOTIFICATION_*`, `NOTIFY_WEBHOOK_URL(S)`, and Telegram Bot settings
+- Frontend now includes candidate detail, notifier summary, and archive/export panels
 
 ## Quick Start
 
@@ -128,6 +139,7 @@ make stop-stack
 
 - Frontend: `frontend/` (this repo)
 - Runtime API: `GET /api/state` served by `polymarket_bot.web`
+- Decision / export APIs: `GET /api/candidates`, `GET /api/stats`, `GET /api/archive`, `GET /api/export`
 - Bot daemon: `polymarket_bot.daemon` writes runtime state to `/tmp/poly_runtime_data/state.json`
 - Pre-production readiness checklist: `preprod_readiness_checklist.md`
 

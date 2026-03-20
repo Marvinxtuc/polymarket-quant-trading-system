@@ -3,11 +3,22 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import re
+import time
 
 from polymarket_bot.clients.data_api import ActivityEvent, PolymarketDataClient, Position, TradeFill
 from polymarket_bot.types import Signal
 from polymarket_bot.wallet_history import infer_market_topic
 from polymarket_bot.wallet_scoring import RealizedWalletMetrics, SmartWalletScorer
+
+_MARKET_WINDOW_PATTERN = re.compile(r"-(5m|15m|30m|1h)-(\d{10})$")
+_MARKET_WINDOW_SECONDS = {
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+}
+_SHORT_WINDOW_EDGE_ASK = 0.97
 
 
 @dataclass(slots=True)
@@ -57,6 +68,74 @@ class WalletTradeEvent:
 
 
 @dataclass(slots=True)
+class RawWalletEvent:
+    source: str
+    wallet: str
+    token_id: str
+    condition_id: str
+    market_slug: str
+    outcome: str
+    side: str
+    price: float
+    size: float
+    notional: float
+    timestamp: int
+    event_type: str = ""
+    tx_hash: str = ""
+    trigger_type: str = ""
+
+    @property
+    def dedupe_key(self) -> str:
+        tx_hash = str(self.tx_hash or "").strip().lower()
+        if tx_hash:
+            return f"{tx_hash}:{self.token_id}:{self.side}"
+        return (
+            f"{self.wallet}:{self.token_id}:{self.side}:{self.timestamp}:"
+            f"{self.price:.6f}:{self.size:.6f}:{self.notional:.6f}"
+        )
+
+
+WalletTradeEvent = RawWalletEvent
+
+
+@dataclass(slots=True)
+class WalletCandidateContext:
+    wallet: str
+    token_id: str
+    condition_id: str
+    market_slug: str
+    outcome: str
+    side: str
+    trigger_type: str
+    confidence: float
+    price_hint: float
+    observed_size: float
+    observed_notional: float
+    timestamp: datetime
+    wallet_score: float
+    wallet_tier: str
+    wallet_score_summary: str
+    topic_key: str
+    topic_label: str
+    topic_sample_count: int
+    topic_win_rate: float
+    topic_roi: float
+    topic_resolved_win_rate: float
+    topic_score_summary: str
+    position_action: str
+    position_action_label: str
+    exit_fraction: float = 0.0
+    exit_reason: str = ""
+    cross_wallet_exit: bool = False
+    source_event: RawWalletEvent | None = None
+    previous_position: PositionState | None = None
+    current_position: Position | None = None
+    source_wallet_count: int = 1
+    resonance_wallets: tuple[str, ...] = ()
+    resonance_boost: float = 0.0
+
+
+@dataclass(slots=True)
 class WalletFollowerStrategy:
     client: PolymarketDataClient
     min_increase_usd: float
@@ -77,6 +156,7 @@ class WalletFollowerStrategy:
     signal_lookback_seconds: int = 900
     signal_page_size: int = 100
     signal_max_pages: int = 2
+    live_buy_max_chase_pct: float = 12.0
     scorer: SmartWalletScorer = field(default_factory=SmartWalletScorer)
     _state: dict[str, dict[str, PositionState]] = field(default_factory=dict)
     _latest_wallet_positions: dict[str, list[Position]] = field(default_factory=dict)
@@ -90,6 +170,8 @@ class WalletFollowerStrategy:
     _last_wallet_metrics: dict[str, dict[str, object]] = field(default_factory=dict)
     _wallet_event_watermarks: dict[str, int] = field(default_factory=dict)
     _wallet_event_watermark_keys: dict[str, set[str]] = field(default_factory=dict)
+    _wallet_seen_tokens: dict[str, set[str]] = field(default_factory=dict)
+    _live_market_cache: dict[str, tuple[int, float, float]] = field(default_factory=dict)
 
     def update_wallet_activity_counts(self, counts: Mapping[str, int], *, available: bool = True) -> None:
         normalized: dict[str, int] = {}
@@ -424,13 +506,27 @@ class WalletFollowerStrategy:
                 break
         return events
 
-    def _recent_wallet_events(self, wallet: str, *, warmup: bool) -> list[WalletTradeEvent]:
+    def _record_wallet_seen_token(self, wallet: str, token_id: str) -> None:
+        wallet_key = str(wallet or "").strip().lower()
+        token_key = str(token_id or "").strip()
+        if not wallet_key or not token_key:
+            return
+        self._wallet_seen_tokens.setdefault(wallet_key, set()).add(token_key)
+
+    def _wallet_has_seen_token(self, wallet: str, token_id: str) -> bool:
+        wallet_key = str(wallet or "").strip().lower()
+        token_key = str(token_id or "").strip()
+        if not wallet_key or not token_key:
+            return False
+        return token_key in self._wallet_seen_tokens.get(wallet_key, set())
+
+    def detect_wallet_events(self, wallet: str, *, warmup: bool = False) -> list[RawWalletEvent]:
         if not self._event_signal_enabled():
             return []
 
         mode = self._normalized_signal_source()
         cutoff_ts = self._event_cutoff_ts(wallet)
-        combined: list[WalletTradeEvent] = []
+        combined: list[RawWalletEvent] = []
 
         if mode in {"trades", "hybrid"}:
             try:
@@ -455,6 +551,734 @@ class WalletFollowerStrategy:
             return []
 
         return self._update_wallet_event_cursor(wallet, events)
+
+    def _recent_wallet_events(self, wallet: str, *, warmup: bool) -> list[RawWalletEvent]:
+        return self.detect_wallet_events(wallet, warmup=warmup)
+
+    @staticmethod
+    def _buy_action_and_label(trigger_type: str, *, event_driven: bool) -> tuple[str, str]:
+        normalized = str(trigger_type or "").strip().lower()
+        if normalized == "readd":
+            return "entry", "回补买入" if event_driven else "回补买入"
+        if normalized == "add":
+            return "add", "事件加仓" if event_driven else "追加买入"
+        if normalized == "multi_wallet_confirm":
+            return "entry", "共振买入"
+        return "entry", "事件入场" if event_driven else "首次入场"
+
+    @staticmethod
+    def _exit_action_and_label(*, event_driven: bool, exit_fraction: float) -> tuple[str, str]:
+        if exit_fraction >= 0.95:
+            return "exit", "事件退出" if event_driven else "完全退出"
+        return "trim", "事件减仓" if event_driven else "部分减仓"
+
+    def _classify_buy_trigger(
+        self,
+        *,
+        wallet: str,
+        token_id: str,
+        prev: PositionState | None,
+        current: Position | None,
+        event_driven: bool,
+    ) -> str:
+        if prev is not None:
+            if current is not None and current.notional > prev.notional + 1e-9:
+                return "add"
+            if event_driven and current is None:
+                return "readd" if self._wallet_has_seen_token(wallet, token_id) else "new_open"
+            return "add"
+        if self._wallet_has_seen_token(wallet, token_id):
+            return "readd"
+        return "new_open"
+
+    def _topic_context(
+        self,
+        market_slug: str,
+        topic_profiles: list[dict[str, object]],
+    ) -> tuple[str, str, dict[str, object] | None, str, int, float, float, float]:
+        topic_key, topic_label, topic_profile = self._topic_profile_for_market(market_slug, topic_profiles)
+        topic_summary = self._topic_summary(topic_label, topic_profile)
+        topic_sample_count = int((topic_profile or {}).get("sample_count") or 0)
+        topic_win_rate = float((topic_profile or {}).get("win_rate") or 0.0)
+        topic_roi = float((topic_profile or {}).get("roi") or 0.0)
+        topic_resolved_win_rate = float((topic_profile or {}).get("resolved_win_rate") or 0.0)
+        return (
+            topic_key,
+            topic_label,
+            topic_profile,
+            topic_summary,
+            topic_sample_count,
+            topic_win_rate,
+            topic_roi,
+            topic_resolved_win_rate,
+        )
+
+    def _build_candidate_context(
+        self,
+        *,
+        wallet: str,
+        token_id: str,
+        condition_id: str,
+        market_slug: str,
+        outcome: str,
+        side: str,
+        trigger_type: str,
+        confidence: float,
+        price_hint: float,
+        observed_size: float,
+        observed_notional: float,
+        timestamp: int,
+        wallet_score: float,
+        wallet_tier: str,
+        wallet_score_summary: str,
+        topic_key: str,
+        topic_label: str,
+        topic_sample_count: int,
+        topic_win_rate: float,
+        topic_roi: float,
+        topic_resolved_win_rate: float,
+        topic_score_summary: str,
+        position_action: str,
+        position_action_label: str,
+        exit_fraction: float = 0.0,
+        exit_reason: str = "",
+        cross_wallet_exit: bool = False,
+        source_event: RawWalletEvent | None = None,
+        previous_position: PositionState | None = None,
+        current_position: Position | None = None,
+    ) -> WalletCandidateContext:
+        return WalletCandidateContext(
+            wallet=wallet,
+            token_id=token_id,
+            condition_id=condition_id,
+            market_slug=market_slug,
+            outcome=outcome,
+            side=side,
+            trigger_type=trigger_type,
+            confidence=confidence,
+            price_hint=price_hint,
+            observed_size=observed_size,
+            observed_notional=observed_notional,
+            timestamp=self._event_timestamp(timestamp),
+            wallet_score=wallet_score,
+            wallet_tier=wallet_tier,
+            wallet_score_summary=wallet_score_summary,
+            topic_key=topic_key,
+            topic_label=topic_label,
+            topic_sample_count=topic_sample_count,
+            topic_win_rate=topic_win_rate,
+            topic_roi=topic_roi,
+            topic_resolved_win_rate=topic_resolved_win_rate,
+            topic_score_summary=topic_score_summary,
+            position_action=position_action,
+            position_action_label=position_action_label,
+            exit_fraction=max(0.0, min(1.0, exit_fraction)),
+            exit_reason=exit_reason,
+            cross_wallet_exit=cross_wallet_exit,
+            source_event=source_event,
+            previous_position=previous_position,
+            current_position=current_position,
+        )
+
+    def build_candidates(
+        self,
+        wallet: str,
+        latest_positions: list[Position],
+        wallet_state: dict[str, PositionState],
+        wallet_metrics: Mapping[str, object],
+        raw_events: list[RawWalletEvent],
+        *,
+        wallet_is_eligible: bool,
+        is_warmup_cycle: bool,
+    ) -> list[WalletCandidateContext]:
+        candidates: list[WalletCandidateContext] = []
+        latest_by_token = {pos.token_id: pos for pos in latest_positions}
+        wallet_score = float(wallet_metrics.get("wallet_score") or 0.0)
+        wallet_tier = str(wallet_metrics.get("wallet_tier") or "LOW")
+        wallet_score_summary = str(wallet_metrics.get("score_summary") or "")
+        topic_profiles = list(wallet_metrics.get("topic_profiles") or [])
+        emitted_event_sides: set[tuple[str, str]] = set()
+        seen_tokens: set[str] = set()
+
+        for event in raw_events:
+            token = event.token_id
+            prev = wallet_state.get(token)
+            current = latest_by_token.get(token)
+            was_seen_before = self._wallet_has_seen_token(wallet, token)
+            topic_key, topic_label, topic_profile, topic_summary, topic_sample_count, topic_win_rate, topic_roi, topic_resolved_win_rate = self._topic_context(
+                event.market_slug or (current.market_slug if current is not None else (prev.market_slug if prev is not None else token)),
+                topic_profiles,
+            )
+
+            if event.side == "BUY":
+                if (not wallet_is_eligible) or event.notional < self.min_increase_usd:
+                    self._record_wallet_seen_token(wallet, token)
+                    continue
+                trigger_type = "readd" if was_seen_before else "new_open"
+                if prev is not None:
+                    trigger_type = "add" if current is not None or prev is not None else trigger_type
+                action, action_label = self._buy_action_and_label(trigger_type, event_driven=True)
+                confidence = 0.75 if prev is None else min(0.95, 0.65 + event.notional / 5000.0)
+                candidates.append(
+                    self._build_candidate_context(
+                        wallet=wallet,
+                        token_id=token,
+                        condition_id=(
+                            event.condition_id
+                            or (current.condition_id if current is not None else "")
+                            or (prev.condition_id if prev is not None else "")
+                        ),
+                        market_slug=event.market_slug or (current.market_slug if current is not None else token),
+                        outcome=event.outcome or (current.outcome if current is not None else (prev.outcome if prev is not None else "YES")),
+                        side="BUY",
+                        trigger_type=trigger_type,
+                        confidence=confidence,
+                        price_hint=max(
+                            0.01,
+                            event.price
+                            or (current.avg_price if current is not None else 0.0)
+                            or (prev.price if prev is not None else 0.0),
+                        ),
+                        observed_size=event.size,
+                        observed_notional=event.notional,
+                        timestamp=event.timestamp,
+                        wallet_score=wallet_score,
+                        wallet_tier=wallet_tier,
+                        wallet_score_summary=wallet_score_summary,
+                        topic_key=topic_key,
+                        topic_label=topic_label,
+                        topic_sample_count=topic_sample_count,
+                        topic_win_rate=topic_win_rate,
+                        topic_roi=topic_roi,
+                        topic_resolved_win_rate=topic_resolved_win_rate,
+                        topic_score_summary=topic_summary,
+                        position_action=action,
+                        position_action_label=action_label,
+                        source_event=event,
+                        previous_position=prev,
+                        current_position=current,
+                    )
+                )
+                emitted_event_sides.add((token, "BUY"))
+                self._record_wallet_seen_token(wallet, token)
+                continue
+
+            if (not self.follow_wallet_exits) or prev is None:
+                self._record_wallet_seen_token(wallet, token)
+                continue
+            reduction = max(0.0, event.notional)
+            if reduction < self.min_decrease_usd and current is not None:
+                self._record_wallet_seen_token(wallet, token)
+                continue
+            if current is None:
+                exit_fraction = 1.0
+                exit_reason = f"source wallet fully exited via {event.source}"
+            else:
+                exit_fraction = min(1.0, reduction / max(0.01, prev.notional))
+                exit_reason = f"source wallet trimmed via {event.source} | delta ${reduction:.0f}"
+            action, action_label = self._exit_action_and_label(event_driven=True, exit_fraction=exit_fraction)
+            confidence = min(0.95, 0.55 + exit_fraction * 0.35)
+            candidates.append(
+                self._build_candidate_context(
+                    wallet=wallet,
+                    token_id=token,
+                    condition_id=(
+                        event.condition_id
+                        or (current.condition_id if current is not None else "")
+                        or prev.condition_id
+                    ),
+                    market_slug=event.market_slug or (current.market_slug if current is not None else prev.market_slug or token),
+                    outcome=event.outcome or (current.outcome if current is not None else prev.outcome or "YES"),
+                    side="SELL",
+                    trigger_type="exit",
+                    confidence=confidence,
+                    price_hint=max(
+                        0.01,
+                        event.price
+                        or (current.avg_price if current is not None else 0.0)
+                        or prev.price,
+                    ),
+                    observed_size=event.size,
+                    observed_notional=max(reduction, prev.notional if current is None else reduction),
+                    timestamp=event.timestamp,
+                    wallet_score=wallet_score,
+                    wallet_tier=wallet_tier,
+                    wallet_score_summary=wallet_score_summary,
+                    topic_key=topic_key,
+                    topic_label=topic_label,
+                    topic_sample_count=topic_sample_count,
+                    topic_win_rate=topic_win_rate,
+                    topic_roi=topic_roi,
+                    topic_resolved_win_rate=topic_resolved_win_rate,
+                    topic_score_summary=topic_summary,
+                    position_action=action,
+                    position_action_label=action_label,
+                    exit_fraction=exit_fraction,
+                    exit_reason=exit_reason,
+                    source_event=event,
+                    previous_position=prev,
+                    current_position=current,
+                )
+            )
+            emitted_event_sides.add((token, "SELL"))
+            self._record_wallet_seen_token(wallet, token)
+
+        for pos in latest_positions:
+            token = pos.token_id
+            seen_tokens.add(token)
+            prev = wallet_state.get(token)
+            was_seen_before = self._wallet_has_seen_token(wallet, token)
+            self._record_wallet_seen_token(wallet, token)
+            topic_key, topic_label, topic_profile, topic_summary, topic_sample_count, topic_win_rate, topic_roi, topic_resolved_win_rate = self._topic_context(
+                pos.market_slug or token,
+                topic_profiles,
+            )
+
+            if prev is None:
+                if (
+                    wallet_is_eligible
+                    and (not is_warmup_cycle)
+                    and pos.notional >= self.min_increase_usd
+                    and (token, "BUY") not in emitted_event_sides
+                ):
+                    trigger_type = "readd" if was_seen_before else "new_open"
+                    action, action_label = self._buy_action_and_label(trigger_type, event_driven=False)
+                    candidates.append(
+                        self._build_candidate_context(
+                            wallet=wallet,
+                            token_id=token,
+                            condition_id=str(pos.condition_id or ""),
+                            market_slug=pos.market_slug,
+                            outcome=pos.outcome,
+                            side="BUY",
+                            trigger_type=trigger_type,
+                            confidence=0.75,
+                            price_hint=pos.avg_price,
+                            observed_size=pos.size,
+                            observed_notional=pos.notional,
+                            timestamp=pos.timestamp,
+                            wallet_score=wallet_score,
+                            wallet_tier=wallet_tier,
+                            wallet_score_summary=wallet_score_summary,
+                            topic_key=topic_key,
+                            topic_label=topic_label,
+                            topic_sample_count=topic_sample_count,
+                            topic_win_rate=topic_win_rate,
+                            topic_roi=topic_roi,
+                            topic_resolved_win_rate=topic_resolved_win_rate,
+                            topic_score_summary=topic_summary,
+                            position_action=action,
+                            position_action_label=action_label,
+                            previous_position=prev,
+                            current_position=pos,
+                        )
+                    )
+            else:
+                delta = pos.notional - prev.notional
+                if wallet_is_eligible and delta >= self.min_increase_usd and (token, "BUY") not in emitted_event_sides:
+                    trigger_type = "add"
+                    action, action_label = self._buy_action_and_label(trigger_type, event_driven=False)
+                    conf = min(0.95, 0.65 + delta / 5000.0)
+                    candidates.append(
+                        self._build_candidate_context(
+                            wallet=wallet,
+                            token_id=token,
+                            condition_id=str(pos.condition_id or prev.condition_id),
+                            market_slug=pos.market_slug,
+                            outcome=pos.outcome,
+                            side="BUY",
+                            trigger_type=trigger_type,
+                            confidence=conf,
+                            price_hint=pos.avg_price,
+                            observed_size=max(0.0, pos.size - prev.size),
+                            observed_notional=delta,
+                            timestamp=pos.timestamp,
+                            wallet_score=wallet_score,
+                            wallet_tier=wallet_tier,
+                            wallet_score_summary=wallet_score_summary,
+                            topic_key=topic_key,
+                            topic_label=topic_label,
+                            topic_sample_count=topic_sample_count,
+                            topic_win_rate=topic_win_rate,
+                            topic_roi=topic_roi,
+                            topic_resolved_win_rate=topic_resolved_win_rate,
+                            topic_score_summary=topic_summary,
+                            position_action=action,
+                            position_action_label=action_label,
+                            previous_position=prev,
+                            current_position=pos,
+                        )
+                    )
+                elif (
+                    self.follow_wallet_exits
+                    and delta <= -self.min_decrease_usd
+                    and (token, "SELL") not in emitted_event_sides
+                ):
+                    reduction = abs(delta)
+                    exit_fraction = min(1.0, reduction / max(0.01, prev.notional))
+                    conf = min(0.95, 0.55 + exit_fraction * 0.35)
+                    action, action_label = self._exit_action_and_label(event_driven=False, exit_fraction=exit_fraction)
+                    candidates.append(
+                        self._build_candidate_context(
+                            wallet=wallet,
+                            token_id=token,
+                            condition_id=str(pos.condition_id or prev.condition_id),
+                            market_slug=pos.market_slug,
+                            outcome=pos.outcome,
+                            side="SELL",
+                            trigger_type="exit",
+                            confidence=conf,
+                            price_hint=max(0.01, pos.avg_price or prev.price),
+                            observed_size=max(0.0, prev.size - pos.size),
+                            observed_notional=reduction,
+                            timestamp=pos.timestamp,
+                            wallet_score=wallet_score,
+                            wallet_tier=wallet_tier,
+                            wallet_score_summary=wallet_score_summary,
+                            topic_key=topic_key,
+                            topic_label=topic_label,
+                            topic_sample_count=topic_sample_count,
+                            topic_win_rate=topic_win_rate,
+                            topic_roi=topic_roi,
+                            topic_resolved_win_rate=topic_resolved_win_rate,
+                            topic_score_summary=topic_summary,
+                            position_action=action,
+                            position_action_label=action_label,
+                            exit_fraction=exit_fraction,
+                            exit_reason=(
+                                f"source wallet trimmed {exit_fraction:.0%}"
+                                f" | delta ${reduction:.0f}"
+                            ),
+                            previous_position=prev,
+                            current_position=pos,
+                        )
+                    )
+
+            wallet_state[token] = PositionState(
+                size=pos.size,
+                notional=pos.notional,
+                price=pos.avg_price,
+                updated_ts=pos.timestamp,
+                condition_id=str(pos.condition_id or ""),
+                market_slug=pos.market_slug,
+                outcome=pos.outcome,
+            )
+
+        for token in list(wallet_state.keys()):
+            if token in seen_tokens:
+                continue
+            prev = wallet_state[token]
+            self._record_wallet_seen_token(wallet, token)
+            if (
+                self.follow_wallet_exits
+                and (not is_warmup_cycle)
+                and prev.notional >= self.min_decrease_usd
+                and (token, "SELL") not in emitted_event_sides
+            ):
+                action, action_label = self._exit_action_and_label(event_driven=False, exit_fraction=1.0)
+                candidates.append(
+                    self._build_candidate_context(
+                        wallet=wallet,
+                        token_id=token,
+                        condition_id=str(prev.condition_id or ""),
+                        market_slug=prev.market_slug or token,
+                        outcome=prev.outcome or "YES",
+                        side="SELL",
+                        trigger_type="exit",
+                        confidence=0.9,
+                        price_hint=max(0.01, prev.price),
+                        observed_size=prev.size,
+                        observed_notional=prev.notional,
+                        timestamp=wallet_metrics.get("history_refresh_ts", 0) if isinstance(wallet_metrics, Mapping) else 0,
+                        wallet_score=wallet_score,
+                        wallet_tier=wallet_tier,
+                        wallet_score_summary=wallet_score_summary,
+                        topic_key="",
+                        topic_label="",
+                        topic_sample_count=0,
+                        topic_win_rate=0.0,
+                        topic_roi=0.0,
+                        topic_resolved_win_rate=0.0,
+                        topic_score_summary="",
+                        position_action=action,
+                        position_action_label=action_label,
+                        exit_fraction=1.0,
+                        exit_reason="source wallet fully exited",
+                        previous_position=prev,
+                    )
+                )
+            del wallet_state[token]
+
+        return candidates
+
+    def _candidate_to_signal(self, candidate: WalletCandidateContext) -> Signal:
+        return Signal(
+            signal_id="",
+            trace_id="",
+            wallet=candidate.wallet,
+            market_slug=candidate.market_slug,
+            token_id=candidate.token_id,
+            condition_id=candidate.condition_id,
+            outcome=candidate.outcome,
+            side=candidate.side,  # type: ignore[arg-type]
+            confidence=candidate.confidence,
+            price_hint=max(0.01, candidate.price_hint),
+            observed_size=candidate.observed_size,
+            observed_notional=candidate.observed_notional,
+            timestamp=candidate.timestamp,
+            wallet_score=candidate.wallet_score,
+            wallet_tier=candidate.wallet_tier,
+            wallet_score_summary=candidate.wallet_score_summary,
+            topic_key=candidate.topic_key,
+            topic_label=candidate.topic_label,
+            topic_sample_count=candidate.topic_sample_count,
+            topic_win_rate=candidate.topic_win_rate,
+            topic_roi=candidate.topic_roi,
+            topic_resolved_win_rate=candidate.topic_resolved_win_rate,
+            topic_score_summary=candidate.topic_score_summary,
+            exit_fraction=candidate.exit_fraction,
+            exit_reason=candidate.exit_reason,
+            cross_wallet_exit=candidate.cross_wallet_exit,
+            position_action=candidate.position_action,
+            position_action_label=candidate.position_action_label,
+        )
+
+    def _boost_buy_resonance(
+        self,
+        candidates: list[WalletCandidateContext],
+    ) -> WalletCandidateContext:
+        ordered = sorted(
+            candidates,
+            key=lambda row: (row.wallet_score, row.confidence, row.observed_notional),
+            reverse=True,
+        )
+        representative = ordered[0]
+        wallets = tuple(
+            wallet
+            for wallet in dict.fromkeys(str(row.wallet or "").strip().lower() for row in ordered)
+            if wallet
+        )
+        wallet_count = len(wallets)
+        if wallet_count <= 1:
+            return representative
+
+        boost = min(0.12, 0.04 * (wallet_count - 1) + min(0.04, sum(row.wallet_score for row in ordered) / 5000.0))
+        confidence = min(0.95, representative.confidence + boost)
+        observed_notional = sum(row.observed_notional for row in ordered)
+        observed_size = sum(row.observed_size for row in ordered)
+        weighted_price_base = sum(max(0.0, row.observed_notional) * max(0.01, row.price_hint) for row in ordered)
+        price_hint = (
+            weighted_price_base / observed_notional
+            if observed_notional > 0.0
+            else max(0.01, representative.price_hint)
+        )
+        timestamp = max((row.timestamp for row in ordered), default=representative.timestamp)
+        wallet_score = max(row.wallet_score for row in ordered)
+        wallet_tier = representative.wallet_tier
+        summary = f"resonance {wallet_count} wallets"
+        if wallets:
+            summary = f"{summary} | {', '.join(wallets[:3])}"
+
+        return WalletCandidateContext(
+            wallet="wallet-resonance",
+            token_id=representative.token_id,
+            condition_id=representative.condition_id,
+            market_slug=representative.market_slug,
+            outcome=representative.outcome,
+            side="BUY",
+            trigger_type="multi_wallet_confirm",
+            confidence=confidence,
+            price_hint=price_hint,
+            observed_size=observed_size,
+            observed_notional=observed_notional,
+            timestamp=timestamp,
+            wallet_score=wallet_score,
+            wallet_tier=wallet_tier,
+            wallet_score_summary=summary,
+            topic_key=representative.topic_key,
+            topic_label=representative.topic_label,
+            topic_sample_count=representative.topic_sample_count,
+            topic_win_rate=representative.topic_win_rate,
+            topic_roi=representative.topic_roi,
+            topic_resolved_win_rate=representative.topic_resolved_win_rate,
+            topic_score_summary=representative.topic_score_summary,
+            position_action="entry",
+            position_action_label="共振买入",
+            source_event=representative.source_event,
+            source_wallet_count=wallet_count,
+            resonance_wallets=wallets,
+            resonance_boost=boost,
+        )
+
+    def rank_candidates(self, candidates: list[WalletCandidateContext]) -> list[Signal]:
+        if not candidates:
+            return []
+
+        buy_groups: dict[str, list[WalletCandidateContext]] = {}
+        sell_signals: list[Signal] = []
+        sell_resonance_candidates: dict[str, list[Signal]] = {}
+
+        for candidate in candidates:
+            signal = self._candidate_to_signal(candidate)
+            if candidate.side == "BUY":
+                buy_groups.setdefault(candidate.token_id, []).append(candidate)
+                continue
+            sell_signals.append(signal)
+            sell_resonance_candidates.setdefault(candidate.token_id, []).append(signal)
+
+        signals: list[Signal] = []
+        for token_id, rows in buy_groups.items():
+            by_wallet: dict[str, WalletCandidateContext] = {}
+            for row in sorted(rows, key=lambda item: (item.wallet_score, item.confidence, item.observed_notional), reverse=True):
+                wallet = str(row.wallet or "").strip().lower()
+                if not wallet:
+                    continue
+                if wallet not in by_wallet:
+                    by_wallet[wallet] = row
+            deduped_rows = list(by_wallet.values())
+            if not deduped_rows:
+                continue
+            if len(deduped_rows) > 1:
+                boosted = self._boost_buy_resonance(deduped_rows)
+                signals.append(self._candidate_to_signal(boosted))
+                continue
+            signals.append(self._candidate_to_signal(deduped_rows[0]))
+
+        signals.extend(sell_signals)
+        signals.extend(self._build_resonance_exit_signals(sell_resonance_candidates))
+        signals.sort(
+            key=lambda s: (
+                1 if s.side == "SELL" else 0,
+                1 if s.side == "SELL" and not s.cross_wallet_exit else 0,
+                s.wallet_score,
+                s.confidence,
+                s.observed_notional,
+            ),
+            reverse=True,
+        )
+        return signals
+
+    @staticmethod
+    def _market_window_bounds(market_slug: str) -> tuple[int | None, int | None, int | None]:
+        normalized = str(market_slug or "").strip().lower()
+        if not normalized:
+            return None, None, None
+        match = _MARKET_WINDOW_PATTERN.search(normalized)
+        if match is None:
+            return None, None, None
+        duration_seconds = _MARKET_WINDOW_SECONDS.get(str(match.group(1) or "").strip().lower())
+        start_ts = int(match.group(2) or 0)
+        if duration_seconds is None or start_ts <= 0:
+            return None, None, None
+        return start_ts, duration_seconds, start_ts + duration_seconds
+
+    def _live_market_snapshot(self, token_id: str) -> tuple[float, float] | None:
+        token_key = str(token_id or "").strip()
+        if not token_key:
+            return 0.0, 0.0
+        get_order_book = getattr(self.client, "get_order_book", None)
+        if not callable(get_order_book):
+            return None
+
+        now_ts = int(time.time())
+        cached = self._live_market_cache.get(token_key)
+        if cached is not None:
+            checked_ts, best_bid, best_ask = cached
+            if checked_ts > 0 and (now_ts - int(checked_ts)) <= 60:
+                return float(best_bid), float(best_ask)
+
+        best_bid = 0.0
+        best_ask = 0.0
+        try:
+            book = get_order_book(token_key)
+            if book is not None:
+                best_bid = float(getattr(book, "best_bid", 0.0) or 0.0)
+                best_ask = float(getattr(book, "best_ask", 0.0) or 0.0)
+        except Exception:
+            best_bid = 0.0
+            best_ask = 0.0
+        self._live_market_cache[token_key] = (now_ts, best_bid, best_ask)
+        return best_bid, best_ask
+
+    def _token_has_live_orderbook(self, token_id: str) -> bool:
+        snapshot = self._live_market_snapshot(token_id)
+        if snapshot is None:
+            return True
+        best_bid, best_ask = snapshot
+        return best_bid > 0.0 or best_ask > 0.0
+
+    def _should_skip_short_window_buy(self, signal: Signal) -> bool:
+        if signal.side != "BUY":
+            return False
+        snapshot = self._live_market_snapshot(signal.token_id)
+        best_ask = 0.0
+        if snapshot is not None:
+            _, best_ask = snapshot
+            if best_ask > 0.0 and signal.price_hint > 0.0:
+                chase_pct = ((best_ask - float(signal.price_hint)) / float(signal.price_hint)) * 100.0
+                if chase_pct >= float(self.live_buy_max_chase_pct):
+                    return True
+
+        _, market_window_seconds, market_end_ts = self._market_window_bounds(signal.market_slug)
+        if market_window_seconds is None or market_end_ts is None or market_window_seconds > 900:
+            return False
+
+        now_ts = int(time.time())
+        remaining_seconds = market_end_ts - now_ts
+        if remaining_seconds <= 0:
+            return True
+
+        if best_ask >= _SHORT_WINDOW_EDGE_ASK:
+            return True
+        if best_ask > 0.0 and signal.price_hint > 0.0:
+            chase_pct = ((best_ask - float(signal.price_hint)) / float(signal.price_hint)) * 100.0
+            max_short_window_chase = 3.0 if market_window_seconds <= 300 else 4.0
+            if chase_pct >= max_short_window_chase:
+                return True
+
+        late_threshold = 60 if market_window_seconds <= 300 else 90
+        return remaining_seconds <= late_threshold
+
+    def _select_live_signals(self, ranked_signals: list[Signal]) -> list[Signal]:
+        selected: list[Signal] = []
+        for signal in ranked_signals:
+            if signal.side == "BUY":
+                if not self._token_has_live_orderbook(signal.token_id):
+                    continue
+                if self._should_skip_short_window_buy(signal):
+                    continue
+            selected.append(signal)
+            if len(selected) >= self.max_signals_per_cycle:
+                break
+        return selected
+
+    def generate_signals(self, wallets: list[str]) -> list[Signal]:
+        self._live_market_cache.clear()
+        prior_wallet_metrics = {wallet: dict(metrics) for wallet, metrics in self._last_wallet_metrics.items()}
+        wallets_to_track = list(dict.fromkeys(wallets + list(self._state.keys())))
+        eligible_wallets = self._screen_wallets(wallets_to_track)
+
+        all_candidates: list[WalletCandidateContext] = []
+        for wallet in wallets_to_track:
+            latest_positions = self._latest_wallet_positions.get(wallet, [])
+            wallet_state = self._state.setdefault(wallet, {})
+            is_warmup_cycle = len(wallet_state) == 0
+            wallet_metrics = self._last_wallet_metrics.get(wallet) or prior_wallet_metrics.get(wallet, {})
+            raw_events = self.detect_wallet_events(wallet, warmup=is_warmup_cycle)
+            all_candidates.extend(
+                self.build_candidates(
+                    wallet,
+                    latest_positions,
+                    wallet_state,
+                    wallet_metrics,
+                    raw_events,
+                    wallet_is_eligible=wallet in eligible_wallets,
+                    is_warmup_cycle=is_warmup_cycle,
+                )
+            )
+
+        ranked_signals = self.rank_candidates(all_candidates)
+        return self._select_live_signals(ranked_signals)
 
     def _build_resonance_exit_signals(self, candidates: Mapping[str, list[Signal]]) -> list[Signal]:
         if not self.resonance_exit_enabled:
@@ -526,325 +1350,3 @@ class WalletFollowerStrategy:
                 )
             )
         return signals
-
-    def generate_signals(self, wallets: list[str]) -> list[Signal]:
-        signals: list[Signal] = []
-        prior_wallet_metrics = {wallet: dict(metrics) for wallet, metrics in self._last_wallet_metrics.items()}
-        wallets_to_track = list(dict.fromkeys(wallets + list(self._state.keys())))
-        eligible_wallets = self._screen_wallets(wallets_to_track)
-        resonance_candidates: dict[str, list[Signal]] = {}
-
-        for wallet in wallets_to_track:
-            latest_positions = self._latest_wallet_positions.get(wallet, [])
-            latest_by_token = {pos.token_id: pos for pos in latest_positions}
-            wallet_is_eligible = wallet in eligible_wallets
-            wallet_state = self._state.setdefault(wallet, {})
-            seen_tokens: set[str] = set()
-            is_warmup_cycle = len(wallet_state) == 0
-            wallet_metrics = self._last_wallet_metrics.get(wallet) or prior_wallet_metrics.get(wallet, {})
-            wallet_score = float(wallet_metrics.get("wallet_score") or 0.0)
-            wallet_tier = str(wallet_metrics.get("wallet_tier") or "LOW")
-            wallet_score_summary = str(wallet_metrics.get("score_summary") or "")
-            topic_profiles = list(wallet_metrics.get("topic_profiles") or [])
-            emitted_event_sides: set[tuple[str, str]] = set()
-
-            for event in self._recent_wallet_events(wallet, warmup=is_warmup_cycle):
-                token = event.token_id
-                prev = wallet_state.get(token)
-                current = latest_by_token.get(token)
-                topic_key, topic_label, topic_profile = self._topic_profile_for_market(
-                    (event.market_slug or (current.market_slug if current is not None else (prev.market_slug if prev is not None else token))),
-                    topic_profiles,
-                )
-                topic_summary = self._topic_summary(topic_label, topic_profile)
-                topic_sample_count = int((topic_profile or {}).get("sample_count") or 0)
-                topic_win_rate = float((topic_profile or {}).get("win_rate") or 0.0)
-                topic_roi = float((topic_profile or {}).get("roi") or 0.0)
-                topic_resolved_win_rate = float((topic_profile or {}).get("resolved_win_rate") or 0.0)
-
-                if event.side == "BUY":
-                    if (not wallet_is_eligible) or event.notional < self.min_increase_usd:
-                        continue
-                    confidence = 0.75 if prev is None else min(0.95, 0.65 + event.notional / 5000.0)
-                    signals.append(
-                        Signal(
-                            signal_id="",
-                            trace_id="",
-                            wallet=wallet,
-                            market_slug=event.market_slug or (current.market_slug if current is not None else token),
-                            token_id=token,
-                            condition_id=(
-                                event.condition_id
-                                or (current.condition_id if current is not None else "")
-                                or (prev.condition_id if prev is not None else "")
-                            ),
-                            outcome=event.outcome or (current.outcome if current is not None else (prev.outcome if prev is not None else "YES")),
-                            side="BUY",
-                            confidence=confidence,
-                            price_hint=max(
-                                0.01,
-                                event.price
-                                or (current.avg_price if current is not None else 0.0)
-                                or (prev.price if prev is not None else 0.0),
-                            ),
-                            observed_size=event.size,
-                            observed_notional=event.notional,
-                            timestamp=self._event_timestamp(event.timestamp),
-                            wallet_score=wallet_score,
-                            wallet_tier=wallet_tier,
-                            wallet_score_summary=wallet_score_summary,
-                            topic_key=topic_key,
-                            topic_label=topic_label,
-                            topic_sample_count=topic_sample_count,
-                            topic_win_rate=topic_win_rate,
-                            topic_roi=topic_roi,
-                            topic_resolved_win_rate=topic_resolved_win_rate,
-                            topic_score_summary=topic_summary,
-                            position_action="entry" if prev is None else "add",
-                            position_action_label="事件入场" if prev is None else "事件加仓",
-                        )
-                    )
-                    emitted_event_sides.add((token, "BUY"))
-                    continue
-
-                if (not self.follow_wallet_exits) or prev is None:
-                    continue
-                reduction = max(0.0, event.notional)
-                if reduction < self.min_decrease_usd and current is not None:
-                    continue
-                if current is None:
-                    exit_fraction = 1.0
-                    exit_reason = f"source wallet fully exited via {event.source}"
-                else:
-                    exit_fraction = min(1.0, reduction / max(0.01, prev.notional))
-                    exit_reason = (
-                        f"source wallet trimmed via {event.source}"
-                        f" | delta ${reduction:.0f}"
-                    )
-                confidence = min(0.95, 0.55 + exit_fraction * 0.35)
-                signal = Signal(
-                    signal_id="",
-                    trace_id="",
-                    wallet=wallet,
-                    market_slug=event.market_slug or (current.market_slug if current is not None else prev.market_slug or token),
-                    token_id=token,
-                    condition_id=(
-                        event.condition_id
-                        or (current.condition_id if current is not None else "")
-                        or prev.condition_id
-                    ),
-                    outcome=event.outcome or (current.outcome if current is not None else prev.outcome or "YES"),
-                    side="SELL",
-                    confidence=confidence,
-                    price_hint=max(
-                        0.01,
-                        event.price
-                        or (current.avg_price if current is not None else 0.0)
-                        or prev.price,
-                    ),
-                    observed_size=event.size,
-                    observed_notional=max(reduction, prev.notional if current is None else reduction),
-                    timestamp=self._event_timestamp(event.timestamp),
-                    wallet_score=wallet_score,
-                    wallet_tier=wallet_tier,
-                    wallet_score_summary=wallet_score_summary,
-                    topic_key=topic_key,
-                    topic_label=topic_label,
-                    topic_sample_count=topic_sample_count,
-                    topic_win_rate=topic_win_rate,
-                    topic_roi=topic_roi,
-                    topic_resolved_win_rate=topic_resolved_win_rate,
-                    topic_score_summary=topic_summary,
-                    exit_fraction=exit_fraction,
-                    exit_reason=exit_reason,
-                    position_action="trim" if exit_fraction < 0.95 else "exit",
-                    position_action_label="事件减仓" if exit_fraction < 0.95 else "事件退出",
-                )
-                signals.append(signal)
-                resonance_candidates.setdefault(token, []).append(signal)
-                emitted_event_sides.add((token, "SELL"))
-
-            for pos in latest_positions:
-                token = pos.token_id
-                seen_tokens.add(token)
-                prev = wallet_state.get(token)
-                topic_key, topic_label, topic_profile = self._topic_profile_for_market(
-                    pos.market_slug or token,
-                    topic_profiles,
-                )
-                topic_summary = self._topic_summary(topic_label, topic_profile)
-                topic_sample_count = int((topic_profile or {}).get("sample_count") or 0)
-                topic_win_rate = float((topic_profile or {}).get("win_rate") or 0.0)
-                topic_roi = float((topic_profile or {}).get("roi") or 0.0)
-                topic_resolved_win_rate = float((topic_profile or {}).get("resolved_win_rate") or 0.0)
-
-                if prev is None:
-                    if (
-                        wallet_is_eligible
-                        and (not is_warmup_cycle)
-                        and pos.notional >= self.min_increase_usd
-                        and (token, "BUY") not in emitted_event_sides
-                    ):
-                        signals.append(
-                            Signal(
-                                signal_id="",
-                                trace_id="",
-                                wallet=wallet,
-                                market_slug=pos.market_slug,
-                                token_id=token,
-                                condition_id=str(pos.condition_id or ""),
-                                outcome=pos.outcome,
-                                side="BUY",
-                                confidence=0.75,
-                                price_hint=pos.avg_price,
-                                observed_size=pos.size,
-                                observed_notional=pos.notional,
-                                timestamp=datetime.now(tz=timezone.utc),
-                                wallet_score=wallet_score,
-                                wallet_tier=wallet_tier,
-                                wallet_score_summary=wallet_score_summary,
-                                topic_key=topic_key,
-                                topic_label=topic_label,
-                                topic_sample_count=topic_sample_count,
-                                topic_win_rate=topic_win_rate,
-                                topic_roi=topic_roi,
-                                topic_resolved_win_rate=topic_resolved_win_rate,
-                                topic_score_summary=topic_summary,
-                                position_action="entry",
-                                position_action_label="首次入场",
-                            )
-                        )
-                else:
-                    delta = pos.notional - prev.notional
-                    if wallet_is_eligible and delta >= self.min_increase_usd and (token, "BUY") not in emitted_event_sides:
-                        conf = min(0.95, 0.65 + delta / 5000.0)
-                        signals.append(
-                            Signal(
-                                signal_id="",
-                                trace_id="",
-                                wallet=wallet,
-                                market_slug=pos.market_slug,
-                                token_id=token,
-                                condition_id=str(pos.condition_id or prev.condition_id),
-                                outcome=pos.outcome,
-                                side="BUY",
-                                confidence=conf,
-                                price_hint=pos.avg_price,
-                                observed_size=max(0.0, pos.size - prev.size),
-                                observed_notional=delta,
-                                timestamp=datetime.now(tz=timezone.utc),
-                                wallet_score=wallet_score,
-                                wallet_tier=wallet_tier,
-                                wallet_score_summary=wallet_score_summary,
-                                topic_key=topic_key,
-                                topic_label=topic_label,
-                                topic_sample_count=topic_sample_count,
-                                topic_win_rate=topic_win_rate,
-                                topic_roi=topic_roi,
-                                topic_resolved_win_rate=topic_resolved_win_rate,
-                                topic_score_summary=topic_summary,
-                                position_action="add",
-                                position_action_label="追加买入",
-                            )
-                        )
-                    elif (
-                        self.follow_wallet_exits
-                        and delta <= -self.min_decrease_usd
-                        and (token, "SELL") not in emitted_event_sides
-                    ):
-                        reduction = abs(delta)
-                        exit_fraction = min(1.0, reduction / max(0.01, prev.notional))
-                        conf = min(0.95, 0.55 + exit_fraction * 0.35)
-                        signal = Signal(
-                            signal_id="",
-                            trace_id="",
-                            wallet=wallet,
-                            market_slug=pos.market_slug,
-                            token_id=token,
-                            condition_id=str(pos.condition_id or prev.condition_id),
-                            outcome=pos.outcome,
-                            side="SELL",
-                            confidence=conf,
-                            price_hint=max(0.01, pos.avg_price or prev.price),
-                            observed_size=max(0.0, prev.size - pos.size),
-                            observed_notional=reduction,
-                            timestamp=datetime.now(tz=timezone.utc),
-                            wallet_score=wallet_score,
-                            wallet_tier=wallet_tier,
-                            wallet_score_summary=wallet_score_summary,
-                            topic_key=topic_key,
-                            topic_label=topic_label,
-                            topic_sample_count=topic_sample_count,
-                            topic_win_rate=topic_win_rate,
-                            topic_roi=topic_roi,
-                            topic_resolved_win_rate=topic_resolved_win_rate,
-                            topic_score_summary=topic_summary,
-                            exit_fraction=exit_fraction,
-                            exit_reason=(
-                                f"source wallet trimmed {exit_fraction:.0%}"
-                                f" | delta ${reduction:.0f}"
-                            ),
-                            position_action="trim" if exit_fraction < 0.95 else "exit",
-                            position_action_label="部分减仓" if exit_fraction < 0.95 else "完全退出",
-                        )
-                        signals.append(signal)
-                        resonance_candidates.setdefault(token, []).append(signal)
-
-                wallet_state[token] = PositionState(
-                    size=pos.size,
-                    notional=pos.notional,
-                    price=pos.avg_price,
-                    updated_ts=pos.timestamp,
-                    condition_id=str(pos.condition_id or ""),
-                    market_slug=pos.market_slug,
-                    outcome=pos.outcome,
-                )
-
-            for token in list(wallet_state.keys()):
-                if token in seen_tokens:
-                    continue
-                prev = wallet_state[token]
-                if (
-                    self.follow_wallet_exits
-                    and (not is_warmup_cycle)
-                    and prev.notional >= self.min_decrease_usd
-                    and (token, "SELL") not in emitted_event_sides
-                ):
-                    signal = Signal(
-                        signal_id="",
-                        trace_id="",
-                        wallet=wallet,
-                        market_slug=prev.market_slug or token,
-                        token_id=token,
-                        condition_id=str(prev.condition_id or ""),
-                        outcome=prev.outcome or "YES",
-                        side="SELL",
-                        confidence=0.9,
-                        price_hint=max(0.01, prev.price),
-                        observed_size=prev.size,
-                        observed_notional=prev.notional,
-                        timestamp=datetime.now(tz=timezone.utc),
-                        wallet_score=wallet_score,
-                        wallet_tier=wallet_tier,
-                        wallet_score_summary=wallet_score_summary,
-                        exit_fraction=1.0,
-                        exit_reason="source wallet fully exited",
-                        position_action="exit",
-                        position_action_label="完全退出",
-                    )
-                    signals.append(signal)
-                    resonance_candidates.setdefault(token, []).append(signal)
-                del wallet_state[token]
-
-        signals.extend(self._build_resonance_exit_signals(resonance_candidates))
-        signals.sort(
-            key=lambda s: (
-                1 if s.side == "SELL" else 0,
-                1 if s.side == "SELL" and not s.cross_wallet_exit else 0,
-                s.wallet_score,
-                s.confidence,
-                s.observed_notional,
-            ),
-            reverse=True,
-        )
-        return signals[: self.max_signals_per_cycle]

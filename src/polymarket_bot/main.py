@@ -47,6 +47,7 @@ def build_trader(settings: Settings) -> Trader:
         signal_lookback_seconds=settings.wallet_signal_lookback_seconds,
         signal_page_size=settings.wallet_signal_page_size,
         signal_max_pages=settings.wallet_signal_max_pages,
+        live_buy_max_chase_pct=settings.candidate_buy_max_chase_pct,
     )
     risk = RiskManager(settings)
 

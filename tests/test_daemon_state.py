@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import time
+import tempfile
 import unittest
 from collections import deque
+from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from polymarket_bot.config import Settings
 from polymarket_bot.daemon import _build_state, _build_wallet_score_cache
+from polymarket_bot.notifier import Notifier
 
 
 class _Strategy:
@@ -108,9 +112,59 @@ class _Strategy:
 
 class DaemonStateTests(unittest.TestCase):
     def test_build_state_exposes_wallet_score_fields(self):
+        notifier_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(notifier_dir.cleanup)
+        notifier_log = str(Path(notifier_dir.name) / "notifier.jsonl")
+        with patch.dict("os.environ", {"POLY_NOTIFIER_LOG_PATH": notifier_log}):
+            Notifier(log_path=notifier_log).notify_local(title="Ops", body="check queue")
+        pending_candidate = {
+            "id": "cand-live",
+            "status": "pending",
+            "suggested_action": "watch",
+            "market_slug": "will-btc-close-above-100k",
+            "wallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        }
+        skipped_candidate = {
+            "id": "cand-skipped",
+            "status": "skipped",
+            "suggested_action": "watch",
+            "market_slug": "xrp-above-1pt6-on-march-20",
+            "wallet": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        }
+
+        def _list_candidates(**kwargs):
+            rows = [pending_candidate, skipped_candidate]
+            statuses = {str(status) for status in (kwargs.get("statuses") or [])}
+            if statuses:
+                rows = [row for row in rows if str(row.get("status") or "") in statuses]
+            return rows[: int(kwargs.get("limit") or len(rows))]
+
         trader = SimpleNamespace(
             broker=SimpleNamespace(),
             strategy=_Strategy(),
+            list_candidates=_list_candidates,
+            candidate_store=SimpleNamespace(
+                stats_summary=lambda **_: {
+                    "days": 30,
+                    "recent_days": 7,
+                    "updated_ts": int(time.time()),
+                    "candidates": {"total_candidates": 2, "by_status": [{"status": "approved", "count": 1}]},
+                    "candidate_actions": {"total_actions": 1, "by_action": [{"action": "follow", "count": 1}]},
+                    "journal": {"total_entries": 1, "execution_actions": 1, "watch_actions": 0, "ignore_actions": 0, "updated_ts": int(time.time())},
+                    "archive": {"day_count": 1, "summary": {"candidate_count": 2, "action_count": 1, "journal_count": 1}},
+                    "wallet_profiles": {"count": 1, "enabled": 1, "watched": 0},
+                    "totals": {"candidate_count": 2, "action_count": 1, "journal_count": 1},
+                },
+                archive_summary=lambda **_: {
+                    "days": 30,
+                    "recent_days": 7,
+                    "day_count": 1,
+                    "summary": {"candidate_count": 2, "action_count": 1, "journal_count": 1, "days": 30},
+                    "daily_rows": [{"day_key": "2026-03-17", "candidate_count": 2, "action_count": 1, "journal_count": 1}],
+                    "recent_summary": {"candidate_count": 2, "action_count": 1, "journal_count": 1, "day_count": 1, "updated_ts": int(time.time()), "window_start_ts": 0, "days": 7},
+                    "updated_ts": int(time.time()),
+                },
+            ),
             positions_book={
                 "token-a": {
                     "token_id": "token-a",
@@ -437,9 +491,16 @@ class DaemonStateTests(unittest.TestCase):
                 "broker_event_sync_age_seconds": 180,
             },
         )
-        settings = Settings(_env_file=None)
-
-        payload = _build_state(trader, settings)
+        with patch.dict(
+            "os.environ",
+            {
+                "POLY_NOTIFIER_LOG_PATH": notifier_log,
+                "WALLET_EXIT_FOLLOW_ENABLED": "1",
+                "POLY_WALLET_EXIT_FOLLOW_ENABLED": "true",
+            },
+        ):
+            settings = Settings(_env_file=None)
+            payload = _build_state(trader, settings)
         first_exit_order = next(order for order in payload["orders"] if order["flow"] == "exit")
         self.assertEqual(payload["wallets"][0]["score"], 72.5)
         self.assertEqual(payload["wallets"][0]["tier"], "TRADE")
@@ -460,6 +521,9 @@ class DaemonStateTests(unittest.TestCase):
         self.assertEqual(payload["wallets"][0]["topic_profiles"][0]["label"], "加密")
         self.assertEqual(payload["positions"][0]["last_exit_kind"], "resonance_exit")
         self.assertEqual(payload["positions"][0]["last_exit_label"], "共振退出")
+        self.assertIn(payload["positions"][0]["suggested_action"], {"hold", "close_partial", "close_all"})
+        self.assertTrue(str(payload["positions"][0]["suggested_reason"]).strip())
+        self.assertGreaterEqual(int(payload["positions"][0]["hold_minutes"]), 0)
         self.assertEqual(payload["pending_order_details"][0]["order_id"], "ord-123")
         self.assertEqual(payload["pending_order_details"][0]["broker_status"], "live")
         self.assertEqual(payload["pending_order_details"][0]["matched_notional_hint"], 12.0)
@@ -470,6 +534,12 @@ class DaemonStateTests(unittest.TestCase):
         self.assertEqual(payload["startup"]["checks"][0]["name"], "network_smoke")
         self.assertEqual(payload["reconciliation"]["status"], "warn")
         self.assertEqual(payload["reconciliation"]["fill_count_today"], 1)
+        self.assertIn("notifier", payload)
+        self.assertIn("recent", payload["notifier"])
+        self.assertIn("channels", payload["notifier"])
+        self.assertIn("delivery_stats", payload["notifier"])
+        self.assertIn("telegram_configured", payload["notifier"])
+        self.assertEqual(payload["notifier"]["last"]["title"], "Ops")
         self.assertEqual(first_exit_order["exit_kind"], "resonance_exit")
         self.assertIn("部分减仓 will-btc-close-above-100k", [item["text"] for item in payload["timeline"]])
         self.assertEqual(payload["alerts"][0]["tag"], "处理")
@@ -484,6 +554,13 @@ class DaemonStateTests(unittest.TestCase):
         self.assertEqual(payload["exit_review"]["summary"]["max_hold_minutes"], 65)
         self.assertEqual(payload["exit_review"]["by_kind"][0]["label"], "共振退出")
         self.assertEqual(payload["exit_review"]["by_topic"][0]["label"], "加密")
+        self.assertAlmostEqual(payload["account"]["equity_usd"], payload["summary"]["equity"], places=4)
+        self.assertAlmostEqual(payload["account"]["cash_balance_usd"], payload["summary"]["cash_balance_usd"], places=4)
+        self.assertAlmostEqual(payload["available_notional_usd"], payload["summary"]["available_notional_usd"], places=4)
+        self.assertEqual(payload["open_positions"], payload["summary"]["open_positions"])
+        self.assertEqual(payload["mode"], payload["decision_mode"]["mode"])
+        self.assertFalse(payload["startup_ready"])
+        self.assertEqual(payload["reconciliation_status"], payload["reconciliation"]["status"])
         self.assertEqual(
             payload["exit_review"]["by_source"][0]["source_wallet"],
             "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
@@ -511,6 +588,9 @@ class DaemonStateTests(unittest.TestCase):
         self.assertEqual(payload["signal_review"]["traces"][0]["trace_id"], "trc-1")
         self.assertEqual(payload["signal_review"]["traces"][0]["decision_chain"][0]["action"], "entry")
         self.assertEqual(payload["signal_review"]["traces"][0]["decision_chain"][1]["action"], "trim")
+        self.assertEqual(payload["candidates"]["summary"]["count"], 1)
+        self.assertEqual(payload["candidates"]["summary"]["pending"], 1)
+        self.assertEqual([item["id"] for item in payload["candidates"]["items"]], ["cand-live"])
         self.assertEqual(payload["attribution_review"]["summary"]["available_orders"], 3)
         self.assertEqual(payload["attribution_review"]["windows"]["24h"]["summary"]["order_count"], 3)
         self.assertEqual(payload["attribution_review"]["windows"]["24h"]["summary"]["rejected_count"], 1)
@@ -539,6 +619,10 @@ class DaemonStateTests(unittest.TestCase):
         self.assertAlmostEqual(payload["config"]["resonance_trim_fraction"], 0.35, places=4)
         self.assertTrue(payload["config"]["wallet_discovery_quality_bias_enabled"])
         self.assertEqual(payload["config"]["wallet_discovery_quality_top_n"], 16)
+        self.assertEqual(payload["stats"]["totals"]["candidate_count"], 2)
+        self.assertEqual(payload["stats"]["candidate_actions"]["total_actions"], 1)
+        self.assertEqual(payload["archive"]["summary"]["journal_count"], 1)
+        self.assertEqual(payload["archive"]["day_count"], 1)
 
         cache_payload = _build_wallet_score_cache(trader)
         self.assertEqual(cache_payload["wallets"][0]["wallet_score"], 72.5)
@@ -548,6 +632,79 @@ class DaemonStateTests(unittest.TestCase):
         self.assertEqual(cache_payload["wallets"][0]["closed_positions"], 16)
         self.assertAlmostEqual(cache_payload["wallets"][0]["win_rate"], 0.6875, places=4)
         self.assertEqual(cache_payload["wallets"][0]["discovery_priority_rank"], 1)
+
+    def test_notifier_summary_reports_multiple_channels_and_delivery_stats(self):
+        notifier_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(notifier_dir.cleanup)
+        notifier_log = str(Path(notifier_dir.name) / "notifier.jsonl")
+
+        class _Response:
+            def __init__(self) -> None:
+                self.status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps({"ok": True, "result": {"message_id": 9}}).encode("utf-8")
+
+        def _fake_which(name: str) -> str | None:
+            return "/usr/bin/notify-send" if name == "notify-send" else None
+
+        with patch.dict(
+            "os.environ",
+            {
+                "POLY_NOTIFY_WEBHOOK_URL": "https://hooks.example.local/primary",
+                "POLY_NOTIFY_WEBHOOK_URLS": "https://hooks.example.local/secondary,https://hooks.example.local/tertiary",
+                "POLY_NOTIFY_TELEGRAM_BOT_TOKEN": "123456:telegram-token",
+                "POLY_NOTIFY_TELEGRAM_CHAT_ID": "123456789",
+                "POLY_NOTIFY_TELEGRAM_PARSE_MODE": "",
+            },
+        ):
+            with patch("polymarket_bot.notifier.shutil.which", side_effect=_fake_which):
+                with patch("polymarket_bot.notifier.subprocess.run", return_value=None):
+                    with patch("polymarket_bot.notifier.request.urlopen", return_value=_Response()):
+                        notifier = Notifier(log_path=notifier_log)
+                        local_payload = notifier.notify_local(title="Ops", body="check queue")
+                        webhook_payload = notifier.notify_webhook(
+                            title="Webhook", body="fan out", extra={"severity": "warn"}
+                        )
+                        telegram_payload = notifier.notify_telegram(title="Telegram", body="fan out")
+                        summary = notifier.summary(limit=10)
+
+        self.assertTrue(local_payload["ok"])
+        self.assertTrue(webhook_payload["ok"])
+        self.assertTrue(telegram_payload["ok"])
+        self.assertEqual(webhook_payload["delivery_count"], 3)
+        self.assertEqual(telegram_payload["delivery_count"], 1)
+        self.assertEqual(summary["delivery_stats"]["event_count"], 3)
+        self.assertEqual(summary["delivery_stats"]["delivery_count"], 5)
+        self.assertEqual(summary["delivery_stats"]["ok_events"], 3)
+        self.assertEqual(summary["delivery_stats"]["failed_events"], 0)
+        self.assertIn("local", summary["delivery_stats"]["by_channel"])
+        self.assertIn("webhook", summary["delivery_stats"]["by_channel"])
+        self.assertIn("telegram", summary["delivery_stats"]["by_channel"])
+        self.assertEqual(summary["delivery_stats"]["by_channel"]["webhook"]["deliveries"], 3)
+        self.assertEqual(summary["delivery_stats"]["by_channel"]["telegram"]["ok"], 1)
+        channel_names = [row["name"] for row in summary["channels"]]
+        self.assertIn("local", channel_names)
+        self.assertIn("webhook", channel_names)
+        self.assertIn("telegram", channel_names)
+        self.assertTrue(summary["telegram_configured"])
+        self.assertTrue(summary["webhook_configured"])
+        self.assertEqual(summary["last"]["channel"], "telegram")
+        self.assertEqual(summary["last_success"]["channel"], "telegram")
+        self.assertEqual(summary["channels"][1]["target_count"], 3)
+
+    def test_settings_expose_notification_defaults(self):
+        settings = Settings(_env_file=None)
+        self.assertTrue(settings.notify_local_enabled)
+        self.assertEqual(settings.notify_webhook_url_list, [])
+        self.assertFalse(settings.notify_telegram_enabled)
+        self.assertEqual(settings.notify_telegram_api_base, "https://api.telegram.org")
 
 
 if __name__ == "__main__":

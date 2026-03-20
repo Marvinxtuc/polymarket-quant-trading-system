@@ -5,7 +5,9 @@ import unittest
 from typing import Any
 import zipfile
 
-from polymarket_bot.clients.data_api import PolymarketDataClient
+import httpx
+
+from polymarket_bot.clients.data_api import PolymarketDataClient, _is_retryable_http_error
 
 
 class _StubDataClient(PolymarketDataClient):
@@ -44,6 +46,30 @@ class _StubDataClient(PolymarketDataClient):
 
 
 class DataApiClientTests(unittest.TestCase):
+    def test_retryable_http_error_only_retries_transient_failures(self):
+        request = httpx.Request("GET", "https://clob.polymarket.com/book")
+        not_found = httpx.HTTPStatusError(
+            "missing",
+            request=request,
+            response=httpx.Response(404, request=request),
+        )
+        too_many = httpx.HTTPStatusError(
+            "rate limited",
+            request=request,
+            response=httpx.Response(429, request=request),
+        )
+        server_error = httpx.HTTPStatusError(
+            "server error",
+            request=request,
+            response=httpx.Response(503, request=request),
+        )
+        timeout = httpx.ReadTimeout("timed out", request=request)
+
+        self.assertFalse(_is_retryable_http_error(not_found))
+        self.assertTrue(_is_retryable_http_error(too_many))
+        self.assertTrue(_is_retryable_http_error(server_error))
+        self.assertTrue(_is_retryable_http_error(timeout))
+
     def test_get_order_book_parses_tick_and_min_size(self):
         def responder(base_url: str, path: str, params: dict[str, Any]) -> Any:
             self.assertEqual(base_url, "https://clob.polymarket.com")

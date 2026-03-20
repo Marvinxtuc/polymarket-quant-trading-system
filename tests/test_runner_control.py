@@ -8,6 +8,7 @@ import unittest
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 
 from polymarket_bot.clients.data_api import AccountingSnapshot, ClosedPosition
 from polymarket_bot.config import Settings
@@ -22,6 +23,9 @@ class _DummyDataClient:
         self.active_positions = []
         self.accounting_snapshot = None
         self.closed_positions = []
+        self.order_book = SimpleNamespace(best_bid=0.48, best_ask=0.52)
+        self.midpoint_price = 0.5
+        self.price_history: list[dict[str, object]] = []
 
     def discover_wallet_activity(self, paths, limit):
         return {}
@@ -34,6 +38,15 @@ class _DummyDataClient:
 
     def iter_closed_positions(self, wallet, **_kwargs):
         return iter(self.closed_positions)
+
+    def get_order_book(self, _token_id: str):
+        return self.order_book
+
+    def get_midpoint_price(self, _token_id: str):
+        return self.midpoint_price
+
+    def get_price_history(self, _token_id: str, **_kwargs):
+        return list(self.price_history)
 
     def close(self):
         return None
@@ -90,6 +103,25 @@ class _DummyBroker:
         return None
 
 
+class _RejectingBroker(_DummyBroker):
+    def __init__(self, message: str):
+        super().__init__()
+        self.message = message
+
+    def execute(self, signal, notional_usd):
+        self.calls.append((signal, notional_usd))
+        return ExecutionResult(
+            ok=False,
+            broker_order_id=None,
+            message=self.message,
+            filled_notional=0.0,
+            filled_price=0.0,
+            status="rejected",
+            requested_notional=notional_usd,
+            requested_price=max(0.01, signal.price_hint),
+        )
+
+
 class _PendingBroker(_DummyBroker):
     def __init__(self):
         super().__init__()
@@ -119,6 +151,7 @@ class _PendingBroker(_DummyBroker):
 
     def heartbeat(self, order_ids: list[str]):
         self.heartbeat_calls.append(list(order_ids))
+        return True
 
     def list_open_orders(self):
         return self.open_orders
@@ -151,7 +184,6 @@ class _FakeHistoryStore:
         self.metrics = dict(metrics or {})
         self.topic_profiles = dict(topic_profiles or {})
 
-        return True
     def sync_wallets(self, wallets, *, max_wallets=None):
         selected = []
         limit = len(wallets) if max_wallets is None else max_wallets
@@ -217,6 +249,7 @@ class TraderControlTests(unittest.TestCase):
         max_signals_per_cycle = int(kwargs.get("max_signals_per_cycle", 1))
         runtime_state_path = kwargs.get("runtime_state_path")
         ledger_path = kwargs.get("ledger_path")
+        candidate_db_path = kwargs.get("candidate_db_path")
         if runtime_state_path is None:
             runtime_state_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
             runtime_state_file.write("{}")
@@ -227,10 +260,13 @@ class TraderControlTests(unittest.TestCase):
             ledger_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
             ledger_file.close()
             ledger_path = ledger_file.name
+        if candidate_db_path is None:
+            candidate_db_path = str(Path(tempfile.mkdtemp()) / "terminal.db")
 
         return Settings(
             _env_file=None,
             dry_run=bool(kwargs.get("dry_run", True)),
+            decision_mode=str(kwargs.get("decision_mode", "auto")),
             wallet_discovery_enabled=bool(kwargs.get("wallet_discovery_enabled", False)),
             wallet_discovery_mode=str(kwargs.get("wallet_discovery_mode", "union")),
             watch_wallets=str(kwargs.get("watch_wallets", "0x1111111111111111111111111111111111111111")),
@@ -244,6 +280,7 @@ class TraderControlTests(unittest.TestCase):
             control_path=control_path,
             runtime_state_path=str(runtime_state_path),
             ledger_path=str(ledger_path),
+            candidate_db_path=str(candidate_db_path),
             max_signals_per_cycle=max_signals_per_cycle,
             poll_interval_seconds=60,
             bankroll_usd=float(kwargs.get("bankroll_usd", 5000.0)),
@@ -511,6 +548,42 @@ class TraderControlTests(unittest.TestCase):
         self.assertEqual(trader.recent_orders[0]["status"], "CANCELED")
         self.assertEqual(trader.state.pending_entry_notional_usd, 0.0)
 
+    def test_pending_order_heartbeat_ts_not_updated_when_broker_heartbeat_noops(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 24,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _PendingBroker()
+
+        def _noop_heartbeat(order_ids: list[str]):
+            broker.heartbeat_calls.append(list(order_ids))
+            return False
+
+        broker.heartbeat = _noop_heartbeat  # type: ignore[assignment]
+        trader = Trader(
+            settings=self._make_settings(control_path, dry_run=False, funder_address="0xabc"),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([_signal("BUY")]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+
+        trader.step()
+        self.assertEqual(len(trader.pending_orders), 1)
+        trader._reconcile_runtime_with_broker()
+
+        pending = next(iter(trader.pending_orders.values()))
+        self.assertEqual(broker.heartbeat_calls[-1], ["live-token-demo"])
+        self.assertEqual(int(pending.get("last_heartbeat_ts") or 0), 0)
+
     def test_operator_clear_stale_pending_removes_only_stale_orders(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
             json.dump(
@@ -548,42 +621,6 @@ class TraderControlTests(unittest.TestCase):
         fresh_order = dict(stale_order)
         fresh_order["key"] = "fresh-live-token-demo"
         fresh_order["order_id"] = "live-token-demo-fresh"
-    def test_pending_order_heartbeat_ts_not_updated_when_broker_heartbeat_noops(self):
-        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
-            json.dump(
-                {
-                    "pause_opening": False,
-                    "reduce_only": False,
-                    "emergency_stop": False,
-                    "updated_ts": 24,
-                },
-                f,
-            )
-            control_path = f.name
-
-        broker = _PendingBroker()
-
-        def _noop_heartbeat(order_ids: list[str]):
-            broker.heartbeat_calls.append(list(order_ids))
-            return False
-
-        broker.heartbeat = _noop_heartbeat  # type: ignore[assignment]
-        trader = Trader(
-            settings=self._make_settings(control_path, dry_run=False, funder_address="0xabc"),
-            data_client=_DummyDataClient(),
-            strategy=_DummyStrategy([_signal("BUY")]),
-            risk=_DummyRisk(),
-            broker=broker,
-        )
-
-        trader.step()
-        self.assertEqual(len(trader.pending_orders), 1)
-        trader._reconcile_runtime_with_broker()
-
-        pending = next(iter(trader.pending_orders.values()))
-        self.assertEqual(broker.heartbeat_calls[-1], ["live-token-demo"])
-        self.assertEqual(int(pending.get("last_heartbeat_ts") or 0), 0)
-
         fresh_order["signal_id"] = "sig-fresh"
         fresh_order["trace_id"] = "trc-fresh"
         fresh_order["token_id"] = "token-demo-fresh"
@@ -780,6 +817,429 @@ class TraderControlTests(unittest.TestCase):
         trader.step()
 
         self.assertEqual(len(broker.calls), 0)
+
+    def test_condition_netting_allows_small_clip_below_legacy_five_usd_floor(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 26,
+                },
+                f,
+            )
+            control_path = f.name
+
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                bankroll_usd=100.0,
+                max_condition_exposure_pct=0.015,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+
+        allowed, snapshot = trader._enforce_condition_netting(
+            _signal("BUY", token_id="token-small-cap", market_slug="small-cap", condition_id="condition-small"),
+            50.0,
+        )
+
+        self.assertAlmostEqual(allowed, 1.5, places=4)
+        self.assertAlmostEqual(float(snapshot["condition_exposure_cap_usd"]), 1.5, places=4)
+
+    def test_buy_signal_uses_remaining_cash_below_legacy_five_usd_floor(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 27,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                bankroll_usd=100.0,
+                portfolio_netting_enabled=False,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([_signal("BUY", token_id="token-low-cash", market_slug="low-cash-market")]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        trader.state.cash_balance_usd = 1.8756
+        trader.state.account_snapshot_ts = int(time.time())
+
+        trader.step()
+
+        self.assertEqual(len(broker.calls), 1)
+        self.assertAlmostEqual(broker.calls[0][1], 1.8756, places=4)
+
+    def test_time_exit_closes_full_position_below_close_threshold(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 28,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                stale_position_minutes=5,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        now_ts = int(time.time())
+        trader.positions_book["token-stale-small"] = {
+            "token_id": "token-stale-small",
+            "condition_id": "condition-stale-small",
+            "market_slug": "stale-small-market",
+            "outcome": "YES",
+            "quantity": 9.98,
+            "price": 0.5,
+            "notional": 4.99,
+            "cost_basis_notional": 4.99,
+            "opened_ts": now_ts - 3600,
+            "last_buy_ts": now_ts - 3600,
+            "last_trim_ts": 0,
+            "entry_wallet": "0xold",
+            "entry_wallet_score": 75.0,
+            "entry_wallet_tier": "CORE",
+            "entry_topic_label": "",
+            "entry_topic_bias": "neutral",
+            "entry_topic_multiplier": 1.0,
+            "entry_topic_summary": "",
+            "entry_reason": "stale position",
+            "trace_id": "trc-stale-small",
+            "origin_signal_id": "sig-stale-small",
+            "last_signal_id": "sig-stale-small",
+            "last_exit_kind": "",
+            "last_exit_label": "",
+            "last_exit_summary": "",
+            "last_exit_ts": 0,
+        }
+        trader.state.open_positions = 1
+
+        trader._apply_time_exit()
+
+        self.assertEqual(len(broker.calls), 1)
+        self.assertAlmostEqual(broker.calls[0][1], 4.99, places=4)
+        self.assertNotIn("token-stale-small", trader.positions_book)
+
+    def test_time_exit_retires_position_when_orderbook_is_missing_and_account_snapshot_cleared(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 2801,
+                },
+                f,
+            )
+            control_path = f.name
+
+        data_client = _DummyDataClient()
+        data_client.accounting_snapshot = AccountingSnapshot(
+            wallet="0xabc",
+            cash_balance=10.8356,
+            positions_value=0.0,
+            equity=10.8356,
+            valuation_time="2026-03-20T06:47:12Z",
+            positions=(),
+        )
+        broker = _RejectingBroker(
+            "live preflight failed: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=token-stale-closed'"
+        )
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                dry_run=False,
+                funder_address="0xabc",
+                stale_position_minutes=5,
+            ),
+            data_client=data_client,
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        now_ts = int(time.time())
+        trader.positions_book["token-stale-closed"] = {
+            "token_id": "token-stale-closed",
+            "condition_id": "condition-stale-closed",
+            "market_slug": "stale-closed-market",
+            "outcome": "YES",
+            "quantity": 8.96,
+            "price": 0.89,
+            "notional": 7.9744,
+            "cost_basis_notional": 7.9744,
+            "opened_ts": now_ts - 3600,
+            "last_buy_ts": now_ts - 3600,
+            "last_trim_ts": 0,
+            "entry_wallet": "0xold",
+            "entry_wallet_score": 75.0,
+            "entry_wallet_tier": "CORE",
+            "entry_topic_label": "",
+            "entry_topic_bias": "neutral",
+            "entry_topic_multiplier": 1.0,
+            "entry_topic_summary": "",
+            "entry_reason": "resolved position",
+            "trace_id": "trc-stale-closed",
+            "origin_signal_id": "sig-stale-closed",
+            "last_signal_id": "sig-stale-closed",
+            "last_exit_kind": "",
+            "last_exit_label": "",
+            "last_exit_summary": "",
+            "last_exit_ts": 0,
+        }
+        trader.state.open_positions = 1
+
+        trader._apply_time_exit()
+
+        self.assertEqual(len(broker.calls), 1)
+        self.assertNotIn("token-stale-closed", trader.positions_book)
+        self.assertEqual(trader.state.open_positions, 0)
+        self.assertAlmostEqual(trader.state.cash_balance_usd, 10.8356, places=4)
+        self.assertAlmostEqual(trader.state.positions_value_usd, 0.0, places=4)
+        self.assertEqual(trader.recent_orders[0]["final_status"] if "final_status" in trader.recent_orders[0] else trader.recent_orders[0]["status"], "REJECTED")
+        self.assertIn("time-exit failed", trader.recent_orders[0]["reason"])
+
+    def test_pending_buy_reserves_cash_for_following_buys(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 6,
+                },
+                f,
+            )
+            control_path = f.name
+
+        signal_one = _signal("BUY", wallet_score=90.0, market_slug="market-one", token_id="token-one")
+        signal_one.signal_id = "sig-one"
+        signal_one.trace_id = "tr-one"
+        signal_two = _signal("BUY", wallet_score=90.0, market_slug="market-two", token_id="token-two")
+        signal_two.signal_id = "sig-two"
+        signal_two.trace_id = "tr-two"
+
+        settings = self._make_settings(
+            control_path,
+            bankroll_usd=100.0,
+            max_signals_per_cycle=2,
+            portfolio_netting_enabled=False,
+        )
+        settings.risk_per_trade_pct = 0.05
+        broker = _PendingBroker()
+        trader = Trader(
+            settings=settings,
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([signal_one, signal_two]),
+            risk=RiskManager(settings),
+            broker=broker,
+        )
+        trader.state.cash_balance_usd = 9.0
+        trader.state.account_snapshot_ts = 1700000000
+        trader._refresh_risk_state()
+
+        trader.step()
+
+        self.assertEqual(len(broker.calls), 2)
+        self.assertAlmostEqual(broker.calls[0][1], 7.5, places=4)
+        self.assertAlmostEqual(broker.calls[1][1], 1.5, places=4)
+        self.assertAlmostEqual(trader.state.pending_entry_notional_usd, 9.0, places=4)
+        self.assertAlmostEqual(trader._available_notional_usd(), 0.0, places=4)
+        queued = trader.list_candidates(limit=10)
+        submitted = [row for row in queued if row.get("status") == "submitted"]
+        skipped_budget = [row for row in queued if row.get("result_tag") == "insufficient_budget"]
+        self.assertEqual(len(submitted), 2)
+        self.assertEqual(len(skipped_budget), 0)
+
+    def test_auto_mode_keeps_watch_candidate_out_of_execution_plans(self):
+        class _WideSpreadDataClient(_DummyDataClient):
+            def __init__(self):
+                super().__init__()
+                self.order_book = SimpleNamespace(best_bid=0.01, best_ask=0.99)
+                self.midpoint_price = 0.945
+
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "auto",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 41,
+                },
+                f,
+            )
+            control_path = f.name
+
+        signal = _signal(
+            "BUY",
+            wallet_score=90.73,
+            wallet_tier="CORE",
+            market_slug="xrp-above-1pt6-on-march-20",
+            token_id="token-watch-only",
+            outcome="No",
+            observed_notional=189.89,
+            observed_size=199.88,
+        )
+        signal.confidence = 0.687978416198392
+        signal.price_hint = 0.946772
+
+        settings = self._make_settings(
+            control_path,
+            decision_mode="auto",
+            max_signals_per_cycle=1,
+        )
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=settings,
+            data_client=_WideSpreadDataClient(),
+            strategy=_DummyStrategy([signal]),
+            risk=RiskManager(settings),
+            broker=broker,
+        )
+
+        trader.step()
+
+        queued = trader.list_candidates(limit=4)
+        self.assertEqual(len(broker.calls), 0)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["status"], "pending")
+        self.assertEqual(queued[0]["suggested_action"], "watch")
+        self.assertIsNone(queued[0].get("result_tag"))
+
+    def test_live_order_refreshes_account_snapshot_before_following_buy(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 7,
+                },
+                f,
+            )
+            control_path = f.name
+
+        smoke_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        smoke_file.write(
+            json.dumps(
+                {
+                    "ts": int(time.time()),
+                    "summary": {
+                        "failures": 0,
+                        "blocks": 0,
+                        "warnings": 0,
+                        "exit_code": 0,
+                    },
+                }
+            )
+        )
+        smoke_file.write("\n")
+        smoke_file.flush()
+        smoke_file.close()
+
+        signal_one = _signal("BUY", wallet_score=96.5, wallet_tier="CORE", market_slug="market-one", token_id="token-one")
+        signal_two = _signal("BUY", wallet_score=96.5, wallet_tier="CORE", market_slug="market-two", token_id="token-two")
+
+        settings = self._make_settings(
+            control_path,
+            dry_run=False,
+            decision_mode="auto",
+            bankroll_usd=100.0,
+            max_signals_per_cycle=2,
+            portfolio_netting_enabled=False,
+            funder_address="0xabc",
+            live_allowance_ready=True,
+            live_geoblock_ready=True,
+            live_account_ready=True,
+            account_sync_refresh_seconds=300,
+        )
+        settings.risk_per_trade_pct = 0.05
+
+        data_client = _DummyDataClient()
+        data_client.accounting_snapshot = AccountingSnapshot(
+            wallet="0xabc",
+            cash_balance=12.0,
+            positions_value=0.0,
+            equity=12.0,
+            valuation_time="2026-03-19T13:43:00Z",
+        )
+
+        class _BalanceUpdatingPendingBroker(_PendingBroker):
+            def __init__(self, client):
+                super().__init__()
+                self._client = client
+
+            def execute(self, signal, notional_usd):
+                if not self.calls:
+                    self._client.accounting_snapshot = AccountingSnapshot(
+                        wallet="0xabc",
+                        cash_balance=1.0,
+                        positions_value=7.5,
+                        equity=8.5,
+                        valuation_time="2026-03-19T13:43:40Z",
+                    )
+                return super().execute(signal, notional_usd)
+
+        broker = _BalanceUpdatingPendingBroker(data_client)
+        previous = {
+            key: os.environ.get(key)
+            for key in ("NETWORK_SMOKE_LOG", "LIVE_ALLOWANCE_READY", "LIVE_GEOBLOCK_READY", "LIVE_ACCOUNT_READY")
+        }
+        os.environ["NETWORK_SMOKE_LOG"] = smoke_file.name
+        os.environ["LIVE_ALLOWANCE_READY"] = "true"
+        os.environ["LIVE_GEOBLOCK_READY"] = "true"
+        os.environ["LIVE_ACCOUNT_READY"] = "true"
+        try:
+            trader = Trader(
+                settings=settings,
+                data_client=data_client,
+                strategy=_DummyStrategy([signal_one, signal_two]),
+                risk=RiskManager(settings),
+                broker=broker,
+            )
+
+            trader.step()
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+        self.assertEqual(len(broker.calls), 1)
+        self.assertAlmostEqual(trader.state.cash_balance_usd, 1.0, places=4)
+        self.assertAlmostEqual(trader.state.pending_entry_notional_usd, broker.calls[0][1], places=4)
+        queued = trader.list_candidates(limit=10)
+        submitted = [row for row in queued if row.get("status") == "submitted"]
+        skipped_budget = [row for row in queued if row.get("result_tag") == "insufficient_budget"]
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(len(skipped_budget), 1)
+        self.assertIn(skipped_budget[0].get("market_slug"), {"market-one", "market-two"})
 
     def test_duplicate_buy_signal_is_debounced(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
@@ -2111,6 +2571,79 @@ class TraderControlTests(unittest.TestCase):
         self.assertAlmostEqual(trader.state.broker_closed_pnl_today, -14.0, places=4)
         self.assertGreater(trader.state.account_snapshot_ts, 0)
 
+    def test_periodic_reconcile_removed_positions_refreshes_account_snapshot(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 2401,
+                },
+                f,
+            )
+            control_path = f.name
+
+        data_client = _DummyDataClient()
+        data_client.accounting_snapshot = AccountingSnapshot(
+            wallet="0xabc",
+            cash_balance=10.8356,
+            positions_value=0.0,
+            equity=10.8356,
+            valuation_time="2026-03-20T06:47:12Z",
+            positions=(),
+        )
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                dry_run=False,
+                funder_address="0xabc",
+                account_sync_refresh_seconds=60,
+            ),
+            data_client=data_client,
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+        trader.positions_book["token-demo"] = {
+            "token_id": "token-demo",
+            "condition_id": "condition-demo",
+            "market_slug": "demo-market",
+            "outcome": "YES",
+            "quantity": 10.0,
+            "price": 0.5,
+            "notional": 5.0,
+            "cost_basis_notional": 5.0,
+            "opened_ts": 1700000000,
+            "last_buy_ts": 1700000000,
+            "last_trim_ts": 0,
+            "entry_wallet": "0xold",
+            "entry_wallet_score": 75.0,
+            "entry_wallet_tier": "CORE",
+            "entry_topic_label": "",
+            "entry_topic_bias": "neutral",
+            "entry_topic_multiplier": 1.0,
+            "entry_topic_summary": "",
+            "entry_reason": "demo",
+            "trace_id": "trc-demo",
+            "origin_signal_id": "sig-demo",
+            "last_signal_id": "sig-demo",
+            "last_exit_kind": "",
+            "last_exit_label": "",
+            "last_exit_summary": "",
+            "last_exit_ts": 0,
+        }
+        trader._refresh_risk_state()
+        data_client.active_positions = []
+
+        trader._reconcile_runtime_with_broker()
+
+        self.assertEqual(trader.state.open_positions, 0)
+        self.assertEqual(trader.positions_book, {})
+        self.assertAlmostEqual(trader.state.cash_balance_usd, 10.8356, places=4)
+        self.assertAlmostEqual(trader.state.positions_value_usd, 0.0, places=4)
+        self.assertAlmostEqual(trader.state.equity_usd, 10.8356, places=4)
+
     def test_portfolio_netting_clamps_same_condition_buy_across_tokens(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
             json.dump(
@@ -2234,6 +2767,500 @@ class TraderControlTests(unittest.TestCase):
         self.assertAlmostEqual(broker.calls[1][1], 10.0, places=4)
         self.assertAlmostEqual(trader.positions_book["token-b"]["notional"], 10.0, places=4)
         self.assertEqual(trader.positions_book["token-b"]["condition_id"], "")
+
+    def test_manual_mode_queues_candidates_and_executes_after_approval(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "manual",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 1,
+                },
+                f,
+            )
+            control_path = f.name
+
+        strategy = _DummyStrategy([_signal("BUY", token_id="token-manual", market_slug="manual-market")])
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="manual",
+                max_signals_per_cycle=1,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=strategy,
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+
+        trader.step()
+
+        queued = trader.list_candidates(limit=4)
+        self.assertEqual(len(broker.calls), 0)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["status"], "pending")
+
+        assert trader.candidate_store is not None
+        trader.candidate_store.record_candidate_action(queued[0]["id"], action="follow", note="ship it")
+        strategy._signals = []
+
+        trader.step()
+
+        executed = trader.candidate_store.get_candidate(queued[0]["id"])
+        self.assertEqual(len(broker.calls), 1)
+        self.assertIsNotNone(executed)
+        assert executed is not None
+        self.assertEqual(executed["status"], "executed")
+        self.assertIn("token-manual", trader.positions_book)
+        self.assertGreaterEqual(trader.journal_summary()["total_entries"], 1)
+
+    def test_candidate_marks_existing_position_conflict(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "manual",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 1,
+                },
+                f,
+            )
+            control_path = f.name
+
+        strategy = _DummyStrategy([_signal("BUY", token_id="token-conflict", market_slug="conflict-market", wallet="0xnew")])
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="manual",
+                max_signals_per_cycle=1,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=strategy,
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        trader.positions_book["token-conflict"] = {
+            "token_id": "token-conflict",
+            "condition_id": "condition-conflict",
+            "market_slug": "conflict-market",
+            "outcome": "YES",
+            "quantity": 20.0,
+            "price": 0.5,
+            "notional": 10.0,
+            "cost_basis_notional": 10.0,
+            "opened_ts": int(time.time()) - 300,
+            "last_buy_ts": int(time.time()) - 300,
+            "last_trim_ts": 0,
+            "entry_wallet": "0xold",
+            "entry_wallet_score": 82.0,
+            "entry_wallet_tier": "CORE",
+            "entry_topic_label": "Politics",
+            "entry_topic_bias": "neutral",
+            "entry_topic_multiplier": 1.0,
+            "entry_topic_summary": "",
+            "entry_reason": "existing position",
+            "trace_id": "trc-conflict",
+            "origin_signal_id": "sig-conflict",
+            "last_signal_id": "sig-conflict",
+            "last_exit_kind": "",
+            "last_exit_label": "",
+            "last_exit_summary": "",
+            "last_exit_ts": 0,
+        }
+
+        trader.step()
+
+        queued = trader.list_candidates(limit=4)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["skip_reason"], "existing_position_conflict")
+        self.assertEqual(queued[0]["suggested_action"], "watch")
+        self.assertTrue(queued[0]["has_existing_position"])
+        self.assertTrue(queued[0]["existing_position_conflict"])
+        self.assertIn("当前已有仓位", " ".join(queued[0].get("explanation") or []))
+        factor_keys = [str(item.get("key") or "") for item in queued[0].get("reason_factors") or []]
+        self.assertIn("existing_position", factor_keys)
+        self.assertIn("skip_reason", factor_keys)
+        self.assertIn("decision", factor_keys)
+        self.assertIn("已有仓位", " ".join(str(item.get("detail") or "") for item in queued[0].get("reason_factors") or []))
+
+    def test_candidate_enrich_uses_price_history_momentum(self):
+        class _HistoryDataClient(_DummyDataClient):
+            def __init__(self, *, history: list[dict[str, object]]):
+                super().__init__()
+                self.history = list(history)
+
+            def get_order_book(self, _token_id: str):
+                return type("Book", (), {"best_bid": 0.58, "best_ask": 0.64})()
+
+            def get_midpoint_price(self, _token_id: str):
+                return 0.61
+
+            def get_price_history(self, _token_id: str, **_kwargs):
+                return list(self.history)
+
+        now_ts = int(time.time())
+        signal = _signal("BUY", token_id="token-history", market_slug="history-market")
+        signal.price_hint = 0.60
+        signal.observed_notional = 400.0
+        rich_history_client = _HistoryDataClient(
+            history=[
+                {"t": now_ts - 1800, "p": 0.54},
+                {"t": now_ts - 600, "p": 0.58},
+                {"t": now_ts - 300, "p": 0.60},
+                {"t": now_ts - 60, "p": 0.62},
+            ]
+        )
+        sparse_history_client = _HistoryDataClient(history=[])
+
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "manual",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 35,
+                },
+                f,
+            )
+            rich_control_path = f.name
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "manual",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 36,
+                },
+                f,
+            )
+            plain_control_path = f.name
+
+        settings = self._make_settings(
+            rich_control_path,
+            decision_mode="manual",
+            max_signals_per_cycle=1,
+        )
+        trader_with_history = Trader(
+            settings=settings,
+            data_client=rich_history_client,
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+        trader_without_history = Trader(
+            settings=self._make_settings(
+                plain_control_path,
+                decision_mode="manual",
+                max_signals_per_cycle=1,
+            ),
+            data_client=sparse_history_client,
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+
+        rich_candidate = trader_with_history._candidate_from_signal(signal, now=now_ts)
+        plain_candidate = trader_without_history._candidate_from_signal(signal, now=now_ts)
+
+        self.assertGreater(float(rich_candidate.momentum_5m or 0.0), 0.0)
+        self.assertGreater(float(rich_candidate.momentum_30m or 0.0), 0.0)
+        self.assertGreater(float(rich_candidate.score or 0.0), float(plain_candidate.score or 0.0))
+        self.assertIn("5m", " ".join(rich_candidate.explanation))
+        self.assertIn("30m", " ".join(rich_candidate.explanation))
+        self.assertIn("趋势", " ".join(rich_candidate.explanation))
+        factor_keys = [factor.key for factor in rich_candidate.reason_factors]
+        self.assertIn("momentum", factor_keys)
+        self.assertIn("spread", factor_keys)
+        self.assertIn("chase", factor_keys)
+        self.assertIn("decision", factor_keys)
+        momentum_factor = next(factor for factor in rich_candidate.reason_factors if factor.key == "momentum")
+        self.assertIn("5m", momentum_factor.value)
+        self.assertIn("30m", momentum_factor.value)
+
+    def test_auto_mode_skips_buy_candidates_without_live_orderbook(self):
+        class _NoOrderbookDataClient(_DummyDataClient):
+            def get_order_book(self, _token_id: str):
+                return None
+
+            def get_midpoint_price(self, _token_id: str):
+                return None
+
+            def get_price_history(self, _token_id: str, **_kwargs):
+                return []
+
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "auto",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 37,
+                },
+                f,
+            )
+            control_path = f.name
+
+        signal = _signal("BUY", token_id="token-no-book", market_slug="stale-market")
+        signal.price_hint = 0.74
+        signal.observed_notional = 250.0
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="auto",
+                max_signals_per_cycle=1,
+            ),
+            data_client=_NoOrderbookDataClient(),
+            strategy=_DummyStrategy([signal]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+
+        trader.step()
+
+        queued = trader.list_candidates(limit=4)
+        self.assertEqual(len(broker.calls), 0)
+        self.assertEqual(len(queued), 0)
+
+    def test_candidate_from_signal_requires_live_ask_for_buy_market_data(self):
+        class _BidOnlyDataClient(_DummyDataClient):
+            def __init__(self):
+                super().__init__()
+                self.order_book = SimpleNamespace(best_bid=0.01, best_ask=0.0)
+                self.midpoint_price = 0.995
+
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "manual",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 38,
+                },
+                f,
+            )
+            control_path = f.name
+
+        now_ts = int(time.time())
+        signal = _signal(
+            "BUY",
+            token_id="token-bid-only",
+            market_slug=f"eth-updown-15m-{now_ts - 60}",
+            observed_notional=250.0,
+        )
+        signal.price_hint = 0.74
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="manual",
+                max_signals_per_cycle=1,
+            ),
+            data_client=_BidOnlyDataClient(),
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+
+        candidate = trader._candidate_from_signal(signal, now=now_ts)
+
+        self.assertEqual(candidate.skip_reason, "market_data_unavailable")
+        self.assertIsNone(candidate.chase_pct)
+        self.assertAlmostEqual(float(candidate.current_midpoint or 0.0), 0.995, places=4)
+
+    def test_candidate_expiry_caps_to_short_market_end(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "manual",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 39,
+                },
+                f,
+            )
+            control_path = f.name
+
+        now_ts = int(time.time())
+        market_start = now_ts - 120
+        signal = _signal(
+            "BUY",
+            token_id="token-short-window",
+            market_slug=f"btc-updown-5m-{market_start}",
+        )
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="manual",
+                max_signals_per_cycle=1,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+
+        candidate = trader._candidate_from_signal(signal, now=now_ts)
+
+        self.assertEqual(candidate.expires_ts, market_start + 300)
+
+    def test_auto_mode_skips_buy_candidates_near_market_close(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "auto",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 40,
+                },
+                f,
+            )
+            control_path = f.name
+
+        now_ts = int(time.time())
+        signal = _signal(
+            "BUY",
+            token_id="token-near-close",
+            market_slug=f"btc-updown-5m-{now_ts - 260}",
+            observed_notional=250.0,
+        )
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="auto",
+                max_signals_per_cycle=1,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([signal]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+
+        trader.step()
+
+        queued = trader.list_candidates(limit=4)
+        self.assertEqual(len(broker.calls), 0)
+        self.assertEqual(len(queued), 0)
+
+    def test_step_expires_pending_buy_candidate_when_revalidation_fails(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "manual",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 41,
+                },
+                f,
+            )
+            control_path = f.name
+
+        now_ts = int(time.time())
+        signal = _signal(
+            "BUY",
+            token_id="token-stale-pending",
+            market_slug=f"eth-updown-15m-{now_ts - 120}",
+            observed_notional=250.0,
+        )
+        signal.signal_id = "sig-stale-pending"
+        signal.trace_id = "trc-stale-pending"
+        signal.price_hint = 0.74
+        data_client = _DummyDataClient()
+        data_client.order_book = SimpleNamespace(best_bid=0.72, best_ask=0.74)
+        data_client.midpoint_price = 0.73
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="manual",
+                max_signals_per_cycle=1,
+            ),
+            data_client=data_client,
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+
+        candidate = trader._candidate_from_signal(signal, now=now_ts)
+        assert trader.candidate_store is not None
+        trader.candidate_store.upsert_candidate(candidate)
+
+        data_client.order_book = SimpleNamespace(best_bid=0.01, best_ask=0.99)
+        data_client.midpoint_price = 0.50
+
+        trader.step()
+
+        self.assertEqual(trader.list_candidates(limit=4), [])
+        expired = trader.candidate_store.get_candidate(candidate.id)
+        self.assertIsNotNone(expired)
+        self.assertEqual(expired["status"], "expired")
+        self.assertEqual(expired["result_tag"], "candidate_revalidated_chase_too_high")
+
+    def test_step_refreshes_pending_buy_candidate_market_snapshot(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "manual",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 42,
+                },
+                f,
+            )
+            control_path = f.name
+
+        now_ts = int(time.time())
+        signal = _signal(
+            "BUY",
+            token_id="token-refresh-pending",
+            market_slug=f"btc-updown-15m-{now_ts - 120}",
+            observed_notional=250.0,
+        )
+        signal.signal_id = "sig-refresh-pending"
+        signal.trace_id = "trc-refresh-pending"
+        signal.price_hint = 0.60
+        data_client = _DummyDataClient()
+        data_client.order_book = SimpleNamespace(best_bid=0.48, best_ask=0.52)
+        data_client.midpoint_price = 0.50
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="manual",
+                max_signals_per_cycle=1,
+            ),
+            data_client=data_client,
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+
+        candidate = trader._candidate_from_signal(signal, now=now_ts)
+        assert trader.candidate_store is not None
+        trader.candidate_store.upsert_candidate(candidate)
+
+        data_client.order_book = SimpleNamespace(best_bid=0.54, best_ask=0.56)
+        data_client.midpoint_price = 0.55
+
+        trader.step()
+
+        refreshed = trader.list_candidates(limit=4)
+        self.assertEqual(len(refreshed), 1)
+        self.assertEqual(refreshed[0]["id"], candidate.id)
+        self.assertAlmostEqual(float(refreshed[0]["current_best_ask"] or 0.0), 0.56, places=4)
+        self.assertAlmostEqual(float(refreshed[0]["current_best_bid"] or 0.0), 0.54, places=4)
+        self.assertGreaterEqual(int(refreshed[0]["updated_ts"] or 0), now_ts)
 
 
 class RiskManagerTests(unittest.TestCase):

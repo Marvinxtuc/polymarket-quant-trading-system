@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from polymarket_bot.brokers.live_clob import LiveClobBroker
 from polymarket_bot.types import Signal
@@ -53,6 +55,12 @@ class _FakeClient:
 
     def get_trades(self):
         return list(self.trades_payload)
+
+
+class _FakePartialCreateOrderOptions:
+    def __init__(self, *, tick_size, neg_risk):
+        self.tick_size = tick_size
+        self.neg_risk = neg_risk
 
 
 class _FakeMarketClient:
@@ -106,6 +114,52 @@ def _signal(side: str, *, price_hint: float = 0.5) -> Signal:
 
 
 class LiveClobTests(unittest.TestCase):
+    def test_create_and_post_order_passes_partial_options_to_create_order(self):
+        class _SdkStyleClient(_FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.last_options = None
+
+            def create_order(self, order_args, options=None):
+                self.last_order = order_args
+                self.last_options = options
+                return order_args
+
+        broker = LiveClobBroker.__new__(LiveClobBroker)
+        broker.client = _SdkStyleClient()
+        broker._OrderType = _FakeOrderType
+        broker._PartialCreateOrderOptions = _FakePartialCreateOrderOptions
+
+        response = broker._create_and_post_order(object(), tick_size=0.01, neg_risk=True)
+
+        self.assertEqual(response["orderID"], "oid-demo")
+        self.assertIsInstance(broker.client.last_options, _FakePartialCreateOrderOptions)
+        self.assertEqual(broker.client.last_options.tick_size, "0.01")
+        self.assertTrue(broker.client.last_options.neg_risk)
+
+    def test_create_and_post_order_passes_partial_options_to_create_and_post(self):
+        class _SdkCreateAndPostClient(_FakeClient):
+            def __init__(self):
+                super().__init__()
+                self.last_options = None
+
+            def create_and_post_order(self, order_args, options=None):
+                self.last_order = order_args
+                self.last_options = options
+                return {"orderID": "oid-direct", "status": "live"}
+
+        broker = LiveClobBroker.__new__(LiveClobBroker)
+        broker.client = _SdkCreateAndPostClient()
+        broker._OrderType = _FakeOrderType
+        broker._PartialCreateOrderOptions = _FakePartialCreateOrderOptions
+
+        response = broker._create_and_post_order(object(), tick_size=0.005, neg_risk=False)
+
+        self.assertEqual(response["orderID"], "oid-direct")
+        self.assertIsInstance(broker.client.last_options, _FakePartialCreateOrderOptions)
+        self.assertEqual(broker.client.last_options.tick_size, "0.005")
+        self.assertFalse(broker.client.last_options.neg_risk)
+
     def test_execute_maps_sell_side(self):
         broker = LiveClobBroker.__new__(LiveClobBroker)
         broker._OrderArgs = _FakeOrderArgs
@@ -219,6 +273,7 @@ class LiveClobTests(unittest.TestCase):
 
         result = broker.heartbeat(["oid-a", "", "oid-b"])
 
+        self.assertTrue(result)
         self.assertEqual(broker.client.heartbeat_payloads, [["oid-a", "oid-b"]])
 
     def test_list_open_orders_parses_partial_fill_state(self):
@@ -273,7 +328,6 @@ class LiveClobTests(unittest.TestCase):
 
         self.assertIsNotNone(fills)
         assert fills is not None
-        self.assertTrue(result)
         self.assertEqual(len(fills), 1)
         self.assertEqual(fills[0].order_id, "oid-maker")
         self.assertAlmostEqual(fills[0].notional, 3.64, places=6)
@@ -409,7 +463,8 @@ class LiveClobTests(unittest.TestCase):
         os.environ["LIVE_GEOBLOCK_READY"] = "true"
         os.environ["LIVE_ACCOUNT_READY"] = "true"
         try:
-            checks = broker.startup_checks()
+            with patch.dict(sys.modules, {"websocket": SimpleNamespace(__name__="websocket")}):
+                checks = broker.startup_checks()
         finally:
             for key, value in previous.items():
                 if value is None:

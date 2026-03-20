@@ -8,17 +8,40 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
     # Runtime
-    poll_interval_seconds: int = Field(default=45, ge=5)
+    poll_interval_seconds: int = Field(default=30, ge=5)
     dry_run: bool = True
     log_level: str = "INFO"
+    decision_mode: str = "manual"
+    candidate_db_path: str = "/tmp/poly_runtime_data/decision_terminal.db"
+    candidate_ttl_seconds: int = Field(default=900, ge=60, le=86400)
+    candidate_buy_small_fraction: float = Field(default=0.35, gt=0.0, le=1.0)
+    candidate_buy_normal_fraction: float = Field(default=0.7, gt=0.0, le=1.0)
+    candidate_follow_fraction: float = Field(default=1.0, gt=0.0, le=1.0)
+    candidate_close_partial_fraction: float = Field(default=0.5, gt=0.0, le=1.0)
+    candidate_auto_min_score: float = Field(default=72.0, ge=0.0, le=100.0)
+    candidate_auto_min_wallet_score: float = Field(default=70.0, ge=0.0, le=100.0)
+    candidate_buy_max_spread_pct: float = Field(default=120.0, ge=0.0, le=1000.0)
+    candidate_buy_max_chase_pct: float = Field(default=12.0, ge=0.0, le=100.0)
+    candidate_buy_spread_chase_guard_pct: float = Field(default=4.0, ge=0.0, le=100.0)
+    candidate_notification_enabled: bool = False
+    candidate_notification_min_score: float = Field(default=84.0, ge=0.0, le=100.0)
+    candidate_notification_cooldown_seconds: int = Field(default=900, ge=30, le=86400)
+    notify_local_enabled: bool = True
+    notify_webhook_url: str = ""
+    notify_webhook_urls: str = ""
+    notify_telegram_bot_token: str = ""
+    notify_telegram_chat_id: str = ""
+    notify_telegram_api_base: str = "https://api.telegram.org"
+    notify_telegram_parse_mode: str = ""
+    notify_log_path: str = "/tmp/poly_runtime_data/notifier_events.jsonl"
 
     # Universe / strategy
     watch_wallets: str = ""
-    wallet_discovery_enabled: bool = True
+    wallet_discovery_enabled: bool = False
     wallet_discovery_mode: str = "union"
     wallet_discovery_paths: str = "/trades"
     wallet_discovery_limit: int = Field(default=300, ge=20, le=1000)
-    wallet_discovery_top_n: int = Field(default=50, ge=5, le=500)
+    wallet_discovery_top_n: int = Field(default=20, ge=5, le=500)
     wallet_discovery_min_events: int = Field(default=2, ge=1, le=50)
     wallet_discovery_refresh_seconds: int = Field(default=900, ge=60, le=86400)
     wallet_discovery_quality_bias_enabled: bool = True
@@ -55,7 +78,7 @@ class Settings(BaseSettings):
     wallet_signal_page_size: int = Field(default=100, ge=10, le=500)
     wallet_signal_max_pages: int = Field(default=2, ge=1, le=10)
     min_wallet_increase_usd: float = Field(default=300.0, ge=1.0)
-    max_signals_per_cycle: int = Field(default=5, ge=1)
+    max_signals_per_cycle: int = Field(default=3, ge=1)
     portfolio_netting_enabled: bool = True
     max_condition_exposure_pct: float = Field(default=0.015, gt=0.0, le=0.25)
     min_wallet_active_positions: int = Field(default=2, ge=1)
@@ -84,8 +107,8 @@ class Settings(BaseSettings):
     risk_per_trade_pct: float = Field(default=0.01, gt=0, le=0.05)
     daily_max_loss_pct: float = Field(default=0.03, gt=0, le=0.2)
     max_open_positions: int = Field(default=8, ge=1)
-    min_price: float = Field(default=0.08, ge=0.01, le=0.99)
-    max_price: float = Field(default=0.92, ge=0.01, le=0.99)
+    min_price: float = Field(default=0.08, ge=0.01, le=0.999)
+    max_price: float = Field(default=0.92, ge=0.01, le=0.999)
     control_path: str = "/tmp/poly_runtime_data/control.json"
 
     # APIs
@@ -135,3 +158,17 @@ class Settings(BaseSettings):
     @property
     def replay_fee_keyword_list(self) -> list[str]:
         return [value.strip().lower() for value in self.replay_fee_keywords.split(",") if value.strip()]
+
+    @property
+    def notify_webhook_url_list(self) -> list[str]:
+        values: list[str] = []
+        for raw in (self.notify_webhook_url, self.notify_webhook_urls):
+            for chunk in raw.replace("\n", ",").replace(";", ",").split(","):
+                value = chunk.strip()
+                if value and value not in values:
+                    values.append(value)
+        return values
+
+    @property
+    def notify_telegram_enabled(self) -> bool:
+        return bool(self.notify_telegram_bot_token and self.notify_telegram_chat_id)

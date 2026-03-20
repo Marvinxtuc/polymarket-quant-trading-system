@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import time
 from collections import deque
 from collections.abc import Mapping
@@ -11,18 +12,41 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from polymarket_bot.brokers.base import Broker
-from polymarket_bot.clients.data_api import AccountingSnapshot, PolymarketDataClient
+from polymarket_bot.clients.data_api import AccountingSnapshot, PolymarketDataClient, PriceHistoryPoint
 from polymarket_bot.config import Settings
+from polymarket_bot.db import PersonalTerminalStore
+from polymarket_bot.notifier import Notifier
 from polymarket_bot.reconciliation_report import append_ledger_entry, load_ledger_rows
 from polymarket_bot.risk import RiskManager, RiskState
 from polymarket_bot.strategies.wallet_follower import WalletFollowerStrategy
-from polymarket_bot.types import BrokerOrderEvent, ExecutionResult, OpenOrderSnapshot, OrderFillSnapshot, OrderStatusSnapshot, Signal
+from polymarket_bot.types import (
+    BrokerOrderEvent,
+    Candidate,
+    CandidateReasonFactor,
+    DecisionMode,
+    ExecutionResult,
+    JournalEntry,
+    OpenOrderSnapshot,
+    OrderFillSnapshot,
+    OrderStatusSnapshot,
+    Signal,
+    WalletProfile,
+)
 from polymarket_bot.wallet_history import WalletHistoryStore
 from polymarket_bot.wallet_scoring import RealizedWalletMetrics
+
+_MARKET_WINDOW_PATTERN = re.compile(r"-(5m|15m|30m|1h)-(\d{10})$")
+_MARKET_WINDOW_SECONDS = {
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+}
 
 
 @dataclass(slots=True)
 class ControlState:
+    decision_mode: str = "manual"
     pause_opening: bool = False
     reduce_only: bool = False
     emergency_stop: bool = False
@@ -56,9 +80,9 @@ class Trader:
     _recent_order_keys: dict[str, float] = field(init=False, default_factory=dict)
     _last_broker_reconcile_ts: float = field(init=False, default=0.0)
     _wallet_history_store: WalletHistoryStore | None = field(init=False, default=None)
-    _last_control_signature: tuple[bool, bool, bool, int, int] = field(
+    _last_control_signature: tuple[str, bool, bool, bool, int, int] = field(
         init=False,
-        default=(False, False, False, 0, 0),
+        default=("manual", False, False, False, 0, 0),
     )
     _last_operator_pending_cleanup_ts: int = field(init=False, default=0)
     _signal_seq: int = field(init=False, default=0)
@@ -74,10 +98,29 @@ class Trader:
     startup_warning_count: int = field(init=False, default=0)
     startup_failure_count: int = field(init=False, default=0)
     last_operator_action: dict[str, object] = field(init=False, default_factory=dict)
+    decision_mode: str = field(init=False, default="manual")
+    candidate_store: PersonalTerminalStore | None = field(init=False, default=None)
+    notifier: Notifier | None = field(init=False, default=None)
+    _candidate_notification_watermarks: dict[str, int] = field(init=False, default_factory=dict)
+    _candidate_price_history_cache: dict[str, dict[str, object]] = field(init=False, default_factory=dict)
 
     def __post_init__(self) -> None:
         self.state = RiskState()
         self.log = logging.getLogger("polybot")
+        self.decision_mode = self._normalize_decision_mode(self.settings.decision_mode)
+        candidate_db_path = str(self.settings.candidate_db_path or "").strip()
+        if candidate_db_path:
+            self.candidate_store = PersonalTerminalStore(candidate_db_path)
+        self.notifier = Notifier(
+            local_enabled=bool(getattr(self.settings, "notify_local_enabled", True)),
+            webhook_url=str(getattr(self.settings, "notify_webhook_url", "") or ""),
+            webhook_urls=str(getattr(self.settings, "notify_webhook_urls", "") or ""),
+            telegram_bot_token=str(getattr(self.settings, "notify_telegram_bot_token", "") or ""),
+            telegram_chat_id=str(getattr(self.settings, "notify_telegram_chat_id", "") or ""),
+            telegram_api_base=str(getattr(self.settings, "notify_telegram_api_base", "") or ""),
+            telegram_parse_mode=str(getattr(self.settings, "notify_telegram_parse_mode", "") or ""),
+            log_path=str(getattr(self.settings, "notify_log_path", "") or ""),
+        )
         self._active_day_key = self._utc_day_key()
         self._wallet_history_store = WalletHistoryStore(
             client=self.data_client,
@@ -122,7 +165,22 @@ class Trader:
         self.state.pending_entry_orders = self._pending_entry_orders()
 
     def _available_notional_usd(self) -> float:
-        return max(0.0, self.settings.bankroll_usd - (self._tracked_notional_usd() + self._pending_entry_notional_usd()))
+        pending_entry_notional = self._pending_entry_notional_usd()
+        bankroll_remaining = max(
+            0.0,
+            self.settings.bankroll_usd - (self._tracked_notional_usd() + pending_entry_notional),
+        )
+        cash_balance = max(0.0, float(self.state.cash_balance_usd or 0.0))
+        cash_snapshot_known = cash_balance > 0.0 or int(self.state.account_snapshot_ts or 0) > 0
+        if cash_snapshot_known:
+            cash_available = max(0.0, cash_balance - pending_entry_notional)
+            return min(bankroll_remaining, cash_available)
+        return bankroll_remaining
+
+    @staticmethod
+    def _actionable_notional_floor_usd() -> float:
+        # Keep dust out, but let the bot keep trading or exiting when free cash drops below the old 5 USD floor.
+        return 1.0
 
     @staticmethod
     def _condition_exposure_key(
@@ -216,6 +274,1157 @@ class Trader:
             return float(value)
         except (TypeError, ValueError):
             return default
+
+    @staticmethod
+    def _normalize_decision_mode(value: object) -> DecisionMode:
+        normalized = str(value or "").strip().lower()
+        if normalized in {"manual", "semi_auto", "auto"}:
+            return normalized  # type: ignore[return-value]
+        return "manual"
+
+    def list_candidates(
+        self,
+        *,
+        statuses: list[str] | tuple[str, ...] | None = None,
+        limit: int = 24,
+        include_expired: bool = False,
+    ) -> list[dict[str, object]]:
+        if self.candidate_store is None:
+            return []
+        return list(
+            self.candidate_store.list_candidates(
+                statuses=statuses,
+                limit=limit,
+                include_expired=include_expired,
+            )
+        )
+
+    def list_wallet_profiles(self, *, limit: int = 32) -> list[dict[str, object]]:
+        if self.candidate_store is None:
+            return []
+        return list(self.candidate_store.list_wallet_profiles(limit=limit))
+
+    def list_journal_entries(self, *, limit: int = 20) -> list[dict[str, object]]:
+        if self.candidate_store is None:
+            return []
+        return list(self.candidate_store.list_journal_entries(limit=limit))
+
+    def journal_summary(self, *, days: int = 30) -> dict[str, object]:
+        if self.candidate_store is None:
+            return {
+                "days": int(days),
+                "total_entries": 0,
+                "execution_actions": 0,
+                "watch_actions": 0,
+                "ignore_actions": 0,
+                "updated_ts": int(time.time()),
+            }
+        return dict(self.candidate_store.journal_summary(days=days))
+
+    def pending_candidate_actions(self, *, limit: int = 24) -> list[dict[str, object]]:
+        if self.candidate_store is None:
+            return []
+        return list(self.candidate_store.list_pending_actions(limit=limit))
+
+    @staticmethod
+    def _market_window_bounds(market_slug: str) -> tuple[int | None, int | None, int | None]:
+        normalized = str(market_slug or "").strip().lower()
+        if not normalized:
+            return None, None, None
+        match = _MARKET_WINDOW_PATTERN.search(normalized)
+        if match is None:
+            return None, None, None
+        duration_seconds = _MARKET_WINDOW_SECONDS.get(str(match.group(1) or "").strip().lower())
+        start_ts = int(match.group(2) or 0)
+        if duration_seconds is None or start_ts <= 0:
+            return None, None, None
+        return start_ts, duration_seconds, start_ts + duration_seconds
+
+    def _candidate_market_context(
+        self,
+        token_id: str,
+        *,
+        price_hint: float,
+        market_slug: str = "",
+    ) -> dict[str, object]:
+        now_ts = int(time.time())
+        book = None
+        midpoint = None
+        try:
+            book = self.data_client.get_order_book(token_id)
+        except Exception as exc:
+            self.log.debug("Candidate order book enrich failed token=%s err=%s", token_id, exc)
+        try:
+            midpoint = self.data_client.get_midpoint_price(token_id)
+        except Exception as exc:
+            self.log.debug("Candidate midpoint enrich failed token=%s err=%s", token_id, exc)
+
+        history_points = self._candidate_price_history(token_id, now_ts=now_ts)
+        market_start_ts, market_window_seconds, market_end_ts = self._market_window_bounds(market_slug)
+
+        best_bid = float(book.best_bid) if book is not None and float(book.best_bid) > 0.0 else 0.0
+        best_ask = float(book.best_ask) if book is not None and float(book.best_ask) > 0.0 else 0.0
+        ref_mid = float(midpoint or 0.0)
+        history_reference = ref_mid if ref_mid > 0.0 else (best_ask if best_ask > 0.0 else self._history_last_price(history_points))
+        momentum_5m = self._history_momentum(history_points, current_price=history_reference, now_ts=now_ts, window_seconds=300)
+        momentum_30m = self._history_momentum(history_points, current_price=history_reference, now_ts=now_ts, window_seconds=1800)
+        spread_pct = None
+        if best_bid > 0.0 and best_ask > 0.0:
+            denominator = ref_mid if ref_mid > 0.0 else ((best_bid + best_ask) / 2.0)
+            if denominator > 0.0:
+                spread_pct = ((best_ask - best_bid) / denominator) * 100.0
+
+        chase_ref = best_ask if best_ask > 0.0 else 0.0
+        chase_pct = None
+        if chase_ref > 0.0 and price_hint > 0.0:
+            chase_pct = ((chase_ref - price_hint) / price_hint) * 100.0
+        market_remaining_seconds = None
+        market_elapsed_ratio = None
+        if market_start_ts is not None and market_window_seconds is not None and market_end_ts is not None:
+            market_remaining_seconds = market_end_ts - now_ts
+            market_age_seconds = max(0, now_ts - market_start_ts)
+            market_elapsed_ratio = min(1.0, max(0.0, market_age_seconds / max(1, market_window_seconds)))
+
+        return {
+            "current_best_bid": best_bid if best_bid > 0.0 else None,
+            "current_best_ask": best_ask if best_ask > 0.0 else None,
+            "current_midpoint": ref_mid if ref_mid > 0.0 else None,
+            "spread_pct": spread_pct,
+            "chase_pct": chase_pct,
+            "momentum_5m": momentum_5m,
+            "momentum_30m": momentum_30m,
+            "history_points": len(history_points),
+            "history_span_seconds": self._history_span_seconds(history_points),
+            "market_window_seconds": market_window_seconds,
+            "market_start_ts": market_start_ts,
+            "market_end_ts": market_end_ts,
+            "market_remaining_seconds": market_remaining_seconds,
+            "market_elapsed_ratio": market_elapsed_ratio,
+        }
+
+    def _candidate_price_history(self, token_id: str, *, now_ts: int) -> list[tuple[int, float]]:
+        normalized = str(token_id or "").strip()
+        if not normalized:
+            return []
+
+        cache = self._candidate_price_history_cache.get(normalized)
+        if isinstance(cache, dict):
+            fetched_ts = int(cache.get("fetched_ts") or 0)
+            cached_points = list(cache.get("points") or [])
+            if fetched_ts > 0 and (now_ts - fetched_ts) <= 120 and cached_points:
+                return [
+                    (int(point[0]), float(point[1]))
+                    for point in cached_points
+                    if isinstance(point, tuple) and len(point) == 2
+                ]
+
+        getter = getattr(self.data_client, "get_prices_history", None)
+        if not callable(getter):
+            getter = getattr(self.data_client, "get_price_history", None)
+        points: list[tuple[int, float]] = []
+        if callable(getter):
+            raw_points: object = []
+            try:
+                raw_points = getter(
+                    normalized,
+                    start_ts=max(0, now_ts - 3600),
+                    end_ts=now_ts,
+                    fidelity=1,
+                )
+            except TypeError:
+                try:
+                    raw_points = getter(normalized, interval="1h", fidelity=1)
+                except Exception as exc:
+                    self.log.debug("Candidate price history enrich failed token=%s err=%s", normalized, exc)
+                    raw_points = []
+            except Exception as exc:
+                self.log.debug("Candidate price history enrich failed token=%s err=%s", normalized, exc)
+                raw_points = []
+
+            for row in list(raw_points or []):
+                parsed = self._normalize_price_history_point(row)
+                if parsed is None:
+                    continue
+                points.append(parsed)
+
+        points.sort(key=lambda item: item[0])
+        self._candidate_price_history_cache[normalized] = {
+            "fetched_ts": now_ts,
+            "points": list(points),
+        }
+        return list(points)
+
+    @staticmethod
+    def _normalize_price_history_point(row: object) -> tuple[int, float] | None:
+        if isinstance(row, PriceHistoryPoint):
+            timestamp = int(row.timestamp or 0)
+            price = float(row.price or 0.0)
+            return (timestamp, price) if timestamp > 0 and price > 0.0 else None
+        if isinstance(row, Mapping):
+            timestamp = int(row.get("t") or row.get("timestamp") or row.get("ts") or 0)
+            price = float(row.get("p") or row.get("price") or 0.0)
+            return (timestamp, price) if timestamp > 0 and price > 0.0 else None
+        timestamp = int(getattr(row, "timestamp", 0) or getattr(row, "t", 0) or 0)
+        price = float(getattr(row, "price", 0.0) or getattr(row, "p", 0.0) or 0.0)
+        return (timestamp, price) if timestamp > 0 and price > 0.0 else None
+
+    @staticmethod
+    def _history_last_price(points: list[tuple[int, float]]) -> float:
+        if not points:
+            return 0.0
+        return float(points[-1][1])
+
+    @staticmethod
+    def _history_price_at_or_before(points: list[tuple[int, float]], target_ts: int) -> float | None:
+        if not points:
+            return None
+        resolved: float | None = None
+        for timestamp, price in points:
+            if timestamp <= target_ts and price > 0.0:
+                resolved = float(price)
+            elif timestamp > target_ts:
+                break
+        return resolved
+
+    @classmethod
+    def _history_momentum(
+        cls,
+        points: list[tuple[int, float]],
+        *,
+        current_price: float,
+        now_ts: int,
+        window_seconds: int,
+    ) -> float | None:
+        if current_price <= 0.0 or not points:
+            return None
+        history_price = cls._history_price_at_or_before(points, now_ts - max(1, int(window_seconds)))
+        if history_price is None or history_price <= 0.0:
+            return None
+        return ((float(current_price) - float(history_price)) / float(history_price)) * 100.0
+
+    @staticmethod
+    def _history_span_seconds(points: list[tuple[int, float]]) -> int:
+        if len(points) < 2:
+            return 0
+        return max(0, int(points[-1][0]) - int(points[0][0]))
+
+    @staticmethod
+    def _candidate_score_from_signal(signal: Signal, market_context: Mapping[str, object]) -> float:
+        base = (float(signal.confidence or 0.0) * 100.0 * 0.55) + (float(signal.wallet_score or 0.0) * 0.45)
+        spread_pct = float(market_context.get("spread_pct") or 0.0)
+        chase_pct = float(market_context.get("chase_pct") or 0.0)
+        momentum_5m = float(market_context.get("momentum_5m") or 0.0)
+        momentum_30m = float(market_context.get("momentum_30m") or 0.0)
+        momentum_bias = (momentum_5m * 0.55) + (momentum_30m * 0.45)
+        if spread_pct > 6.0:
+            base -= min(20.0, spread_pct * 1.1)
+        if signal.side == "BUY" and chase_pct > 4.0:
+            base -= min(18.0, chase_pct * 1.4)
+        if signal.side == "BUY":
+            if momentum_bias > 0.0:
+                base += min(8.0, momentum_bias * 0.45)
+            else:
+                base -= min(12.0, abs(momentum_bias) * 0.55)
+        elif signal.side == "SELL":
+            if momentum_bias < 0.0:
+                base += min(6.0, abs(momentum_bias) * 0.35)
+            else:
+                base -= min(4.0, momentum_bias * 0.2)
+        if bool(signal.cross_wallet_exit):
+            base += 6.0
+        if int(signal.exit_wallet_count or 0) >= 2:
+            base += min(10.0, float(signal.exit_wallet_count or 0) * 2.0)
+        topic_bias = str(signal.topic_bias or "").strip().lower()
+        if topic_bias == "boost":
+            base += 4.0
+        elif topic_bias == "penalty":
+            base -= 4.0
+        if signal.side == "SELL":
+            base = max(base, 70.0 if float(signal.exit_fraction or 0.0) >= 0.95 else 62.0)
+        return round(max(0.0, min(100.0, base)), 2)
+
+    def _candidate_skip_reason(
+        self,
+        signal: Signal,
+        market_context: Mapping[str, object],
+        *,
+        existing: Mapping[str, object] | None = None,
+    ) -> str | None:
+        has_orderbook = (
+            market_context.get("current_best_ask") not in (None, "")
+            or market_context.get("current_best_bid") not in (None, "")
+        )
+        has_live_ask = market_context.get("current_best_ask") not in (None, "")
+        has_midpoint = market_context.get("current_midpoint") not in (None, "")
+        spread_pct = float(market_context.get("spread_pct") or 0.0)
+        chase_pct = float(market_context.get("chase_pct") or 0.0)
+        momentum_5m = float(market_context.get("momentum_5m") or 0.0)
+        momentum_30m = float(market_context.get("momentum_30m") or 0.0)
+        price_hint = float(signal.price_hint or 0.0)
+        has_market_reference = has_orderbook or has_midpoint or price_hint > 0.0
+        market_window_seconds = (
+            int(market_context.get("market_window_seconds") or 0)
+            if market_context.get("market_window_seconds") not in (None, "")
+            else None
+        )
+        market_remaining_seconds = (
+            int(market_context.get("market_remaining_seconds") or 0)
+            if market_context.get("market_remaining_seconds") not in (None, "")
+            else None
+        )
+        if signal.side == "BUY" and existing:
+            entry_wallet = str(existing.get("entry_wallet") or "").strip().lower()
+            signal_wallet = str(signal.wallet or "").strip().lower()
+            if entry_wallet and signal_wallet and entry_wallet != signal_wallet:
+                return "existing_position_conflict"
+        if signal.side == "BUY":
+            if market_remaining_seconds is not None:
+                if market_remaining_seconds <= 0:
+                    return "market_window_elapsed"
+                if market_window_seconds is not None and market_window_seconds <= 900 and market_remaining_seconds <= 90:
+                    return "market_near_close"
+            if not has_live_ask:
+                return "market_data_unavailable"
+            if not has_market_reference:
+                return "market_data_unavailable"
+            max_spread_pct = float(self.settings.candidate_buy_max_spread_pct)
+            spread_chase_guard_pct = float(self.settings.candidate_buy_spread_chase_guard_pct)
+            max_chase_pct = float(self.settings.candidate_buy_max_chase_pct)
+            if chase_pct >= max_chase_pct:
+                return "chase_too_high"
+            if spread_pct >= max_spread_pct:
+                return "spread_too_wide"
+            if spread_pct >= 12.0 and chase_pct >= spread_chase_guard_pct:
+                return "spread_too_wide"
+        if signal.side == "BUY" and momentum_5m <= -8.0 and momentum_30m <= -12.0:
+            return "momentum_too_weak"
+        return None
+
+    @staticmethod
+    def _candidate_trigger_type(signal: Signal) -> str:
+        action = str(signal.position_action or "").strip().lower()
+        if action in {"entry", "add", "trim", "exit"}:
+            return action
+        if signal.side == "SELL":
+            return "follow_exit"
+        return "new_open"
+
+    def _candidate_suggested_action(
+        self,
+        signal: Signal,
+        *,
+        score: float,
+        skip_reason: str | None,
+        existing: Mapping[str, object] | None = None,
+    ) -> str:
+        if signal.side == "SELL":
+            if float(signal.exit_fraction or 0.0) >= 0.95 or bool(signal.cross_wallet_exit):
+                return "close_all"
+            return "close_partial"
+        if skip_reason:
+            return "watch"
+        if existing and float(existing.get("notional") or 0.0) > 0.0:
+            return "watch"
+        if score >= 84.0 and str(signal.wallet_tier or "").upper() in {"HIGH", "CORE"}:
+            return "follow"
+        if score >= 72.0:
+            return "buy_normal"
+        if score >= 60.0:
+            return "buy_small"
+        return "watch"
+
+    @staticmethod
+    def _candidate_recommendation_reason(
+        signal: Signal,
+        *,
+        market_context: Mapping[str, object],
+        score: float,
+        suggested_action: str,
+        skip_reason: str | None,
+        existing: Mapping[str, object] | None = None,
+    ) -> str:
+        if skip_reason == "market_data_unavailable":
+            return "当前没有可跟的卖盘，先观察避免撞空簿"
+        if skip_reason == "market_window_elapsed":
+            return "该短周期市场已结束，旧信号不再跟"
+        if skip_reason == "market_near_close":
+            return "短周期市场接近结束，先不追最后一段"
+        if skip_reason == "spread_too_wide":
+            return "盘口点差过宽，先观察"
+        if skip_reason == "chase_too_high":
+            return "价格已被推远，追价风险偏高"
+        if skip_reason == "momentum_too_weak":
+            return "短线动量转弱，先等更好的入场"
+        if skip_reason == "existing_position_conflict":
+            return "当前同市场已有仓位，先避免重复暴露"
+        if signal.side == "SELL":
+            if bool(signal.cross_wallet_exit):
+                return f"{int(signal.exit_wallet_count or 0)} 个钱包共振退出，优先减仓"
+            if float(signal.exit_fraction or 0.0) >= 0.95:
+                return "来源钱包基本清仓，优先跟随退出"
+            return "来源钱包在减仓，适合先减一部分"
+        if existing and float(existing.get("notional") or 0.0) > 0.0:
+            return "已有仓位在场，先观察是否需要继续加"
+        momentum_5m = float(market_context.get("momentum_5m") or 0.0)
+        momentum_30m = float(market_context.get("momentum_30m") or 0.0)
+        if signal.side == "BUY" and momentum_5m > 0.0 and momentum_30m > 0.0:
+            return f"5m/30m 动量都在走强，{suggested_action.replace('_', ' ')} 更顺势"
+        if signal.side == "BUY" and momentum_5m < 0.0 and momentum_30m < 0.0:
+            return f"5m/30m 动量偏弱，{suggested_action.replace('_', ' ')} 前先小心"
+        if suggested_action == "follow":
+            return f"分数 {score:.0f}，钱包等级高，可正常跟随"
+        if suggested_action == "buy_normal":
+            return f"分数 {score:.0f}，机会较强，可常规仓位跟随"
+        if suggested_action == "buy_small":
+            return f"分数 {score:.0f}，有跟随价值，但更适合小仓试探"
+        return f"分数 {score:.0f}，先观察更多确认"
+
+    @staticmethod
+    def _candidate_reason_factor(
+        key: str,
+        label: str,
+        value: object,
+        *,
+        direction: str = "neutral",
+        weight: float = 0.0,
+        detail: str = "",
+    ) -> CandidateReasonFactor:
+        if isinstance(value, float):
+            rendered_value = f"{value:.2f}"
+        elif isinstance(value, int):
+            rendered_value = str(value)
+        else:
+            rendered_value = str(value)
+        return CandidateReasonFactor(
+            key=str(key),
+            label=str(label),
+            value=rendered_value,
+            direction=str(direction or "neutral"),
+            weight=float(weight),
+            detail=str(detail or ""),
+        )
+
+    def _candidate_reason_factors(
+        self,
+        signal: Signal,
+        market_context: Mapping[str, object],
+        *,
+        score: float,
+        suggested_action: str,
+        skip_reason: str | None,
+        existing: Mapping[str, object] | None = None,
+    ) -> list[CandidateReasonFactor]:
+        factors: list[CandidateReasonFactor] = []
+        wallet_score = float(signal.wallet_score or 0.0)
+        confidence = float(signal.confidence or 0.0)
+        wallet_tier = str(signal.wallet_tier or "LOW").upper()
+        factors.append(
+            self._candidate_reason_factor(
+                "wallet",
+                "钱包强度",
+                f"{wallet_tier} · {wallet_score:.1f}",
+                direction="bullish" if wallet_score >= 70.0 else "neutral",
+                weight=round((wallet_score - 50.0) / 10.0, 2),
+                detail=str(signal.wallet_score_summary or ""),
+            )
+        )
+        if confidence > 0.0:
+            factors.append(
+                self._candidate_reason_factor(
+                    "confidence",
+                    "置信度",
+                    f"{confidence:.2f}",
+                    direction="bullish" if confidence >= 0.75 else "neutral",
+                    weight=round((confidence - 0.5) * 10.0, 2),
+                )
+            )
+
+        topic_label = str(signal.topic_label or signal.topic_key or "").strip()
+        if topic_label:
+            topic_bias = str(signal.topic_bias or "neutral").strip()
+            topic_direction = "bullish" if topic_bias == "boost" else "bearish" if topic_bias == "penalty" else "neutral"
+            factors.append(
+                self._candidate_reason_factor(
+                    "topic",
+                    "题材偏向",
+                    topic_label,
+                    direction=topic_direction,
+                    weight=round((float(signal.topic_multiplier or 1.0) - 1.0) * 10.0, 2),
+                    detail=str(signal.topic_score_summary or ""),
+                )
+            )
+
+        spread_pct = float(market_context.get("spread_pct") or 0.0)
+        if spread_pct > 0.0:
+            factors.append(
+                self._candidate_reason_factor(
+                    "spread",
+                    "盘口点差",
+                    f"{spread_pct:.2f}%",
+                    direction="bearish" if spread_pct >= 6.0 else "neutral",
+                    weight=round(-min(20.0, spread_pct * 1.1), 2),
+                    detail="点差越大，追价性价比越差",
+                )
+            )
+
+        chase_pct = float(market_context.get("chase_pct") or 0.0)
+        if signal.side == "BUY" and chase_pct > 0.0:
+            factors.append(
+                self._candidate_reason_factor(
+                    "chase",
+                    "追价幅度",
+                    f"{chase_pct:.2f}%",
+                    direction="bearish" if chase_pct >= 4.0 else "neutral",
+                    weight=round(-min(18.0, chase_pct * 1.4), 2),
+                    detail="当前买价相对源价格的抬升幅度",
+                )
+            )
+
+        momentum_5m = float(market_context.get("momentum_5m") or 0.0)
+        momentum_30m = float(market_context.get("momentum_30m") or 0.0)
+        if momentum_5m != 0.0 or momentum_30m != 0.0:
+            momentum_bias = (momentum_5m * 0.55) + (momentum_30m * 0.45)
+            factors.append(
+                self._candidate_reason_factor(
+                    "momentum",
+                    "价格动量",
+                    f"5m {momentum_5m:+.2f}% / 30m {momentum_30m:+.2f}%",
+                    direction="bullish" if momentum_bias > 0.0 else "bearish" if momentum_bias < 0.0 else "neutral",
+                    weight=round(momentum_bias * 0.45, 2),
+                    detail="动量用于判断是否顺势或逆势追单",
+                )
+            )
+
+        if existing and float(existing.get("notional") or 0.0) > 0.0:
+            current_notional = float(existing.get("notional") or 0.0)
+            direction = "bearish" if skip_reason == "existing_position_conflict" else "neutral"
+            factors.append(
+                self._candidate_reason_factor(
+                    "existing_position",
+                    "已有仓位",
+                    f"{current_notional:.2f}U",
+                    direction=direction,
+                    weight=-6.0 if skip_reason == "existing_position_conflict" else 0.0,
+                    detail=str(existing.get("entry_reason") or existing.get("reason") or "已有仓位在场"),
+                )
+            )
+
+        if signal.side == "SELL":
+            exit_fraction = float(signal.exit_fraction or 0.0)
+            factors.append(
+                self._candidate_reason_factor(
+                    "exit",
+                    "退出比例",
+                    f"{exit_fraction * 100.0:.0f}%",
+                    direction="bearish" if exit_fraction >= 0.95 or bool(signal.cross_wallet_exit) else "neutral",
+                    weight=round(8.0 + exit_fraction * 10.0, 2),
+                    detail="卖出信号主要反映源钱包减仓或清仓",
+                )
+            )
+            if bool(signal.cross_wallet_exit):
+                factors.append(
+                    self._candidate_reason_factor(
+                        "resonance_exit",
+                        "共振退出",
+                        f"{int(signal.exit_wallet_count or 0)} wallets",
+                        direction="bearish",
+                        weight=min(10.0, float(signal.exit_wallet_count or 0) * 2.0),
+                        detail="多个钱包同步减仓时，退出优先级更高",
+                    )
+                )
+
+        factors.append(
+            self._candidate_reason_factor(
+                "decision",
+                "建议动作",
+                suggested_action,
+                direction="bullish" if suggested_action in {"follow", "buy_normal"} else "neutral",
+                weight=max(-2.0, min(10.0, score / 10.0 - 5.0)),
+                detail=self._candidate_recommendation_reason(
+                    signal,
+                    market_context=market_context,
+                    score=score,
+                    suggested_action=suggested_action,
+                    skip_reason=skip_reason,
+                    existing=existing,
+                ),
+            )
+        )
+        if skip_reason:
+            factors.append(
+                self._candidate_reason_factor(
+                    "skip_reason",
+                    "忽略原因",
+                    skip_reason,
+                    direction="bearish",
+                    weight=-10.0,
+                    detail=self._candidate_recommendation_reason(
+                        signal,
+                        market_context=market_context,
+                        score=score,
+                        suggested_action=suggested_action,
+                        skip_reason=skip_reason,
+                        existing=existing,
+                    ),
+                )
+            )
+
+        return factors
+
+    @staticmethod
+    def _candidate_explanation(
+        signal: Signal,
+        market_context: Mapping[str, object],
+        *,
+        score: float,
+        suggested_action: str,
+        skip_reason: str | None,
+        existing: Mapping[str, object] | None = None,
+    ) -> list[str]:
+        notes: list[str] = []
+        notes.append(
+            f"钱包 {str(signal.wallet_tier or 'WATCH').upper()} · {float(signal.wallet_score or 0.0):.1f} 分 · 置信度 {float(signal.confidence or 0.0):.2f}"
+        )
+        topic_label = str(signal.topic_label or signal.topic_key or "").strip()
+        if topic_label:
+            topic_bias = str(signal.topic_bias or "neutral").strip()
+            notes.append(f"题材 {topic_label} · bias={topic_bias} · multiplier {float(signal.topic_multiplier or 1.0):.2f}")
+        spread_pct = market_context.get("spread_pct")
+        chase_pct = market_context.get("chase_pct")
+        best_ask = market_context.get("current_best_ask")
+        best_bid = market_context.get("current_best_bid")
+        midpoint = market_context.get("current_midpoint")
+        history_points = int(market_context.get("history_points") or 0)
+        market_bits: list[str] = []
+        if midpoint not in (None, ""):
+            market_bits.append(f"mid {float(midpoint):.3f}")
+        if best_ask not in (None, ""):
+            market_bits.append(f"ask {float(best_ask):.3f}")
+        if best_bid not in (None, ""):
+            market_bits.append(f"bid {float(best_bid):.3f}")
+        if spread_pct not in (None, ""):
+            market_bits.append(f"spread {float(spread_pct):.2f}%")
+        if chase_pct not in (None, "") and signal.side == "BUY":
+            market_bits.append(f"chase {float(chase_pct):.2f}%")
+        if market_bits:
+            notes.append("盘口 " + " · ".join(market_bits))
+        if history_points > 0:
+            notes.append(
+                f"历史 {history_points} 个点 · 5m {float(market_context.get('momentum_5m') or 0.0):+.2f}%"
+                f" · 30m {float(market_context.get('momentum_30m') or 0.0):+.2f}%"
+            )
+        momentum_5m = float(market_context.get("momentum_5m") or 0.0)
+        momentum_30m = float(market_context.get("momentum_30m") or 0.0)
+        if momentum_5m > 0.0 and momentum_30m > 0.0:
+            notes.append("趋势 5m/30m 一致偏强")
+        elif momentum_5m < 0.0 and momentum_30m < 0.0:
+            notes.append("趋势 5m/30m 一致偏弱")
+        if existing and float(existing.get("notional") or 0.0) > 0.0:
+            notes.append(
+                f"当前已有仓位 {float(existing.get('notional') or 0.0):.2f}U"
+                + (
+                    f" · 来源 {str(existing.get('entry_wallet_tier') or '').upper()}"
+                    if str(existing.get('entry_wallet_tier') or "").strip()
+                    else ""
+                )
+            )
+        if bool(signal.cross_wallet_exit):
+            notes.append(f"多钱包共振退出 {int(signal.exit_wallet_count or 0)} 个钱包")
+        elif signal.side == "SELL" and float(signal.exit_fraction or 0.0) > 0.0:
+            notes.append(f"退出比例 {float(signal.exit_fraction or 0.0) * 100.0:.0f}%")
+        elif signal.side == "BUY":
+            notes.append(f"观察金额 {float(signal.observed_notional or 0.0):.2f}U · 动作 {str(signal.position_action_label or signal.position_action or '')}")
+        if skip_reason:
+            notes.append(
+                "建议先不追："
+                + Trader._candidate_recommendation_reason(
+                    signal,
+                    market_context=market_context,
+                    score=score,
+                    suggested_action=suggested_action,
+                    skip_reason=skip_reason,
+                    existing=existing,
+                )
+            )
+        else:
+            notes.append(f"建议动作 {suggested_action} · 综合分 {score:.0f}")
+        if signal.side == "BUY" and momentum_5m > 0.0 and momentum_30m > 0.0:
+            notes.append("短线动量一致偏强，追价压力相对更低")
+        elif signal.side == "BUY" and momentum_5m < 0.0 and momentum_30m < 0.0:
+            notes.append("短线动量一致偏弱，先别急着追")
+        return notes
+
+    def _candidate_from_signal(
+        self,
+        signal: Signal,
+        *,
+        now: int,
+        existing: Mapping[str, object] | None = None,
+        market_context: Mapping[str, object] | None = None,
+    ) -> Candidate:
+        if existing is None:
+            existing = self.positions_book.get(signal.token_id)
+        if market_context is None:
+            market_context = self._candidate_market_context(
+                signal.token_id,
+                price_hint=float(signal.price_hint or 0.0),
+                market_slug=str(signal.market_slug or ""),
+            )
+        score = self._candidate_score_from_signal(signal, market_context)
+        skip_reason = self._candidate_skip_reason(signal, market_context, existing=existing)
+        suggested_action = self._candidate_suggested_action(
+            signal,
+            score=score,
+            skip_reason=skip_reason,
+            existing=existing,
+        )
+        recommendation_reason = self._candidate_recommendation_reason(
+            signal,
+            market_context=market_context,
+            score=score,
+            suggested_action=suggested_action,
+            skip_reason=skip_reason,
+            existing=existing,
+        )
+        reason_factors = self._candidate_reason_factors(
+            signal,
+            market_context,
+            score=score,
+            suggested_action=suggested_action,
+            skip_reason=skip_reason,
+            existing=existing,
+        )
+        explanation = self._candidate_explanation(
+            signal,
+            market_context,
+            score=score,
+            suggested_action=suggested_action,
+            skip_reason=skip_reason,
+            existing=existing,
+        )
+        source_wallet_count = max(1, int(signal.exit_wallet_count or 0)) if bool(signal.cross_wallet_exit) else 1
+        created_ts = int(signal.timestamp.timestamp()) if isinstance(signal.timestamp, datetime) else now
+        expires_ts = created_ts + max(60, int(self.settings.candidate_ttl_seconds))
+        market_end_ts = market_context.get("market_end_ts")
+        if market_end_ts not in (None, ""):
+            expires_ts = min(expires_ts, int(market_end_ts))
+        return Candidate(
+            id=str(signal.signal_id or ""),
+            signal_id=str(signal.signal_id or ""),
+            trace_id=str(signal.trace_id or ""),
+            wallet=str(signal.wallet or ""),
+            wallet_tag=str(signal.wallet_tier or ""),
+            wallet_score=float(signal.wallet_score or 0.0),
+            wallet_tier=str(signal.wallet_tier or "LOW"),
+            market_slug=str(signal.market_slug or ""),
+            token_id=str(signal.token_id or ""),
+            condition_id=str(signal.condition_id or ""),
+            outcome=str(signal.outcome or ""),
+            side=str(signal.side or "BUY"),
+            trigger_type=self._candidate_trigger_type(signal),
+            source_wallet_count=source_wallet_count,
+            observed_notional=float(signal.observed_notional or 0.0),
+            observed_size=float(signal.observed_size or 0.0),
+            source_avg_price=float(signal.price_hint or 0.0),
+            current_best_bid=market_context.get("current_best_bid"),  # type: ignore[arg-type]
+            current_best_ask=market_context.get("current_best_ask"),  # type: ignore[arg-type]
+            current_midpoint=market_context.get("current_midpoint"),  # type: ignore[arg-type]
+            spread_pct=market_context.get("spread_pct"),  # type: ignore[arg-type]
+            momentum_5m=market_context.get("momentum_5m"),  # type: ignore[arg-type]
+            momentum_30m=market_context.get("momentum_30m"),  # type: ignore[arg-type]
+            chase_pct=market_context.get("chase_pct"),  # type: ignore[arg-type]
+            market_tag=str(signal.topic_label or signal.topic_key or ""),
+            resolution_bucket=str(signal.topic_bias or ""),
+            confidence=float(signal.confidence or 0.0),
+            score=score,
+            suggested_action=suggested_action,
+            skip_reason=skip_reason,
+            recommendation_reason=recommendation_reason,
+            explanation=explanation,
+            reason_factors=reason_factors,
+            has_existing_position=existing is not None and float(existing.get("notional") or 0.0) > 0.0,
+            existing_position_conflict=skip_reason == "existing_position_conflict",
+            existing_position_notional=float((existing or {}).get("notional") or 0.0),
+            created_ts=created_ts,
+            expires_ts=expires_ts,
+            updated_ts=now,
+            signal_snapshot=self._signal_snapshot(signal),
+            topic_snapshot=self._topic_snapshot(signal),
+        )
+
+    def _sync_wallet_profiles(self, wallets: list[str]) -> None:
+        if self.candidate_store is None or not wallets:
+            return
+        metrics_getter = getattr(self.strategy, "latest_wallet_metrics", None)
+        latest_metrics = metrics_getter() if callable(metrics_getter) else {}
+        now = int(time.time())
+        for wallet in wallets:
+            row = dict(latest_metrics.get(wallet, {}) or {})
+            selection = dict(self._cached_wallet_selection_context.get(wallet, {}) or {})
+            score_summary = str(row.get("score_summary") or selection.get("discovery_priority_reason") or "")
+            profile = WalletProfile(
+                wallet=wallet,
+                tag=str(row.get("wallet_tier") or "WATCH"),
+                trust_score=float(row.get("wallet_score") or 0.0),
+                followability_score=float(selection.get("discovery_priority_score") or row.get("wallet_score") or 0.0),
+                avg_hold_minutes=None,
+                category=str(selection.get("discovery_best_topic") or ""),
+                enabled=bool(row.get("trading_enabled", True)),
+                notes=score_summary,
+                updated_ts=now,
+                payload={
+                    "score_summary": score_summary,
+                    "trading_enabled": bool(row.get("trading_enabled", True)),
+                    "topic_profiles": list(row.get("topic_profiles") or [])[:3],
+                },
+            )
+            self.candidate_store.upsert_wallet_profile(profile)
+
+    def _persist_candidates(self, candidates: list[Candidate]) -> None:
+        if self.candidate_store is None:
+            return
+        for candidate in candidates:
+            self.candidate_store.upsert_candidate(candidate)
+
+    def _refresh_active_pending_candidates(self, *, now: int) -> None:
+        if self.candidate_store is None:
+            return
+        pending_candidates = list(self.candidate_store.list_candidates(statuses=["pending"], limit=1000) or [])
+        if not pending_candidates:
+            return
+
+        refreshed = 0
+        expired = 0
+        for payload in pending_candidates:
+            candidate_id = str(payload.get("id") or "")
+            if not candidate_id:
+                continue
+            signal = self._candidate_to_signal(payload)
+            if signal is None:
+                self.candidate_store.update_candidate_status(
+                    candidate_id,
+                    status="expired",
+                    note="candidate_refresh:snapshot_missing",
+                    result_tag="candidate_snapshot_missing",
+                    updated_ts=now,
+                )
+                expired += 1
+                continue
+            if str(signal.side or "").upper() != "BUY":
+                continue
+
+            existing = self.positions_book.get(signal.token_id)
+            market_context = self._candidate_market_context(
+                signal.token_id,
+                price_hint=float(signal.price_hint or 0.0),
+                market_slug=str(signal.market_slug or ""),
+            )
+            refreshed_candidate = self._candidate_from_signal(
+                signal,
+                now=now,
+                existing=existing,
+                market_context=market_context,
+            )
+            refreshed_candidate.id = candidate_id
+            refreshed_candidate.signal_id = str(payload.get("signal_id") or refreshed_candidate.signal_id or candidate_id)
+            refreshed_candidate.status = str(payload.get("status") or refreshed_candidate.status or "pending")
+            refreshed_candidate.selected_action = str(payload.get("selected_action") or refreshed_candidate.selected_action or "")
+            refreshed_candidate.note = str(payload.get("note") or refreshed_candidate.note or "")
+            refreshed_candidate.created_ts = int(payload.get("created_ts") or refreshed_candidate.created_ts or now)
+            refreshed_candidate.updated_ts = now
+
+            if refreshed_candidate.skip_reason:
+                self.candidate_store.update_candidate_status(
+                    candidate_id,
+                    status="expired",
+                    selected_action=refreshed_candidate.suggested_action,
+                    note=f"candidate_refresh:{refreshed_candidate.skip_reason}",
+                    result_tag=f"candidate_revalidated_{refreshed_candidate.skip_reason}",
+                    updated_ts=now,
+                )
+                expired += 1
+                continue
+
+            self.candidate_store.upsert_candidate(refreshed_candidate)
+            refreshed += 1
+
+        if refreshed > 0 or expired > 0:
+            self.log.info(
+                "Refreshed active pending candidates kept=%d expired=%d",
+                refreshed,
+                expired,
+            )
+            self._append_event(
+                "candidate_refresh",
+                {
+                    "refreshed": refreshed,
+                    "expired": expired,
+                },
+            )
+
+    @staticmethod
+    def _candidate_notification_key(candidate: Candidate) -> str:
+        return "|".join(
+            [
+                str(candidate.wallet or "").strip().lower(),
+                str(candidate.market_slug or "").strip().lower(),
+                str(candidate.token_id or "").strip().lower(),
+                str(candidate.side or "").strip().upper(),
+                str(candidate.suggested_action or "").strip().lower(),
+            ]
+        )
+
+    def _should_notify_candidate(self, candidate: Candidate) -> bool:
+        if not bool(getattr(self.settings, "candidate_notification_enabled", False)):
+            return False
+        if candidate.skip_reason:
+            return False
+        if candidate.side != "BUY":
+            return False
+        if str(candidate.suggested_action or "").strip().lower() not in {"buy_normal", "follow"}:
+            return False
+        if float(candidate.score or 0.0) < float(getattr(self.settings, "candidate_notification_min_score", 84.0) or 84.0):
+            return False
+        return True
+
+    def _notify_candidates(self, candidates: list[Candidate]) -> None:
+        if not candidates or self.notifier is None:
+            return
+        cooldown_seconds = max(30, int(getattr(self.settings, "candidate_notification_cooldown_seconds", 900) or 900))
+        now = int(time.time())
+        for candidate in candidates:
+            if not self._should_notify_candidate(candidate):
+                continue
+            key = self._candidate_notification_key(candidate)
+            last_ts = int(self._candidate_notification_watermarks.get(key) or 0)
+            if last_ts > 0 and (now - last_ts) < cooldown_seconds:
+                continue
+            title = f"{candidate.suggested_action.upper()} · {candidate.market_slug or candidate.token_id}"
+            wallet_label = str(candidate.wallet_tag or candidate.wallet_tier or "WATCH").upper()
+            body_parts = [
+                f"{wallet_label} 钱包 {float(candidate.wallet_score or 0.0):.1f} 分",
+                f"{candidate.outcome or '--'} · {float(candidate.observed_notional or 0.0):.2f}U",
+            ]
+            if candidate.spread_pct is not None:
+                body_parts.append(f"spread {float(candidate.spread_pct):.2f}%")
+            if candidate.chase_pct is not None:
+                body_parts.append(f"chase {float(candidate.chase_pct):.2f}%")
+            if candidate.recommendation_reason:
+                body_parts.append(str(candidate.recommendation_reason))
+            body = " | ".join(part for part in body_parts if part)
+            extra = {
+                "candidate_id": candidate.id,
+                "wallet": candidate.wallet,
+                "market_slug": candidate.market_slug,
+                "token_id": candidate.token_id,
+                "suggested_action": candidate.suggested_action,
+                "score": candidate.score,
+            }
+            self.notifier.notify_all(
+                title=title,
+                body=body,
+                extra=extra,
+                channels=[
+                    channel
+                    for channel, enabled in (
+                        ("local", bool(getattr(self.settings, "notify_local_enabled", True))),
+                        ("webhook", bool(getattr(self.notifier, "webhook_targets", lambda: [])())),
+                        ("telegram", bool(getattr(self.notifier, "telegram_available", lambda: False)())),
+                    )
+                    if enabled
+                ],
+            )
+            self._candidate_notification_watermarks[key] = now
+
+    def _candidate_to_signal(self, candidate: Mapping[str, object]) -> Signal | None:
+        snapshot = dict(candidate.get("signal_snapshot") or {})
+        if not snapshot:
+            return None
+        ts = self._parse_iso_timestamp(snapshot.get("timestamp"))
+        when = datetime.fromtimestamp(max(0, ts or int(time.time())), tz=timezone.utc)
+        topic_snapshot = dict(candidate.get("topic_snapshot") or {})
+        return Signal(
+            signal_id=str(snapshot.get("signal_id") or candidate.get("signal_id") or ""),
+            trace_id=str(snapshot.get("trace_id") or candidate.get("trace_id") or ""),
+            wallet=str(snapshot.get("wallet") or candidate.get("wallet") or ""),
+            market_slug=str(snapshot.get("market_slug") or candidate.get("market_slug") or ""),
+            token_id=str(snapshot.get("token_id") or candidate.get("token_id") or ""),
+            outcome=str(snapshot.get("outcome") or candidate.get("outcome") or ""),
+            side=str(snapshot.get("side") or candidate.get("side") or "BUY"),
+            confidence=float(snapshot.get("confidence") or candidate.get("confidence") or 0.0),
+            price_hint=float(snapshot.get("price_hint") or candidate.get("source_avg_price") or 0.0),
+            observed_size=float(snapshot.get("observed_size") or candidate.get("observed_size") or 0.0),
+            observed_notional=float(snapshot.get("observed_notional") or candidate.get("observed_notional") or 0.0),
+            timestamp=when,
+            condition_id=str(snapshot.get("condition_id") or candidate.get("condition_id") or ""),
+            wallet_score=float(snapshot.get("wallet_score") or candidate.get("wallet_score") or 0.0),
+            wallet_tier=str(snapshot.get("wallet_tier") or candidate.get("wallet_tier") or "LOW"),
+            wallet_score_summary=str(snapshot.get("wallet_score_summary") or ""),
+            topic_key=str(topic_snapshot.get("topic_key") or ""),
+            topic_label=str(topic_snapshot.get("topic_label") or candidate.get("market_tag") or ""),
+            topic_sample_count=int(topic_snapshot.get("topic_sample_count") or 0),
+            topic_win_rate=float(topic_snapshot.get("topic_win_rate") or 0.0),
+            topic_roi=float(topic_snapshot.get("topic_roi") or 0.0),
+            topic_resolved_win_rate=float(topic_snapshot.get("topic_resolved_win_rate") or 0.0),
+            topic_score_summary=str(topic_snapshot.get("topic_score_summary") or ""),
+            topic_bias=str(topic_snapshot.get("topic_bias") or candidate.get("resolution_bucket") or "neutral"),
+            topic_multiplier=float(topic_snapshot.get("topic_multiplier") or 1.0),
+            exit_fraction=float(snapshot.get("exit_fraction") or 0.0),
+            exit_reason=str(snapshot.get("exit_reason") or ""),
+            cross_wallet_exit=bool(snapshot.get("cross_wallet_exit", False)),
+            exit_wallet_count=int(snapshot.get("exit_wallet_count") or candidate.get("source_wallet_count") or 0),
+            position_action=str(snapshot.get("position_action") or candidate.get("trigger_type") or ""),
+            position_action_label=str(snapshot.get("position_action_label") or ""),
+        )
+
+    def _claim_approved_candidate_plans(self) -> list[dict[str, object]]:
+        if self.candidate_store is None:
+            return []
+        plans: list[dict[str, object]] = []
+        for candidate in self.candidate_store.list_candidates(statuses=["approved"], limit=self.settings.max_signals_per_cycle):
+            signal = self._candidate_to_signal(candidate)
+            if signal is None:
+                self.candidate_store.update_candidate_status(
+                    str(candidate.get("id") or ""),
+                    status="expired",
+                    result_tag="candidate_snapshot_missing",
+                )
+                continue
+            candidate_id = str(candidate.get("id") or "")
+            self.candidate_store.update_candidate_status(
+                candidate_id,
+                status="queued",
+                selected_action=str(candidate.get("selected_action") or ""),
+                updated_ts=int(time.time()),
+            )
+            plans.append(
+                {
+                    "signal": signal,
+                    "candidate_id": candidate_id,
+                    "candidate_action": str(candidate.get("selected_action") or ""),
+                    "candidate_note": str(candidate.get("note") or ""),
+                    "origin": "approved_queue",
+                }
+            )
+        return plans
+
+    def _auto_candidate_plans(self, candidates: list[Candidate], signals: list[Signal], mode: str) -> list[dict[str, object]]:
+        if mode not in {"semi_auto", "auto"}:
+            return []
+        candidate_by_id = {candidate.id: candidate for candidate in candidates}
+        plans: list[dict[str, object]] = []
+        for signal in signals:
+            candidate = candidate_by_id.get(str(signal.signal_id or ""))
+            if candidate is None:
+                continue
+            if candidate.skip_reason:
+                continue
+            suggested_action = str(candidate.suggested_action or "")
+            if signal.side == "BUY":
+                if suggested_action not in {"buy_small", "buy_normal", "follow"}:
+                    continue
+            elif suggested_action not in {"close_partial", "close_all"}:
+                continue
+            if mode == "semi_auto":
+                if signal.side == "BUY":
+                    if not (
+                        candidate.score >= float(self.settings.candidate_auto_min_score)
+                        and candidate.wallet_score >= float(self.settings.candidate_auto_min_wallet_score)
+                        and str(candidate.wallet_tier or "").upper() in {"HIGH", "CORE"}
+                        and suggested_action in {"buy_normal", "follow"}
+                    ):
+                        continue
+                elif suggested_action != "close_all":
+                    continue
+            if self.candidate_store is not None:
+                self.candidate_store.update_candidate_status(
+                    candidate.id,
+                    status="queued",
+                    selected_action=suggested_action,
+                    updated_ts=int(time.time()),
+                )
+            plans.append(
+                {
+                    "signal": signal,
+                    "candidate_id": candidate.id,
+                    "candidate_action": suggested_action,
+                    "candidate_note": "",
+                    "origin": f"{mode}_fresh",
+                }
+            )
+        return plans
+
+    def _candidate_action_multiplier(self, action: str) -> float:
+        normalized = str(action or "").strip().lower()
+        if normalized == "buy_small":
+            return float(self.settings.candidate_buy_small_fraction)
+        if normalized == "buy_normal":
+            return float(self.settings.candidate_buy_normal_fraction)
+        if normalized == "follow":
+            return float(self.settings.candidate_follow_fraction)
+        if normalized == "close_partial":
+            return float(self.settings.candidate_close_partial_fraction)
+        return 1.0
+
+    def _apply_candidate_action_sizing(
+        self,
+        *,
+        signal: Signal,
+        action: str,
+        requested_notional: float,
+        existing: Mapping[str, object] | None,
+    ) -> float:
+        normalized = str(action or "").strip().lower()
+        if normalized in {"", "watch", "ignore"}:
+            return 0.0
+        multiplier = self._candidate_action_multiplier(normalized)
+        if signal.side == "SELL":
+            position_notional = max(0.0, float((existing or {}).get("notional") or 0.0))
+            if normalized == "close_partial":
+                return min(position_notional * multiplier, requested_notional)
+            return min(position_notional, requested_notional)
+        return requested_notional * multiplier
+
+    @staticmethod
+    def _should_apply_candidate_action_sizing(origin: object, action: object) -> bool:
+        normalized_origin = str(origin or "").strip().lower()
+        normalized_action = str(action or "").strip().lower()
+        if normalized_origin != "approved_queue":
+            return False
+        return normalized_action not in {"", "watch", "ignore"}
+
+    def _record_candidate_result(
+        self,
+        candidate_id: str,
+        *,
+        action: str,
+        status: str,
+        rationale: str,
+        result_tag: str,
+        signal: Signal,
+        pnl_realized: float | None = None,
+    ) -> None:
+        if self.candidate_store is None or not candidate_id:
+            return
+        self.candidate_store.update_candidate_status(
+            candidate_id,
+            status=status,
+            selected_action=action,
+            result_tag=result_tag,
+            updated_ts=int(time.time()),
+        )
+        self.candidate_store.append_journal_entry(
+            JournalEntry(
+                candidate_id=candidate_id,
+                action=action,
+                rationale=rationale,
+                result_tag=result_tag,
+                created_ts=int(time.time()),
+                market_slug=str(signal.market_slug or ""),
+                wallet=str(signal.wallet or ""),
+                pnl_realized=pnl_realized,
+            )
+        )
 
     @staticmethod
     def _utc_day_key(ts: int | None = None) -> str:
@@ -392,6 +1601,76 @@ class Trader:
         self._roll_daily_state_if_needed(ts)
         self.state.daily_realized_pnl += realized_pnl
 
+    @staticmethod
+    def _is_missing_orderbook_message(message: object) -> bool:
+        text = str(message or "").strip().lower()
+        if not text:
+            return False
+        return (
+            "no orderbook exists" in text
+            or "book?token_id" in text
+            or "order book unavailable" in text
+        )
+
+    def _apply_accounting_snapshot(self, snapshot: AccountingSnapshot | None) -> None:
+        if snapshot is None:
+            return
+        self.state.cash_balance_usd = float(snapshot.cash_balance)
+        self.state.positions_value_usd = float(snapshot.positions_value)
+        self.state.equity_usd = float(snapshot.equity)
+        self.state.account_snapshot_ts = self._parse_iso_timestamp(snapshot.valuation_time) or int(time.time())
+
+    def _retire_position_from_account_snapshot(
+        self,
+        *,
+        token_id: str,
+        position: Mapping[str, object],
+        snapshot: AccountingSnapshot | None,
+        reason: str,
+        now: int,
+    ) -> bool:
+        normalized_token = str(token_id or "").strip()
+        if not normalized_token or snapshot is None:
+            return False
+
+        active_tokens = {
+            str(getattr(account_pos, "token_id", "") or "").strip()
+            for account_pos in tuple(snapshot.positions or ())
+            if str(getattr(account_pos, "token_id", "") or "").strip()
+        }
+        if normalized_token in active_tokens:
+            return False
+
+        removed = self.positions_book.pop(normalized_token, None)
+        if removed is None:
+            return False
+
+        self._apply_accounting_snapshot(snapshot)
+        self._refresh_risk_state()
+        market_slug = str(position.get("market_slug") or normalized_token)
+        trace_id = str(position.get("trace_id") or "")
+        self._append_event(
+            "position_retired",
+            {
+                "token_id": normalized_token,
+                "market_slug": market_slug,
+                "reason": reason,
+                "source": "account_snapshot",
+            },
+        )
+        if self.settings.token_reentry_cooldown_seconds > 0:
+            self.token_reentry_until[normalized_token] = now + self.settings.token_reentry_cooldown_seconds
+        if trace_id:
+            self._mark_trace_closed(trace_id, now)
+        self.log.warning(
+            "POSITION_RETIRED slug=%s token=%s reason=%s open_positions=%d",
+            market_slug,
+            normalized_token,
+            reason,
+            self.state.open_positions,
+        )
+        return True
+
     def _closed_pnl_today(self, wallet: str, day_start_ts: int) -> float | None:
         total = 0.0
         found = False
@@ -429,10 +1708,7 @@ class Trader:
             self.log.warning("Closed-position pnl sync failed wallet=%s err=%s", wallet, exc)
 
         if snapshot is not None:
-            self.state.cash_balance_usd = float(snapshot.cash_balance)
-            self.state.positions_value_usd = float(snapshot.positions_value)
-            self.state.equity_usd = float(snapshot.equity)
-            self.state.account_snapshot_ts = self._parse_iso_timestamp(snapshot.valuation_time) or int(time.time())
+            self._apply_accounting_snapshot(snapshot)
         if closed_pnl_today is not None:
             self.state.broker_closed_pnl_today = float(closed_pnl_today)
 
@@ -467,6 +1743,18 @@ class Trader:
             return
         self._last_account_sync_ts = time.time()
         self._sync_account_state()
+
+    def _refresh_account_state_after_order(self, result: ExecutionResult) -> None:
+        if self.settings.dry_run or not str(self.settings.funder_address or "").strip():
+            return
+
+        message = str(result.message or "").strip().lower()
+        should_refresh = result.ok or "not enough balance / allowance" in message
+        if not should_refresh:
+            return
+
+        self._maybe_sync_account_state(force=True)
+        self._refresh_risk_state()
 
     def _append_event(self, event_type: str, payload: dict[str, object]) -> None:
         path = self.settings.event_log_path
@@ -1358,7 +2646,9 @@ class Trader:
 
         if removed or added or updated:
             self.positions_book = reconciled
-            self.state.open_positions = len(self.positions_book)
+            self._refresh_risk_state()
+            if removed:
+                self._maybe_sync_account_state(force=True)
             self.log.warning(
                 "Periodic broker reconciliation changed positions added=%d removed=%d updated=%d open=%d",
                 len(added),
@@ -1432,7 +2722,8 @@ class Trader:
             return 0.0, snapshot
 
         allowed_notional = min(requested_notional, remaining_capacity)
-        if allowed_notional < 5.0:
+        actionable_floor = self._actionable_notional_floor_usd()
+        if allowed_notional < actionable_floor:
             self._append_event(
                 "signal_skip",
                 {
@@ -1447,6 +2738,7 @@ class Trader:
                     "condition_exposure_current_usd": current_exposure,
                     "condition_exposure_remaining_usd": remaining_capacity,
                     "allowed_notional": allowed_notional,
+                    "actionable_notional_floor_usd": actionable_floor,
                 },
             )
             return 0.0, snapshot
@@ -1499,7 +2791,8 @@ class Trader:
             return 0.0
 
         allowed_notional = min(requested_notional, available)
-        if allowed_notional < 5.0:
+        actionable_floor = self._actionable_notional_floor_usd()
+        if allowed_notional < actionable_floor:
             self._append_event(
                 "signal_skip",
                 {
@@ -1509,6 +2802,7 @@ class Trader:
                     "reason": "notional_too_small_after_budget",
                     "allowed_notional": allowed_notional,
                     "available_notional": available,
+                    "actionable_notional_floor_usd": actionable_floor,
                 },
             )
             return 0.0
@@ -1550,7 +2844,8 @@ class Trader:
         else:
             target_notional = max(0.0, float(requested_notional or 0.0))
         target_notional = min(current_notional, target_notional)
-        if target_notional < 5.0:
+        actionable_floor = self._actionable_notional_floor_usd()
+        if target_notional < actionable_floor:
             self._append_event(
                 "signal_skip",
                 {
@@ -1561,6 +2856,7 @@ class Trader:
                     "target_notional": target_notional,
                     "current_notional": current_notional,
                     "exit_fraction": exit_fraction,
+                    "actionable_notional_floor_usd": actionable_floor,
                 },
             )
             return 0.0
@@ -3059,9 +4355,13 @@ class Trader:
         budget_limited: bool = False,
         netting_limited: bool = False,
         netting_snapshot: dict[str, object] | None = None,
+        candidate_id: str = "",
+        candidate_action: str = "",
+        candidate_origin: str = "",
     ) -> dict[str, object]:
         snapshot = {
             "control": {
+                "decision_mode": str(control.decision_mode or self.decision_mode or self.settings.decision_mode or "manual"),
                 "pause_opening": bool(control.pause_opening),
                 "reduce_only": bool(control.reduce_only),
                 "emergency_stop": bool(control.emergency_stop),
@@ -3092,6 +4392,9 @@ class Trader:
             "netting_limited": bool(netting_limited),
             "duplicate": bool(duplicate),
             "skip_reason": str(skip_reason or ""),
+            "candidate_id": str(candidate_id or ""),
+            "candidate_action": str(candidate_action or ""),
+            "candidate_origin": str(candidate_origin or ""),
         }
         return snapshot
 
@@ -3202,6 +4505,7 @@ class Trader:
                 "failure_count": int(self.startup_failure_count),
                 "checks": list(self.startup_checks),
             },
+            "decision_mode": str(self.decision_mode or self.settings.decision_mode or "manual"),
             "risk_state": {
                 "day_key": self._active_day_key,
                 "daily_realized_pnl": float(self.state.daily_realized_pnl),
@@ -3247,6 +4551,7 @@ class Trader:
             payload = {}
 
         state = ControlState(
+            decision_mode=self._normalize_decision_mode(payload.get("decision_mode", self.settings.decision_mode)),
             pause_opening=bool(payload.get("pause_opening", False)),
             reduce_only=bool(payload.get("reduce_only", False)),
             emergency_stop=bool(payload.get("emergency_stop", False)),
@@ -3255,6 +4560,7 @@ class Trader:
         )
 
         signature = (
+            state.decision_mode,
             state.pause_opening,
             state.reduce_only,
             state.emergency_stop,
@@ -3264,7 +4570,8 @@ class Trader:
         if signature != self._last_control_signature:
             self._last_control_signature = signature
             self.log.info(
-                "CONTROL pause_opening=%s reduce_only=%s emergency_stop=%s clear_stale_pending_requested_ts=%d updated_ts=%d",
+                "CONTROL decision_mode=%s pause_opening=%s reduce_only=%s emergency_stop=%s clear_stale_pending_requested_ts=%d updated_ts=%d",
+                state.decision_mode,
                 state.pause_opening,
                 state.reduce_only,
                 state.emergency_stop,
@@ -3273,6 +4580,7 @@ class Trader:
             )
 
         self.control_state = state
+        self.decision_mode = state.decision_mode
         return state
 
     def _apply_operator_clear_stale_pending(self, control: ControlState) -> None:
@@ -3892,6 +5200,7 @@ class Trader:
             trim_pct = self.settings.stale_position_trim_pct
         trim_cooldown = self.settings.stale_position_trim_cooldown_seconds
         close_notional = self.settings.stale_position_close_notional_usd
+        actionable_floor = self._actionable_notional_floor_usd()
         cycle_id = self._new_cycle_id(now)
         wallet_pool_snapshot = self._wallet_pool_snapshot()
         cycle_record = {
@@ -3921,8 +5230,10 @@ class Trader:
             if current_notional <= 0 or current_qty <= 0:
                 continue
 
-            trim_notional = current_notional * trim_pct
-            if trim_notional < 5:
+            full_close = current_notional <= close_notional
+            exit_fraction = 1.0 if full_close else trim_pct
+            target_notional = current_notional if full_close else (current_notional * trim_pct)
+            if target_notional < actionable_floor:
                 continue
 
             sig = Signal(
@@ -3936,11 +5247,11 @@ class Trader:
                 side="SELL",
                 confidence=0.5,
                 price_hint=float(position.get("price") or 0.5),
-                observed_size=current_qty * trim_pct,
-                observed_notional=trim_notional,
+                observed_size=current_qty if full_close else (current_qty * trim_pct),
+                observed_notional=target_notional,
                 timestamp=datetime.now(tz=timezone.utc),
-                position_action="exit" if trim_pct >= 0.95 else "trim",
-                position_action_label="时间退出" if trim_pct >= 0.95 else "时间减仓",
+                position_action="exit" if full_close or exit_fraction >= 0.95 else "trim",
+                position_action_label="时间退出" if full_close or exit_fraction >= 0.95 else "时间减仓",
             )
             signal_record = self._cycle_candidate_record(
                 sig,
@@ -3953,21 +5264,43 @@ class Trader:
                 signal=sig,
                 control=self.control_state,
                 existing=position,
-                sized_notional=trim_notional,
-                final_notional=trim_notional,
+                sized_notional=target_notional,
+                final_notional=target_notional,
             )
             base_decision_snapshot["risk_allowed"] = True
             base_decision_snapshot["risk_reason"] = "time_exit"
             base_decision_snapshot["risk_snapshot"] = {
                 "system_exit": "time_exit",
                 "congested": bool(congested),
-                "trim_pct": float(trim_pct),
+                "trim_pct": float(exit_fraction),
                 "stale_seconds": int(stale_seconds),
                 "trim_cooldown": int(trim_cooldown),
                 "close_notional_threshold": float(close_notional),
+                "target_notional": float(target_notional),
             }
-            result = self.broker.execute(sig, trim_notional)
+            result = self.broker.execute(sig, target_notional)
             if not result.ok:
+                retired = False
+                if self._is_missing_orderbook_message(result.message):
+                    wallet = str(self.settings.funder_address or "").strip()
+                    snapshot = None
+                    if wallet:
+                        try:
+                            snapshot = self.data_client.get_accounting_snapshot(wallet)
+                        except Exception as exc:
+                            self.log.warning(
+                                "Accounting snapshot refresh failed during time-exit retirement wallet=%s token=%s err=%s",
+                                wallet,
+                                token_id,
+                                exc,
+                            )
+                    retired = self._retire_position_from_account_snapshot(
+                        token_id=token_id,
+                        position=position,
+                        snapshot=snapshot,
+                        reason=str(result.message or ""),
+                        now=now,
+                    )
                 entry_context = self._position_entry_context(position)
                 self._append_event(
                     "time_exit_fail",
@@ -3983,12 +5316,13 @@ class Trader:
                         "exit_kind": "time_exit",
                         "exit_label": "时间退出",
                         "hold_minutes": self._position_hold_minutes(position, now),
-                        "exit_fraction": float(trim_pct),
-                        "trim_notional": trim_notional,
+                        "exit_fraction": float(exit_fraction),
+                        "trim_notional": target_notional,
                         "reason": result.message,
                         "cycle_id": cycle_id,
                         "wallet_score": 0.0,
                         "wallet_tier": "SYSTEM",
+                        "position_retired": bool(retired),
                     },
                 )
                 self.recent_orders.appendleft(
@@ -4008,20 +5342,25 @@ class Trader:
                         "source_wallet": "system-time-exit",
                         "hold_minutes": self._position_hold_minutes(position, now),
                         "topic_label": str(position.get("entry_topic_label") or ""),
-                        "notional": trim_notional,
+                        "notional": target_notional,
                         "wallet_score": 0.0,
                         "wallet_tier": "SYSTEM",
                         "position_action": sig.position_action,
                         "position_action_label": sig.position_action_label,
                         **entry_context,
                         **self._exit_result_meta(exit_kind="time_exit", ok=False),
-                        **self._order_meta("SELL", exit_kind="time_exit", exit_label="时间退出", exit_summary="time-exit failed"),
+                        **self._order_meta(
+                            "SELL",
+                            exit_kind="time_exit",
+                            exit_label="时间退出",
+                            exit_summary="time-exit retired" if retired else "time-exit failed",
+                        ),
                     }
                 )
                 signal_record["decision_snapshot"] = dict(base_decision_snapshot)
                 signal_record["order_snapshot"] = self._order_trace_snapshot(dict(self.recent_orders[0]))
-                signal_record["position_snapshot"] = self._position_trace_snapshot(position, is_open=True)
-                signal_record["final_status"] = "order_rejected"
+                signal_record["position_snapshot"] = self._position_trace_snapshot(position, is_open=not retired)
+                signal_record["final_status"] = "position_retired" if retired else "order_rejected"
                 self._trace_record(
                     trace_id=str(sig.trace_id or ""),
                     signal=sig,
@@ -4029,7 +5368,15 @@ class Trader:
                     signal_record=dict(signal_record),
                     opened_ts=now,
                 )
-                self.log.error("TIME_EXIT_FAIL slug=%s token=%s reason=%s", sig.market_slug, sig.token_id, result.message)
+                if retired:
+                    self.log.warning(
+                        "TIME_EXIT_RETIRE slug=%s token=%s reason=%s",
+                        sig.market_slug,
+                        sig.token_id,
+                        result.message,
+                    )
+                else:
+                    self.log.error("TIME_EXIT_FAIL slug=%s token=%s reason=%s", sig.market_slug, sig.token_id, result.message)
                 continue
 
             if result.is_pending:
@@ -4058,7 +5405,7 @@ class Trader:
                         "exit_kind": "time_exit",
                         "exit_label": "时间退出",
                         "hold_minutes": self._position_hold_minutes(position, now),
-                        "exit_fraction": float(trim_pct),
+                        "exit_fraction": float(exit_fraction),
                         "requested_notional": result.requested_notional,
                         "order_id": result.broker_order_id or "",
                         "broker_status": result.lifecycle_status,
@@ -4149,7 +5496,7 @@ class Trader:
                     "exit_result": "partial_trim" if remaining_notional > close_notional and remaining_qty > 0.0 else "full_exit",
                     "exit_result_label": "部分减仓" if remaining_notional > close_notional and remaining_qty > 0.0 else "完全退出",
                     "hold_minutes": self._position_hold_minutes(position, now),
-                    "exit_fraction": float(trim_pct),
+                    "exit_fraction": float(exit_fraction),
                     "trim_notional": result.filled_notional,
                     "notional": result.filled_notional,
                     "remaining_notional": remaining_notional,
@@ -4264,19 +5611,16 @@ class Trader:
             return
 
         self._apply_time_exit()
+        self._refresh_active_pending_candidates(now=int(time.time()))
         wallets = self._resolve_wallets()
         self.last_wallets = wallets
-        if not wallets:
-            self.log.warning("No wallets configured/resolved. Check WATCH_WALLETS and discovery settings.")
-            self.last_signals = []
-            return
-        self._update_strategy_history(wallets)
-
-        signals = self.strategy.generate_signals(wallets)
-        if not signals:
-            self.last_signals = []
-            self.log.info("No actionable signal this cycle")
-            return
+        fresh_signals: list[Signal] = []
+        if wallets:
+            self._update_strategy_history(wallets)
+            self._sync_wallet_profiles(wallets)
+            fresh_signals = self.strategy.generate_signals(wallets)
+        else:
+            self.log.warning("No wallets configured/resolved. fresh candidate generation skipped.")
 
         cycle_now = int(time.time())
         cycle_id = self._new_cycle_id(cycle_now)
@@ -4284,14 +5628,54 @@ class Trader:
         signal_records: list[dict[str, object]] = []
         signal_record_by_id: dict[str, dict[str, object]] = {}
         prepared_signals: list[Signal] = []
-        for sig in signals:
+        fresh_candidates: list[Candidate] = []
+        precheck_skipped = 0
+        for sig in fresh_signals:
             existing = self.positions_book.get(sig.token_id)
             sig.signal_id = self._new_signal_id(cycle_now)
             sig.trace_id = self._trace_id_for_signal(sig, existing, cycle_now)
             action, action_label = self._position_action_for_signal(sig, existing)
             sig.position_action = action
             sig.position_action_label = action_label
+            market_context = None
+            if sig.side == "BUY":
+                market_context = self._candidate_market_context(
+                    sig.token_id,
+                    price_hint=float(sig.price_hint or 0.0),
+                    market_slug=str(sig.market_slug or ""),
+                )
+                skip_reason = self._candidate_skip_reason(sig, market_context, existing=existing)
+                if skip_reason in {"market_data_unavailable", "market_window_elapsed", "market_near_close"}:
+                    precheck_skipped += 1
+                    self.log.info(
+                        "DROP wallet=%s slug=%s token=%s reason=%s",
+                        sig.wallet,
+                        sig.market_slug,
+                        sig.token_id,
+                        skip_reason,
+                    )
+                    self._append_event(
+                        "signal_precheck_skip",
+                        {
+                            "signal_id": str(sig.signal_id or ""),
+                            "trace_id": str(sig.trace_id or ""),
+                            "wallet": str(sig.wallet or ""),
+                            "market_slug": str(sig.market_slug or ""),
+                            "token_id": str(sig.token_id or ""),
+                            "side": str(sig.side or ""),
+                            "reason": skip_reason,
+                        },
+                    )
+                    continue
             prepared_signals.append(sig)
+            fresh_candidates.append(
+                self._candidate_from_signal(
+                    sig,
+                    now=cycle_now,
+                    existing=existing,
+                    market_context=market_context,
+                )
+            )
             record = self._cycle_candidate_record(
                 sig,
                 cycle_id=cycle_id,
@@ -4299,16 +5683,69 @@ class Trader:
             )
             signal_records.append(record)
             signal_record_by_id[str(sig.signal_id)] = record
+        self._persist_candidates(fresh_candidates)
+        self._notify_candidates(fresh_candidates)
         self.last_signals = prepared_signals
-        self.recent_signal_cycles.appendleft(
-            {
-                "cycle_id": cycle_id,
-                "ts": cycle_now,
-                "wallets": list(wallets),
-                "wallet_pool_snapshot": list(wallet_pool_snapshot),
-                "candidates": signal_records,
-            }
-        )
+
+        approved_plans = self._claim_approved_candidate_plans()
+        auto_plans = self._auto_candidate_plans(fresh_candidates, prepared_signals, control.decision_mode)
+        execution_plans = approved_plans + auto_plans
+
+        for plan in execution_plans:
+            sig = plan["signal"]
+            signal_id = str(sig.signal_id or "")
+            if signal_id and signal_id in signal_record_by_id:
+                continue
+            existing = self.positions_book.get(sig.token_id)
+            if not str(sig.signal_id or "").strip():
+                sig.signal_id = self._new_signal_id(cycle_now)
+            if not str(sig.trace_id or "").strip():
+                sig.trace_id = self._trace_id_for_signal(sig, existing, cycle_now)
+            action, action_label = self._position_action_for_signal(sig, existing)
+            sig.position_action = action
+            sig.position_action_label = action_label
+            record = self._cycle_candidate_record(
+                sig,
+                cycle_id=cycle_id,
+                wallet_pool_snapshot=wallet_pool_snapshot,
+            )
+            signal_records.append(record)
+            signal_record_by_id[str(sig.signal_id)] = record
+
+        if signal_records:
+            self.recent_signal_cycles.appendleft(
+                {
+                    "cycle_id": cycle_id,
+                    "ts": cycle_now,
+                    "wallets": list(wallets),
+                    "wallet_pool_snapshot": list(wallet_pool_snapshot),
+                    "decision_mode": str(control.decision_mode),
+                    "candidates": signal_records,
+                }
+            )
+
+        if not execution_plans:
+            if prepared_signals:
+                self.log.info(
+                    "Queued %d fresh candidates for decision mode=%s",
+                    len(prepared_signals),
+                    control.decision_mode,
+                )
+            elif precheck_skipped > 0:
+                self.log.info(
+                    "Dropped %d fresh signals at market precheck; no tradable candidate this cycle",
+                    precheck_skipped,
+                )
+            else:
+                self.log.info("No actionable signal or approved candidate this cycle")
+            return
+
+        execution_meta_by_signal_id: dict[str, dict[str, object]] = {}
+        executable_signals: list[Signal] = []
+        for plan in execution_plans:
+            sig = plan["signal"]
+            execution_meta_by_signal_id[str(sig.signal_id or "")] = dict(plan)
+            executable_signals.append(sig)
 
         def finalize_signal(
             sig: Signal,
@@ -4335,7 +5772,12 @@ class Trader:
                 opened_ts=now_ts,
             )
 
-        for sig in prepared_signals:
+        for sig in executable_signals:
+            execution_meta = execution_meta_by_signal_id.get(str(sig.signal_id or ""), {})
+            candidate_id = str(execution_meta.get("candidate_id") or "")
+            candidate_action = str(execution_meta.get("candidate_action") or "")
+            candidate_note = str(execution_meta.get("candidate_note") or "")
+            candidate_origin = str(execution_meta.get("origin") or "runtime")
             order_meta = self._signal_order_meta(sig)
             existing = self.positions_book.get(sig.token_id)
             if sig.side == "BUY" and control.pause_opening:
@@ -4364,6 +5806,15 @@ class Trader:
                     ),
                     now_ts=int(time.time()),
                 )
+                if candidate_id:
+                    self._record_candidate_result(
+                        candidate_id,
+                        action=candidate_action or "ignore",
+                        status="skipped",
+                        rationale=candidate_note or "pause_opening",
+                        result_tag="pause_opening",
+                        signal=sig,
+                    )
                 continue
             if sig.side == "BUY" and control.reduce_only:
                 self.log.info(
@@ -4391,6 +5842,15 @@ class Trader:
                     ),
                     now_ts=int(time.time()),
                 )
+                if candidate_id:
+                    self._record_candidate_result(
+                        candidate_id,
+                        action=candidate_action or "ignore",
+                        status="skipped",
+                        rationale=candidate_note or "reduce_only",
+                        result_tag="reduce_only",
+                        signal=sig,
+                    )
                 continue
 
             now = int(time.time())
@@ -4431,6 +5891,15 @@ class Trader:
                     ),
                     now_ts=now,
                 )
+                if candidate_id:
+                    self._record_candidate_result(
+                        candidate_id,
+                        action=candidate_action or "ignore",
+                        status="skipped",
+                        rationale=candidate_note or "token_reentry_cooldown",
+                        result_tag="token_reentry_cooldown",
+                        signal=sig,
+                    )
                 continue
 
             existing = self.positions_book.get(sig.token_id)
@@ -4456,6 +5925,15 @@ class Trader:
                         ),
                         now_ts=now,
                     )
+                    if candidate_id:
+                        self._record_candidate_result(
+                            candidate_id,
+                            action=candidate_action or "ignore",
+                            status="skipped",
+                            rationale=candidate_note or "sell_already_processed_this_cycle",
+                            result_tag="sell_already_processed_this_cycle",
+                            signal=sig,
+                        )
                     continue
                 if existing is None:
                     self._append_event(
@@ -4478,6 +5956,15 @@ class Trader:
                         ),
                         now_ts=now,
                     )
+                    if candidate_id:
+                        self._record_candidate_result(
+                            candidate_id,
+                            action=candidate_action or "ignore",
+                            status="skipped",
+                            rationale=candidate_note or "no_open_position",
+                            result_tag="no_open_position",
+                            signal=sig,
+                        )
                     continue
                 entry_wallet = str(existing.get("entry_wallet") or "").strip().lower()
                 if (
@@ -4506,6 +5993,15 @@ class Trader:
                         ),
                         now_ts=now,
                     )
+                    if candidate_id:
+                        self._record_candidate_result(
+                            candidate_id,
+                            action=candidate_action or "ignore",
+                            status="skipped",
+                            rationale=candidate_note or "entry_wallet_mismatch",
+                            result_tag="entry_wallet_mismatch",
+                            signal=sig,
+                        )
                     continue
             if sig.side == "BUY" and existing is not None and self.settings.token_add_cooldown_seconds > 0:
                 last_buy_ts = int(existing.get("last_buy_ts") or existing.get("opened_ts") or 0)
@@ -4539,6 +6035,15 @@ class Trader:
                         ),
                         now_ts=now,
                     )
+                    if candidate_id:
+                        self._record_candidate_result(
+                            candidate_id,
+                            action=candidate_action or "ignore",
+                            status="skipped",
+                            rationale=candidate_note or "token_add_cooldown",
+                            result_tag="token_add_cooldown",
+                            signal=sig,
+                        )
                     continue
 
             self._refresh_risk_state()
@@ -4571,6 +6076,15 @@ class Trader:
                     ),
                     now_ts=now,
                 )
+                if candidate_id:
+                    self._record_candidate_result(
+                        candidate_id,
+                        action=candidate_action or "ignore",
+                        status="risk_rejected",
+                        rationale=candidate_note or str(decision.reason or ""),
+                        result_tag=str(decision.reason or "risk_rejected"),
+                        signal=sig,
+                    )
                 continue
 
             sized_notional = self._apply_wallet_score_sizing(sig, decision.max_notional)
@@ -4595,6 +6109,15 @@ class Trader:
                     ),
                     now_ts=now,
                 )
+                if candidate_id:
+                    self._record_candidate_result(
+                        candidate_id,
+                        action=candidate_action or "ignore",
+                        status="skipped",
+                        rationale=candidate_note or "wallet_score_gate",
+                        result_tag="wallet_score_gate",
+                        signal=sig,
+                    )
                 continue
 
             sized_notional = self._apply_topic_profile_sizing(sig, sized_notional)
@@ -4605,6 +6128,13 @@ class Trader:
             else:
                 netting_notional, netting_snapshot = self._enforce_condition_netting(sig, sized_notional)
                 notional_to_use = self._enforce_buy_budget(sig, netting_notional)
+            if self._should_apply_candidate_action_sizing(candidate_origin, candidate_action):
+                notional_to_use = self._apply_candidate_action_sizing(
+                    signal=sig,
+                    action=candidate_action,
+                    requested_notional=notional_to_use,
+                    existing=existing,
+                )
             netting_limited = sig.side == "BUY" and netting_notional + 1e-9 < sized_notional
             budget_limited = sig.side == "BUY" and notional_to_use + 1e-9 < netting_notional
             if notional_to_use <= 0.0:
@@ -4630,6 +6160,15 @@ class Trader:
                     ),
                     now_ts=now,
                 )
+                if candidate_id:
+                    self._record_candidate_result(
+                        candidate_id,
+                        action=candidate_action or "ignore",
+                        status="skipped",
+                        rationale=candidate_note or "insufficient_budget",
+                        result_tag="insufficient_budget",
+                        signal=sig,
+                    )
                 continue
 
             if self._is_order_duplicate(sig, notional_to_use):
@@ -4669,6 +6208,15 @@ class Trader:
                     ),
                     now_ts=now,
                 )
+                if candidate_id:
+                    self._record_candidate_result(
+                        candidate_id,
+                        action=candidate_action or "ignore",
+                        status="duplicate_skipped",
+                        rationale=candidate_note or "duplicate_skipped",
+                        result_tag="duplicate_skipped",
+                        signal=sig,
+                    )
                 continue
 
             result = self.broker.execute(sig, notional_to_use)
@@ -4777,6 +6325,7 @@ class Trader:
                         position_snapshot=self._position_trace_snapshot(existing, is_open=bool(existing)),
                         now_ts=now,
                     )
+                    self._refresh_account_state_after_order(result)
                     self.log.info(
                         "POSTED wallet=%s slug=%s token=%s side=%s status=%s notional=%.2f order_id=%s msg=%s",
                         sig.wallet,
@@ -4788,6 +6337,15 @@ class Trader:
                         result.broker_order_id,
                         result.message,
                     )
+                    if candidate_id:
+                        self._record_candidate_result(
+                            candidate_id,
+                            action=candidate_action or "follow",
+                            status="submitted",
+                            rationale=candidate_note or order_reason,
+                            result_tag="order_pending",
+                            signal=sig,
+                        )
                     continue
 
                 qty = result.filled_notional / max(0.01, result.filled_price)
@@ -4814,6 +6372,15 @@ class Trader:
                             ),
                             now_ts=now,
                         )
+                        if candidate_id:
+                            self._record_candidate_result(
+                                candidate_id,
+                                action=candidate_action or "close_all",
+                                status="skipped",
+                                rationale=candidate_note or "position_missing_after_execute",
+                                result_tag="position_missing_after_execute",
+                                signal=sig,
+                            )
                         continue
                     entry_context = self._position_entry_context(existing)
                     hold_minutes = self._position_hold_minutes(existing, now)
@@ -5050,6 +6617,7 @@ class Trader:
                     source_wallet=str(sig.wallet or ""),
                     source="broker_execute",
                 )
+                self._refresh_account_state_after_order(result)
                 self.log.info(
                     "EXEC wallet=%s slug=%s token=%s side=%s score=%.1f tier=%s notional=%.2f px=%.4f order_id=%s msg=%s",
                     sig.wallet,
@@ -5063,6 +6631,16 @@ class Trader:
                     result.broker_order_id,
                     result.message,
                 )
+                if candidate_id:
+                    self._record_candidate_result(
+                        candidate_id,
+                        action=candidate_action or ("close_all" if sig.side == "SELL" else "follow"),
+                        status="executed",
+                        rationale=candidate_note or order_reason,
+                        result_tag="filled",
+                        signal=sig,
+                        pnl_realized=realized_pnl if sig.side == "SELL" else None,
+                    )
             else:
                 now = int(time.time())
                 entry_context = self._position_entry_context(existing)
@@ -5184,12 +6762,22 @@ class Trader:
                     position_snapshot=self._position_trace_snapshot(existing, is_open=bool(existing)),
                     now_ts=now,
                 )
+                if candidate_id:
+                    self._record_candidate_result(
+                        candidate_id,
+                        action=candidate_action or "follow",
+                        status="rejected",
+                        rationale=candidate_note or result.message,
+                        result_tag="order_rejected",
+                        signal=sig,
+                    )
                 self.log.error(
                     "FAIL wallet=%s slug=%s reason=%s",
                     sig.wallet,
                     sig.market_slug,
                     result.message,
                 )
+                self._refresh_account_state_after_order(result)
 
         self._refresh_risk_state()
 

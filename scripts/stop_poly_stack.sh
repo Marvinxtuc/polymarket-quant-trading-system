@@ -53,6 +53,9 @@ kill_patterns() {
 }
 
 echo "Stopping polymarket stack..."
+if [[ -x "$BASE/scripts/stop_monitor_reports.sh" ]]; then
+  "$BASE/scripts/stop_monitor_reports.sh" >/dev/null 2>&1 || true
+fi
 bootout_service "$WEB_LABEL"
 bootout_service "$BOT_LABEL"
 kill_pid_file "$WEB_PID_FILE"
@@ -60,5 +63,6 @@ kill_pid_file "$BOT_PID_FILE"
 kill_patterns
 kill_port
 rm -f "$RUNTIME_DATA/state.json" "$RUNTIME_DATA/state.json.tmp" "$RUNTIME_DATA/poly_web.log" "$RUNTIME_DATA/poly_bot.log"
+rm -f /tmp/poly_public_state.json
 
 echo "Stack stop complete."

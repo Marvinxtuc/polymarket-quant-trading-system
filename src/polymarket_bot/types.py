@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import Literal
 
 Side = Literal["BUY", "SELL"]
+DecisionMode = Literal["manual", "semi_auto", "auto"]
+CandidateAction = Literal["ignore", "watch", "buy_small", "buy_normal", "follow", "close_partial", "close_all"]
 
 
 def _broker_lifecycle_status(
@@ -68,6 +70,91 @@ class Signal:
     exit_wallet_count: int = 0
     position_action: str = ""
     position_action_label: str = ""
+
+
+@dataclass(slots=True)
+class CandidateReasonFactor:
+    key: str
+    label: str
+    value: str
+    direction: str = "neutral"
+    weight: float = 0.0
+    detail: str = ""
+
+
+@dataclass(slots=True)
+class Candidate:
+    id: str
+    signal_id: str
+    trace_id: str
+    wallet: str
+    market_slug: str
+    token_id: str
+    outcome: str
+    side: Side
+    confidence: float
+    wallet_tag: str = ""
+    wallet_score: float = 0.0
+    wallet_tier: str = "LOW"
+    condition_id: str = ""
+    trigger_type: str = ""
+    source_wallet_count: int = 1
+    observed_notional: float = 0.0
+    observed_size: float = 0.0
+    source_avg_price: float = 0.0
+    current_best_bid: float | None = None
+    current_best_ask: float | None = None
+    current_midpoint: float | None = None
+    spread_pct: float | None = None
+    momentum_5m: float | None = None
+    momentum_30m: float | None = None
+    chase_pct: float | None = None
+    market_tag: str = ""
+    resolution_bucket: str = ""
+    score: float = 0.0
+    suggested_action: str = ""
+    skip_reason: str | None = None
+    recommendation_reason: str = ""
+    explanation: list[str] = field(default_factory=list)
+    reason_factors: list[CandidateReasonFactor] = field(default_factory=list)
+    has_existing_position: bool = False
+    existing_position_conflict: bool = False
+    existing_position_notional: float = 0.0
+    status: str = "pending"
+    selected_action: str = ""
+    created_ts: int = 0
+    expires_ts: int = 0
+    updated_ts: int = 0
+    note: str = ""
+    signal_snapshot: dict[str, object] = field(default_factory=dict)
+    topic_snapshot: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class WalletProfile:
+    wallet: str
+    tag: str = ""
+    trust_score: float = 0.0
+    followability_score: float = 0.0
+    avg_hold_minutes: float | None = None
+    category: str = ""
+    enabled: bool = True
+    notes: str = ""
+    updated_ts: int = 0
+    payload: dict[str, object] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class JournalEntry:
+    candidate_id: str
+    action: str
+    rationale: str = ""
+    result_tag: str | None = None
+    created_ts: int = 0
+    market_slug: str = ""
+    wallet: str = ""
+    pnl_realized: float | None = None
+    payload: dict[str, object] = field(default_factory=dict)
 
 
 @dataclass(slots=True)

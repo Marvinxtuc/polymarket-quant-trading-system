@@ -2,6 +2,7 @@
   const $ = (id) => document.getElementById(id);
   const FRONTEND_REFRESH_SECONDS = 5;
   const controlState = {
+    decision_mode: "manual",
     pause_opening: false,
     reduce_only: false,
     emergency_stop: false,
@@ -13,11 +14,28 @@
     selectedTraceId: "poly.selectedTraceId",
     selectedSignalCycleId: "poly.selectedSignalCycleId",
     selectedAttributionWindow: "poly.selectedAttributionWindow",
+    selectedCandidateId: "poly.selectedCandidateId",
+    candidateQueueFilter: "poly.candidateQueueFilter",
+    candidateFiltersExpanded: "poly.candidateFiltersExpanded",
+    workspaceView: "poly.workspaceView",
+    candidateFocusView: "poly.candidateFocusView",
+  };
+  const CANDIDATE_FILTER_DEFAULTS = {
+    search: "",
+    status: "all",
+    action: "all",
+    side: "all",
+    sort: "score_desc",
   };
   let selectedWallet = "";
   let selectedTraceId = "";
   let selectedSignalCycleId = "";
   let selectedAttributionWindow = "24h";
+  let selectedCandidateId = "";
+  let candidateQueueFilter = { ...CANDIDATE_FILTER_DEFAULTS };
+  let candidateFiltersExpanded = false;
+  let workspaceView = "overview";
+  let candidateFocusView = "summary";
   let selectedDiagnosticFocusKind = "";
   let selectedDiagnosticFocusKey = "";
   const exitReviewFilter = {
@@ -72,6 +90,93 @@
     ledger_summary: {},
     recommendations: [],
   };
+  const EMPTY_DECISION_MODE = {
+    mode: "manual",
+    updated_ts: 0,
+    updated_by: "",
+    note: "",
+    available_modes: ["manual", "semi_auto", "auto"],
+  };
+  const EMPTY_CANDIDATES = {
+    summary: {
+      count: 0,
+      pending: 0,
+      approved: 0,
+      watched: 0,
+      executed: 0,
+    },
+    items: [],
+  };
+  const EMPTY_CANDIDATE_DETAIL = {
+    candidate: {},
+    related_actions: [],
+    related_journal: [],
+    trace: {},
+    related_cycles: [],
+    decision_chain: [],
+    orders: [],
+    timeline: [],
+    summary: {
+      related_action_count: 0,
+      related_journal_count: 0,
+      order_count: 0,
+      decision_chain_count: 0,
+      cycle_count: 0,
+      trace_found: false,
+    },
+  };
+  const EMPTY_WALLET_PROFILES = {
+    summary: {
+      count: 0,
+      enabled: 0,
+    },
+    items: [],
+  };
+  const EMPTY_NOTIFIER = {
+    local_available: false,
+    webhook_configured: false,
+    telegram_configured: false,
+    channels: [],
+    delivery_stats: {
+      event_count: 0,
+      delivery_count: 0,
+      ok_events: 0,
+      failed_events: 0,
+      by_channel: {},
+    },
+    recent: [],
+    last: {},
+    updated_ts: 0,
+  };
+  const EMPTY_JOURNAL = {
+    days: 30,
+    total_entries: 0,
+    execution_actions: 0,
+    watch_actions: 0,
+    ignore_actions: 0,
+    updated_ts: 0,
+    recent: [],
+    notes: [],
+  };
+  let lastDecisionCandidates = EMPTY_CANDIDATES;
+  let lastDecisionMode = EMPTY_DECISION_MODE;
+  let lastDecisionApiState = {
+    candidates: { ok: true, error: "" },
+    mode: { ok: true, error: "" },
+  };
+  let lastCandidateDetail = EMPTY_CANDIDATE_DETAIL;
+  let lastCandidateDetailApiState = { ok: true, error: "", candidateId: "", pending: false };
+  let candidateDetailRequestSeq = 0;
+  let lastWalletProfiles = EMPTY_WALLET_PROFILES;
+  let lastWalletProfilesApiState = { ok: true, error: "" };
+  let lastNotifierSummary = EMPTY_NOTIFIER;
+  let lastJournalSummary = EMPTY_JOURNAL;
+  let lastJournalApiState = { ok: true, error: "" };
+  const candidateRequestState = Object.create(null);
+  const walletProfileDrafts = Object.create(null);
+  const walletProfileRequestState = Object.create(null);
+  let decisionConsoleNotice = { cls: "wait", text: "等待 candidates / mode 数据..." };
+  let journalComposerNotice = { cls: "wait", text: "支持快速写一句理由" };
 
   function loadUiState() {
     try {
@@ -88,6 +193,25 @@
       selectedTraceId = String(window.localStorage.getItem(STORAGE_KEYS.selectedTraceId) || "");
       selectedSignalCycleId = String(window.localStorage.getItem(STORAGE_KEYS.selectedSignalCycleId) || "");
       selectedAttributionWindow = String(window.localStorage.getItem(STORAGE_KEYS.selectedAttributionWindow) || "24h");
+      selectedCandidateId = String(window.localStorage.getItem(STORAGE_KEYS.selectedCandidateId) || "");
+      candidateFiltersExpanded = window.localStorage.getItem(STORAGE_KEYS.candidateFiltersExpanded) === "1";
+      workspaceView = String(window.localStorage.getItem(STORAGE_KEYS.workspaceView) || "overview");
+      candidateFocusView = String(window.localStorage.getItem(STORAGE_KEYS.candidateFocusView) || "summary");
+      if (!["overview", "wallets", "ops", "review"].includes(workspaceView)) workspaceView = "overview";
+      if (!["summary", "detail"].includes(candidateFocusView)) candidateFocusView = "summary";
+      const rawCandidateFilter = window.localStorage.getItem(STORAGE_KEYS.candidateQueueFilter);
+      if (rawCandidateFilter) {
+        const parsed = JSON.parse(rawCandidateFilter);
+        if (parsed && typeof parsed === "object") {
+          candidateQueueFilter = {
+            search: String(parsed.search || "").trim(),
+            status: String(parsed.status || "all").trim() || "all",
+            action: String(parsed.action || "all").trim() || "all",
+            side: String(parsed.side || "all").trim() || "all",
+            sort: String(parsed.sort || "score_desc").trim() || "score_desc",
+          };
+        }
+      }
     } catch (_err) {
       // ignore storage failures
     }
@@ -107,6 +231,20 @@
       window.localStorage.setItem(STORAGE_KEYS.selectedTraceId, String(selectedTraceId || ""));
       window.localStorage.setItem(STORAGE_KEYS.selectedSignalCycleId, String(selectedSignalCycleId || ""));
       window.localStorage.setItem(STORAGE_KEYS.selectedAttributionWindow, String(selectedAttributionWindow || "24h"));
+      window.localStorage.setItem(STORAGE_KEYS.selectedCandidateId, String(selectedCandidateId || ""));
+      window.localStorage.setItem(STORAGE_KEYS.candidateFiltersExpanded, candidateFiltersExpanded ? "1" : "0");
+      window.localStorage.setItem(STORAGE_KEYS.workspaceView, String(workspaceView || "overview"));
+      window.localStorage.setItem(STORAGE_KEYS.candidateFocusView, String(candidateFocusView || "summary"));
+      window.localStorage.setItem(
+        STORAGE_KEYS.candidateQueueFilter,
+        JSON.stringify({
+          search: String(candidateQueueFilter.search || "").trim(),
+          status: String(candidateQueueFilter.status || "all").trim() || "all",
+          action: String(candidateQueueFilter.action || "all").trim() || "all",
+          side: String(candidateQueueFilter.side || "all").trim() || "all",
+          sort: String(candidateQueueFilter.sort || "score_desc").trim() || "score_desc",
+        })
+      );
     } catch (_err) {
       // ignore storage failures
     }
@@ -116,6 +254,73 @@
     const v = Number(n || 0);
     const sign = showSign && v > 0 ? "+" : "";
     return `${sign}$${v.toFixed(2)}`;
+  }
+
+  function workspaceViewLabel(value) {
+    const key = String(value || "").trim().toLowerCase();
+    if (key === "wallets") return "钱包";
+    if (key === "ops") return "监控";
+    if (key === "review") return "复盘";
+    return "总览";
+  }
+
+  function candidateFocusViewLabel(value) {
+    return String(value || "").trim().toLowerCase() === "detail" ? "完整复盘" : "候选解读";
+  }
+
+  function renderWorkspaceShell() {
+    const root = document.querySelector(".console");
+    if (root) root.dataset.workspaceView = workspaceView;
+    const metaEl = $("workspace-meta");
+    if (metaEl) {
+      const copy = {
+        overview: "当前视图：总览，聚焦当下决策、持仓、订单和最关键告警。",
+        wallets: "当前视图：钱包，集中看核心钱包池、画像、评分与来源质量。",
+        ops: "当前视图：监控，集中看 startup、monitor、对账、风险和运行状态。",
+        review: "当前视图：复盘，集中看归档、日记、信号回放、归因和退出样本。",
+      };
+      metaEl.textContent = copy[workspaceView] || copy.overview;
+    }
+    const nav = $("workspace-nav");
+    if (nav) {
+      nav.querySelectorAll("[data-workspace-view]").forEach((button) => {
+        button.classList.toggle("active", String(button.getAttribute("data-workspace-view") || "") === workspaceView);
+      });
+    }
+  }
+
+  function renderCandidateFocusViewSwitch() {
+    const switchEl = $("candidate-focus-view-switch");
+    if (switchEl) {
+      switchEl.querySelectorAll("[data-candidate-focus-view]").forEach((button) => {
+        button.classList.toggle("active", String(button.getAttribute("data-candidate-focus-view") || "") === candidateFocusView);
+      });
+    }
+    document.querySelectorAll("[data-candidate-focus-view-panel]").forEach((panel) => {
+      panel.classList.toggle("active", String(panel.getAttribute("data-candidate-focus-view-panel") || "") === candidateFocusView);
+    });
+  }
+
+  function renderCandidateFilterToggle() {
+    const filtersEl = $("candidate-toolbar-filters");
+    if (filtersEl) {
+      filtersEl.classList.toggle("is-expanded", !!candidateFiltersExpanded);
+    }
+    const toggleBtn = $("candidate-toggle-filters");
+    if (toggleBtn) {
+      toggleBtn.textContent = candidateFiltersExpanded ? "收起筛选" : "展开筛选";
+      toggleBtn.classList.toggle("active", !!candidateFiltersExpanded);
+      toggleBtn.setAttribute("aria-expanded", candidateFiltersExpanded ? "true" : "false");
+    }
+  }
+
+  function escapeHtml(value) {
+    return String(value ?? "")
+      .replaceAll("&", "&amp;")
+      .replaceAll("<", "&lt;")
+      .replaceAll(">", "&gt;")
+      .replaceAll('"', "&quot;")
+      .replaceAll("'", "&#39;");
   }
 
   function fmtPct(n, digits = 2) {
@@ -168,6 +373,117 @@
     const days = Math.floor(hours / 24);
     const hourRem = hours % 24;
     return hourRem > 0 ? `${days}d ${hourRem}h` : `${days}d`;
+  }
+
+  function csvEscape(value) {
+    const text = String(value ?? "");
+    if (/[",\n]/.test(text)) {
+      return `"${text.replaceAll('"', '""')}"`;
+    }
+    return text;
+  }
+
+  function downloadText(filename, content, mime = "text/plain;charset=utf-8") {
+    const blob = new Blob([String(content ?? "")], { type: mime });
+    const url = window.URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.style.display = "none";
+    document.body.appendChild(link);
+    link.click();
+    window.setTimeout(() => {
+      window.URL.revokeObjectURL(url);
+      link.remove();
+    }, 0);
+  }
+
+  function downloadJson(filename, payload) {
+    downloadText(filename, JSON.stringify(payload ?? {}, null, 2), "application/json;charset=utf-8");
+  }
+
+  function downloadCsv(filename, rows, columns) {
+    const header = (columns || []).map((col) => csvEscape(col.label || col.key)).join(",");
+    const body = (Array.isArray(rows) ? rows : [])
+      .map((row) => (columns || []).map((col) => csvEscape(col.value(row))).join(","))
+      .join("\n");
+    downloadText(filename, [header, body].filter(Boolean).join("\n"), "text/csv;charset=utf-8");
+  }
+
+  function candidateKey(candidate) {
+    return String(candidate && (candidate.id || candidate.signal_id || candidate.trace_id || candidate.market_slug || "") || "");
+  }
+
+  function selectedCandidate(payload) {
+    const items = Array.isArray(payload && payload.items) ? payload.items : [];
+    if (items.length <= 0) return null;
+    const target = String(selectedCandidateId || "");
+    const selected = items.find((candidate) => candidateKey(candidate) === target);
+    return selected || items[0] || null;
+  }
+
+  function filteredCandidatePayload(payload) {
+    const source = payload && typeof payload === "object" ? payload : EMPTY_CANDIDATES;
+    const allItems = Array.isArray(source.items) ? source.items.slice(0, 32) : [];
+    const filteredItems = candidateSortCandidates(
+      allItems.filter((candidate) => candidateMatchesQueueFilter(candidate, candidateQueueFilter)),
+      candidateQueueFilter.sort
+    );
+    return {
+      allItems,
+      filteredItems,
+      visiblePayload: { ...source, items: filteredItems },
+    };
+  }
+
+  function candidateDetailMatches(candidate, detailPayload) {
+    if (!candidate || typeof candidate !== "object" || !detailPayload || typeof detailPayload !== "object") return false;
+    const detailCandidate = detailPayload.candidate && typeof detailPayload.candidate === "object" ? detailPayload.candidate : {};
+    const detailId = candidateKey(detailCandidate);
+    const currentId = candidateKey(candidate);
+    if (detailId && currentId && detailId === currentId) return true;
+    const detailTrace = String(detailCandidate.trace_id || detailPayload.trace && detailPayload.trace.trace_id || "").trim();
+    const currentTrace = String(candidate.trace_id || "").trim();
+    if (detailTrace && currentTrace && detailTrace === currentTrace) return true;
+    const detailSignal = String(detailCandidate.signal_id || "").trim();
+    const currentSignal = String(candidate.signal_id || "").trim();
+    if (detailSignal && currentSignal && detailSignal === currentSignal) return true;
+    return false;
+  }
+
+  async function loadCandidateDetail(candidateId, { force = false } = {}) {
+    const normalizedId = String(candidateId || "").trim();
+    const currentDetailId = String(lastCandidateDetailApiState.candidateId || "").trim();
+    if (!normalizedId) {
+      lastCandidateDetail = EMPTY_CANDIDATE_DETAIL;
+      lastCandidateDetailApiState = { ok: true, error: "", candidateId: "", pending: false };
+      return lastCandidateDetail;
+    }
+    if (
+      !force &&
+      !lastCandidateDetailApiState.pending &&
+      currentDetailId === normalizedId &&
+      candidateDetailMatches({ id: normalizedId, signal_id: normalizedId, trace_id: normalizedId }, lastCandidateDetail)
+    ) {
+      return lastCandidateDetail;
+    }
+    const requestSeq = ++candidateDetailRequestSeq;
+    lastCandidateDetailApiState = {
+      ok: lastCandidateDetailApiState.ok,
+      error: "",
+      candidateId: normalizedId,
+      pending: true,
+    };
+    const result = await fetchJsonState(`/api/candidates/${encodeURIComponent(normalizedId)}`, EMPTY_CANDIDATE_DETAIL);
+    if (requestSeq !== candidateDetailRequestSeq) return lastCandidateDetail;
+    lastCandidateDetail = result && result.data ? result.data : EMPTY_CANDIDATE_DETAIL;
+    lastCandidateDetailApiState = {
+      ok: !!(result && result.ok),
+      error: String(result && result.error || ""),
+      candidateId: normalizedId,
+      pending: false,
+    };
+    return lastCandidateDetail;
   }
 
   function replaceRows(tbody, rows, fallbackRow) {
@@ -351,6 +667,1798 @@
     return "ready";
   }
 
+  function recommendationLabel(text, fallbackStatus = "") {
+    return reportDecisionMeta(text, fallbackStatus)[1];
+  }
+
+  function reportGeneratedTs(report) {
+    const payload = report && typeof report === "object" ? report : {};
+    return Number(payload.generated_ts || 0);
+  }
+
+  function reportFreshnessMeta(report, windowSeconds, now) {
+    const generatedTs = reportGeneratedTs(report);
+    const currentTs = Number(now || 0);
+    const ageSeconds = generatedTs > 0 && currentTs > 0 ? Math.max(0, currentTs - generatedTs) : 0;
+    const windowSec = Math.max(0, Number(windowSeconds || 0));
+    const staleThreshold = windowSec > 0
+      ? Math.max(600, windowSec + Math.max(600, Math.floor(windowSec / 10)))
+      : 3600;
+    const stale = generatedTs <= 0 || ageSeconds >= staleThreshold;
+    return {
+      generatedTs,
+      ageSeconds,
+      ageLabel: generatedTs > 0 ? historyAgeLabel(generatedTs, currentTs || generatedTs) : "未生成",
+      stale,
+    };
+  }
+
+  function inconclusiveWindowLabel(report) {
+    const payload = report && typeof report === "object" ? report : {};
+    const count = Number(payload.consecutive_inconclusive_windows || 0);
+    return count > 0 ? `INCONCLUSIVE x${count}` : "INCONCLUSIVE";
+  }
+
+  function monitorWindowSummary(report) {
+    const payload = report && typeof report === "object" ? report : {};
+    const finalText = String(payload.final_recommendation || "").trim();
+    const rawText = String(payload.recommendation || "").trim();
+    const sampleStatus = String(payload.sample_status || "").trim().toUpperCase();
+    const finalLabel = recommendationLabel(finalText, payload.reconciliation_status || payload.sample_status || "unknown");
+    const rawLabel = sampleStatus === "INCONCLUSIVE"
+      ? inconclusiveWindowLabel(payload)
+      : rawText
+        ? recommendationLabel(rawText, payload.sample_status || payload.reconciliation_status || "unknown")
+        : "";
+    if (finalText) {
+      if (rawLabel && rawText !== finalText) return `${finalLabel} · ${rawLabel}`;
+      return finalText;
+    }
+    if (rawLabel) return rawLabel;
+    return sampleStatus || "unknown";
+  }
+
+  function monitorWindowDisplaySummary(report, windowSeconds, now) {
+    const summary = monitorWindowSummary(report);
+    const freshness = reportFreshnessMeta(report, windowSeconds, now);
+    const suffix = freshness.ageLabel;
+    return freshness.stale && freshness.generatedTs > 0
+      ? `${summary} · ${suffix} · STALE`
+      : `${summary} · ${suffix}`;
+  }
+
+  function reconciliationStatusSummary(reconciliation, eodReport) {
+    const live = reconciliation && typeof reconciliation === "object" ? reconciliation : {};
+    const eod = eodReport && typeof eodReport === "object" ? eodReport : {};
+    const status = String(live.status || eod.status || "unknown");
+    const liveIssues = Array.isArray(live.issues) ? live.issues.filter((item) => String(item || "").trim()) : [];
+    const eodIssues = Array.isArray(eod.issues) ? eod.issues.filter((item) => String(item || "").trim()) : [];
+    const issues = liveIssues.length > 0 ? liveIssues : eodIssues;
+    return issues.length > 0 ? `${status} · ${String(issues[0])}` : status;
+  }
+
+  function modeLabel(mode) {
+    const value = String(mode || "").trim().toLowerCase();
+    if (value === "manual") return "手动";
+    if (value === "semi_auto") return "半自动";
+    if (value === "auto") return "自动";
+    return value || "未知";
+  }
+
+  function candidateStatusMeta(status) {
+    const value = String(status || "").trim().toLowerCase();
+    if (value === "approved" || value === "queued") return ["wait", value === "queued" ? "已排队" : "已批准"];
+    if (value === "watched") return ["cancel", "观察中"];
+    if (value === "executed") return ["ok", "已执行"];
+    if (value === "submitted") return ["wait", "已发单"];
+    if (value === "rejected" || value === "risk_rejected") return ["danger", "已拒绝"];
+    if (value === "ignored") return ["cancel", "已忽略"];
+    if (value === "expired") return ["cancel", "已过期"];
+    return ["wait", value ? value.toUpperCase() : "待处理"];
+  }
+
+  function candidateActionText(action, side) {
+    const value = String(action || "").trim().toLowerCase();
+    if (value === "ignore") return "忽略";
+    if (value === "watch") return "观察";
+    if (value === "buy_small") return "小仓跟随";
+    if (value === "buy_normal") return "正常跟随";
+    if (value === "follow") return side === "SELL" ? "立即跟随退出" : "直接跟随";
+    if (value === "close_partial") return "减仓";
+    if (value === "close_all") return "清仓";
+    return value || "处理";
+  }
+
+  const CANDIDATE_ACTION_INTERACTIVE_STATUSES = new Set(["pending", "queued", "approved", "watched", "submitted"]);
+
+  function candidateIsActionable(status) {
+    const value = String(status || "pending").trim().toLowerCase();
+    return CANDIDATE_ACTION_INTERACTIVE_STATUSES.has(value);
+  }
+
+  function candidatePrimaryAction(candidate, side) {
+    const status = candidateStatusValue(candidate);
+    const action = candidateActionValue(candidate);
+    const actionValue = String(action || "").trim().toLowerCase();
+    const normalizedSide = String(side || "BUY").trim().toUpperCase();
+    if (!candidateIsActionable(status)) return "";
+    if (actionValue && actionValue !== "watch" && actionValue !== "ignore") return actionValue;
+    return normalizedSide === "SELL" ? "close_all" : "follow";
+  }
+
+  function candidateCardActionButtons(candidate, side) {
+    const status = candidateStatusValue(candidate);
+    const canOperate = candidateIsActionable(status);
+    const primary = canOperate ? candidatePrimaryAction(candidate, side) : "";
+    if (!canOperate) {
+      return {
+        canOperate,
+        primary,
+        secondary: [],
+      };
+    }
+
+    const actions = [
+      { action: "watch", label: "观察", cls: "subtle" },
+      { action: "ignore", label: "忽略", cls: "ghost" },
+    ];
+    const filtered = [];
+    for (const item of actions) {
+      const shouldHide = primary && String(item.action || "") === String(primary || "");
+      if (shouldHide) continue;
+      filtered.push(item);
+    }
+    return {
+      canOperate,
+      primary,
+      secondary: filtered,
+    };
+  }
+
+  function candidateStatusValue(candidate) {
+    const values = [
+      candidate && candidate.review_status,
+      candidate && candidate.status,
+      candidate && candidate.final_status,
+    ];
+    for (const raw of values) {
+      const value = String(raw || "").trim().toLowerCase();
+      if (!value) continue;
+      if (["pending", "approved", "watched", "executed", "ignored", "rejected", "expired", "queued"].includes(value)) {
+        return value;
+      }
+    }
+    return "pending";
+  }
+
+  function candidateActionValue(candidate) {
+    const values = [
+      candidate && candidate.review_action,
+      candidate && candidate.selected_action,
+      candidate && candidate.suggested_action,
+      candidate && candidate.action,
+    ];
+    for (const raw of values) {
+      const value = String(raw || "").trim().toLowerCase();
+      if (value) return value;
+    }
+    return "";
+  }
+
+  function candidateSearchText(candidate) {
+    if (!candidate || typeof candidate !== "object") return "";
+    const values = [
+      candidate.id,
+      candidate.signal_id,
+      candidate.trace_id,
+      candidate.wallet,
+      candidate.wallet_tag,
+      candidate.wallet_tier,
+      candidate.market_slug,
+      candidate.token_id,
+      candidate.condition_id,
+      candidate.outcome,
+      candidate.side,
+      candidate.trigger_type,
+      candidate.market_tag,
+      candidate.resolution_bucket,
+      candidate.suggested_action,
+      candidate.selected_action,
+      candidate.review_action,
+      candidate.status,
+      candidate.review_status,
+      candidate.final_status,
+      candidate.skip_reason,
+      candidate.recommendation_reason,
+      candidate.note,
+      candidate.wallet_score_summary,
+      candidate.action_label,
+      candidate.review_note,
+    ];
+    const reasonFactors = Array.isArray(candidate.reason_factors) ? candidate.reason_factors : [];
+    for (const factor of reasonFactors) {
+      if (!factor || typeof factor !== "object") continue;
+      values.push(factor.key, factor.label, factor.value, factor.detail);
+    }
+    const explain = Array.isArray(candidate.explanation) ? candidate.explanation : [];
+    for (const item of explain) {
+      if (!item || typeof item !== "object") continue;
+      values.push(item.label, item.value);
+    }
+    const snapshots = [
+      candidate.signal_snapshot,
+      candidate.topic_snapshot,
+      candidate.decision_snapshot,
+      candidate.order_snapshot,
+      candidate.position_snapshot,
+    ];
+    for (const snap of snapshots) {
+      if (!snap || typeof snap !== "object") continue;
+      for (const [key, value] of Object.entries(snap)) {
+        values.push(key, value);
+      }
+    }
+    return values
+      .flatMap((value) => {
+        if (value == null) return [];
+        if (Array.isArray(value)) return value;
+        if (typeof value === "object") return [JSON.stringify(value)];
+        return [String(value)];
+      })
+      .join(" ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+  }
+
+  function candidateMatchesQueueFilter(candidate, filters) {
+    const search = String(filters && filters.search || "").trim().toLowerCase();
+    if (search) {
+      const haystack = candidateSearchText(candidate);
+      if (!haystack.includes(search)) return false;
+    }
+    const statusFilter = String(filters && filters.status || "all").trim().toLowerCase();
+    if (statusFilter && statusFilter !== "all" && candidateStatusValue(candidate) !== statusFilter) return false;
+    const actionFilter = String(filters && filters.action || "all").trim().toLowerCase();
+    if (actionFilter && actionFilter !== "all") {
+      const actionValue = candidateActionValue(candidate);
+      if (actionValue !== actionFilter) return false;
+    }
+    const sideFilter = String(filters && filters.side || "all").trim().toUpperCase();
+    if (sideFilter && sideFilter !== "ALL" && String(candidate && candidate.side || "").trim().toUpperCase() !== sideFilter) return false;
+    return true;
+  }
+
+  function candidateSortValue(candidate, key) {
+    const valueKey = String(key || "score_desc").trim().toLowerCase();
+    if (valueKey === "freshness_desc") return Number(candidate.updated_ts || candidate.created_ts || candidate.signal_ts || 0);
+    if (valueKey === "confidence_desc") return Number(candidate.confidence || 0);
+    if (valueKey === "wallet_score_desc") return Number(candidate.wallet_score || 0);
+    if (valueKey === "observed_notional_desc") return Number(candidate.observed_notional || 0);
+    return Number(candidate.score || 0);
+  }
+
+  function candidateSortCandidates(items, key) {
+    const sortKey = String(key || "score_desc").trim().toLowerCase();
+    const desc = true;
+    return Array.isArray(items)
+      ? items.slice().sort((left, right) => {
+          const leftValue = candidateSortValue(left, sortKey);
+          const rightValue = candidateSortValue(right, sortKey);
+          if (rightValue !== leftValue) return desc ? rightValue - leftValue : leftValue - rightValue;
+          const leftTs = Number(left.updated_ts || left.created_ts || 0);
+          const rightTs = Number(right.updated_ts || right.created_ts || 0);
+          if (rightTs !== leftTs) return rightTs - leftTs;
+          return String(candidateKey(left)).localeCompare(String(candidateKey(right)));
+        })
+      : [];
+  }
+
+  function candidateSortLabel(key) {
+    const value = String(key || "").trim().toLowerCase();
+    if (value === "freshness_desc") return "新鲜度";
+    if (value === "confidence_desc") return "置信度";
+    if (value === "wallet_score_desc") return "钱包分";
+    if (value === "observed_notional_desc") return "观察金额";
+    return "综合评分";
+  }
+
+  function candidateFilterLabel(kind, value) {
+    const rawKind = String(kind || "").trim().toLowerCase();
+    const rawValue = String(value || "all").trim().toLowerCase();
+    if (rawValue === "all" || !rawValue) return "全部";
+    if (rawKind === "status") {
+      const map = {
+        pending: "待处理",
+        approved: "已批准",
+        watched: "观察中",
+        executed: "已执行",
+        ignored: "已忽略",
+        rejected: "已拒绝",
+        expired: "已过期",
+        queued: "已排队",
+      };
+      return map[rawValue] || rawValue;
+    }
+    if (rawKind === "action") {
+      const map = {
+        ignore: "忽略",
+        watch: "观察",
+        buy_small: "小仓",
+        buy_normal: "正常",
+        follow: "跟随",
+        close_partial: "减仓",
+        close_all: "清仓",
+      };
+      return map[rawValue] || rawValue;
+    }
+    if (rawKind === "side") {
+      if (rawValue === "buy") return "BUY";
+      if (rawValue === "sell") return "SELL";
+      return rawValue.toUpperCase();
+    }
+    return rawValue;
+  }
+
+  function candidateFilterSummary(filters, visibleCount, totalCount) {
+    const search = String(filters && filters.search || "").trim();
+    const status = String(filters && filters.status || "all").trim();
+    const action = String(filters && filters.action || "all").trim();
+    const side = String(filters && filters.side || "all").trim();
+    const parts = [
+      `显示 ${visibleCount}/${totalCount}`,
+      `状态 ${candidateFilterLabel("status", status)}`,
+      `动作 ${candidateFilterLabel("action", action)}`,
+      `侧别 ${candidateFilterLabel("side", side)}`,
+      `排序 ${candidateSortLabel(filters && filters.sort)}`,
+    ];
+    if (search) parts.unshift(`搜索 "${search}"`);
+    return parts.join(" · ");
+  }
+
+  function candidateSummaryCounts(items) {
+    const summary = {
+      pending: 0,
+      approved: 0,
+      watched: 0,
+      executed: 0,
+      ignored: 0,
+      rejected: 0,
+      expired: 0,
+    };
+    for (const item of Array.isArray(items) ? items : []) {
+      const status = candidateStatusValue(item);
+      if (Object.prototype.hasOwnProperty.call(summary, status)) {
+        summary[status] += 1;
+      } else if (status === "queued") {
+        summary.approved += 1;
+      }
+    }
+    return summary;
+  }
+
+  function candidateReviewTrail(candidate, side) {
+    const status = candidateStatusValue(candidate);
+    const action = candidateActionValue(candidate) || String(candidate.suggested_action || "").trim().toLowerCase();
+    const reasonText = String(candidate.recommendation_reason || candidate.skip_reason || candidate.note || "").trim();
+    const reviewAction = String(candidate.review_action || "").trim().toLowerCase();
+    const reviewStatus = String(candidate.review_status || "").trim().toLowerCase();
+    const reviewNote = String(candidate.review_note || "").trim();
+    const signalTs = Number(candidate.signal_snapshot && candidate.signal_snapshot.timestamp ? Date.parse(candidate.signal_snapshot.timestamp) / 1000 : 0);
+    const createdTs = Number(candidate.created_ts || 0);
+    const updatedTs = Number(candidate.updated_ts || 0);
+    const expiresTs = Number(candidate.expires_ts || 0);
+    const trail = [];
+    trail.push({
+      label: "发现",
+      value: `${shortWallet(candidate.wallet)} · ${candidate.trigger_type || "wallet_event"}`,
+      detail: `${candidate.source_wallet_count || 1} 个钱包触发 · ${candidate.wallet_tier || "WATCH"}`,
+      tone: candidate.source_wallet_count > 1 ? "positive" : "warn",
+    });
+    trail.push({
+      label: "富化",
+      value: `${candidate.market_tag || "market"} · ${candidate.resolution_bucket || "unbucketed"}`,
+      detail: `${candidate.market_slug || candidate.token_id || "-"} · ${candidate.condition_id || "no condition"}`,
+      tone: candidate.market_tag ? "positive" : "neutral",
+    });
+    trail.push({
+      label: "评分",
+      value: `score ${Number(candidate.score || 0).toFixed(1)} · wallet ${Number(candidate.wallet_score || 0).toFixed(1)} · conf ${fmtPct(Number(candidate.confidence || 0) * 100, 0)}`,
+      detail: `${candidate.source_avg_price ? `来源均价 ${Number(candidate.source_avg_price).toFixed(3)}` : "无来源均价"} · ${candidateActionText(action, side)}`,
+      tone: candidate.score >= 75 ? "positive" : candidate.score < 50 ? "danger" : "warn",
+    });
+    trail.push({
+      label: "盘口",
+      value: candidateOrderbookSummary(candidate),
+      detail: `spread ${candidate.spread_pct == null ? "--" : fmtPct(candidate.spread_pct, 1)} · chase ${candidate.chase_pct == null ? "--" : fmtPct(candidate.chase_pct, 1)}`,
+      tone: Number(candidate.chase_pct || 0) > 4 || Number(candidate.spread_pct || 0) > 6 ? "danger" : "neutral",
+    });
+    trail.push({
+      label: "决策",
+      value: candidateActionText(candidate.suggested_action, side),
+      detail: reasonText || candidate.recommendation_reason || "等待解释",
+      tone: candidateExplainTone(candidateExplainTitle(candidate)),
+    });
+    trail.push({
+      label: "复盘",
+      value: reviewAction ? candidateActionText(reviewAction, side) : reviewStatus || "waiting",
+      detail: `${reviewStatus || "waiting"}${reviewNote ? ` · ${reviewNote}` : ""}`,
+      tone: reviewStatus === "executed" ? "positive" : reviewStatus === "ignored" ? "cancel" : reviewStatus === "pending" ? "warn" : "neutral",
+    });
+    trail.push({
+      label: "生命周期",
+      value: `${status}${expiresTs > 0 ? ` · ${fmtAge(Math.max(0, expiresTs - Math.floor(Date.now() / 1000)))}` : ""}`,
+      detail: `${createdTs > 0 ? `创建 ${fmtDateTime(createdTs)}` : "创建时间未知"}${updatedTs > 0 ? ` · 更新 ${fmtDateTime(updatedTs)}` : ""}${signalTs > 0 ? ` · signal ${fmtDateTime(signalTs)}` : ""}`,
+      tone: status === "executed" ? "positive" : status === "rejected" || status === "ignored" ? "danger" : "warn",
+    });
+    return trail;
+  }
+
+  function humanizeReason(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return "";
+    const labels = {
+      pause_opening: "已暂停开仓",
+      reduce_only: "当前处于只减仓模式",
+      token_add_cooldown: "命中加仓冷却",
+      sell_already_processed_this_cycle: "本轮已处理过卖出",
+      no_open_position: "当前没有可退出仓位",
+      entry_wallet_mismatch: "来源钱包与当前仓位不一致",
+      insufficient_budget: "可用预算不足",
+      wallet_score_gate: "钱包评分未过跟随阈值",
+      position_missing_after_execute: "执行后未能确认仓位",
+      market_data_unavailable: "当前没有可交易盘口",
+      spread_too_wide: "盘口 spread 过宽",
+      chase_too_high: "追价成本过高",
+      price_out_of_band: "价格不在允许区间内",
+      invalid_notional: "下单金额不满足限制",
+      duplicate_signal: "同轮重复信号",
+      risk_rejected: "风控拒绝",
+      pending_order_exists: "已有进行中的相关订单",
+      netting_limited: "同条件暴露已接近上限",
+    };
+    if (labels[raw]) return labels[raw];
+    return raw.replaceAll("_", " ");
+  }
+
+  function candidateGateReason(candidate) {
+    const skipReason = humanizeReason(candidateField(candidate, "skip_reason") || candidate.skip_reason);
+    const riskReason = humanizeReason(candidateField(candidate, "risk_reason") || candidate.risk_reason);
+    return skipReason || riskReason || "";
+  }
+
+  function candidateGateState(candidate, side) {
+    const reason = candidateGateReason(candidate);
+    if (!reason) {
+      return {
+        gated: false,
+        label: "已通过门禁",
+        detail: "当前可以进入执行层",
+        tone: "positive",
+        score: Number(candidateField(candidate, "score") || candidate.score || 0),
+      };
+    }
+
+    const score = Number(candidateField(candidate, "score") || candidate.score || 0);
+    const highScore = score >= 70;
+    const suggested = String(candidateField(candidate, "suggested_action") || candidate.suggested_action || "").trim().toLowerCase();
+    const action = candidateActionText(suggested || candidate.suggested_action, side);
+    return {
+      gated: true,
+      label: highScore ? "高分但被门禁拦住" : "当前不可执行",
+      detail: highScore
+        ? `综合分 ${score.toFixed(1)} · ${reason}`
+        : reason,
+      tone: highScore ? "warn" : "danger",
+      score,
+      action,
+      reason,
+    };
+  }
+
+  function candidateOrderbookSummary(candidate, digits = 3) {
+    const bid = candidate.current_best_bid == null ? "--" : Number(candidate.current_best_bid).toFixed(digits);
+    const ask = candidate.current_best_ask == null ? "--" : Number(candidate.current_best_ask).toFixed(digits);
+    const mid = candidate.current_midpoint == null ? "--" : Number(candidate.current_midpoint).toFixed(digits);
+    return `bid ${bid} · ask ${ask} · mid ${mid}`;
+  }
+
+  function candidateExplainTone(title) {
+    const value = String(title || "").trim();
+    if (value === "为什么推荐") return "positive";
+    if (value === "为什么先观察") return "warn";
+    if (value === "高分但被门禁拦住") return "warn";
+    if (value === "当前不可执行") return "danger";
+    if (value === "为什么忽略") return "danger";
+    return "warn";
+  }
+
+  function candidateField(candidate, key) {
+    if (!candidate || typeof candidate !== "object") return undefined;
+    if (candidate[key] != null && candidate[key] !== "") return candidate[key];
+    const nestedKeys = ["payload", "decision_snapshot", "market_context", "topic_snapshot", "control", "risk_snapshot", "netting_snapshot", "price_band"];
+    for (const nestedKey of nestedKeys) {
+      const nested = candidate[nestedKey];
+      if (nested && typeof nested === "object" && nested[key] != null && nested[key] !== "") {
+        return nested[key];
+      }
+    }
+    return undefined;
+  }
+
+  function candidateExplainTitle(candidate) {
+    const status = String(candidateField(candidate, "status") || "").trim().toLowerCase();
+    const suggested = String(candidateField(candidate, "suggested_action") || "").trim().toLowerCase();
+    const gateState = candidateGateState(candidate, candidateField(candidate, "side") || candidate.side || "BUY");
+    if (status === "ignored" || status === "rejected" || suggested === "ignore") return "为什么忽略";
+    if (gateState.gated) return gateState.label;
+    if (status === "watched" || suggested === "watch") return "为什么先观察";
+    return "为什么推荐";
+  }
+
+  function candidateExplanation(candidate, side) {
+    const suggestedAction = String(candidateField(candidate, "suggested_action") || "").trim();
+    const skipReason = humanizeReason(candidateField(candidate, "skip_reason"));
+    const riskReason = humanizeReason(candidateField(candidate, "risk_reason"));
+    const walletScoreSummary = String(candidateField(candidate, "wallet_score_summary") || "").trim();
+    const score = Number(candidateField(candidate, "score") || candidate.score || 0);
+    const walletScore = Number(candidateField(candidate, "wallet_score") || candidate.wallet_score || 0);
+    const confidence = Number(candidateField(candidate, "confidence") || candidate.confidence || 0);
+    const spreadPct = Number(candidateField(candidate, "spread_pct"));
+    const chasePct = Number(candidateField(candidate, "chase_pct"));
+    const sourceWalletCount = Number(candidateField(candidate, "source_wallet_count") || 0);
+    const resonanceHint = String(candidateField(candidate, "candidate_origin") || candidateField(candidate, "trigger_type") || "").toLowerCase();
+    const existingPosition = candidateField(candidate, "existing_position") === true;
+    const duplicate = candidateField(candidate, "duplicate") === true;
+    const nettingLimited = candidateField(candidate, "netting_limited") === true;
+    const budgetLimited = candidateField(candidate, "budget_limited") === true;
+    const cooldownRemaining = Math.max(0, Number(candidateField(candidate, "cooldown_remaining") || 0), Number(candidateField(candidate, "add_cooldown_remaining") || 0));
+    const lines = [];
+
+    if (suggestedAction) {
+      lines.push({
+        label: skipReason ? "建议处理" : "当前动作",
+        value: candidateActionText(suggestedAction, side),
+      });
+    }
+    if (Number.isFinite(score) || Number.isFinite(walletScore) || Number.isFinite(confidence) || sourceWalletCount > 0) {
+      lines.push({
+        label: "评分拆解",
+        value: `score ${score.toFixed(1)} · wallet ${walletScore.toFixed(1)} · conf ${fmtPct(confidence * 100, 0)} · ${sourceWalletCount} wallet${sourceWalletCount === 1 ? "" : "s"}`,
+      });
+    }
+    if (skipReason || riskReason) {
+      lines.push({
+        label: "忽略 / 风控",
+        value: skipReason || riskReason,
+      });
+    }
+    if (Number.isFinite(spreadPct) || Number.isFinite(chasePct)) {
+      const parts = [];
+      if (Number.isFinite(spreadPct) && spreadPct > 0) parts.push(`spread ${fmtPct(spreadPct, 1)}`);
+      if (Number.isFinite(chasePct) && chasePct > 0) parts.push(`追价 ${fmtPct(chasePct, 1)}`);
+      if (parts.length > 0) {
+        lines.push({
+          label: "动量 / 盘口",
+          value: parts.join(" · "),
+        });
+      }
+    }
+    if (sourceWalletCount > 1 || resonanceHint.includes("resonance") || walletScoreSummary.toLowerCase().includes("resonance")) {
+      lines.push({
+        label: "共振信号",
+        value: sourceWalletCount > 1 ? `${sourceWalletCount} 个钱包同向` : (walletScoreSummary || "多钱包共振"),
+      });
+    }
+    const conflictParts = [];
+    if (existingPosition) conflictParts.push("已有仓位");
+    if (duplicate) conflictParts.push("同轮重复");
+    if (nettingLimited) conflictParts.push("同条件暴露受限");
+    if (budgetLimited) conflictParts.push("预算受限");
+    if (cooldownRemaining > 0) conflictParts.push(`冷却剩余 ${fmtAge(cooldownRemaining)}`);
+    if (conflictParts.length > 0) {
+      lines.push({
+        label: "风险冲突",
+        value: conflictParts.join(" · "),
+      });
+    }
+    if (walletScoreSummary) {
+      lines.push({
+        label: "钱包画像",
+        value: walletScoreSummary,
+      });
+    }
+    if (lines.length <= 0) {
+      lines.push({
+        label: "说明",
+        value: "当前候选没有额外的拦截或共振说明，优先看 suggested_action 与钱包评分。",
+      });
+    }
+    return lines.slice(0, 5);
+  }
+
+  function candidateCardReason(candidate, side) {
+    const gateState = candidateGateState(candidate, side);
+    if (gateState.gated) {
+      return gateState.label;
+    }
+    const primary = [
+      String(candidate.recommendation_reason || "").trim(),
+      String(candidate.note || "").trim(),
+      candidateGateReason(candidate),
+    ].find(Boolean);
+    if (primary) return primary;
+    const explanation = candidateExplanation(candidate, side);
+    const line = explanation.find((item) => {
+      const label = String(item && item.label || "").trim();
+      return item && item.value && !["评分拆解", "当前动作", "建议处理"].includes(label);
+    });
+    if (line && line.value) return String(line.value).trim();
+    const sourceWalletCount = Math.max(1, Number(candidate.source_wallet_count || 1));
+    return `${candidateActionText(candidate.suggested_action, side)} · ${sourceWalletCount} 个钱包触发`;
+  }
+
+  function candidateCardPriorityItems(candidate, side) {
+    const score = Number(candidate.score || 0);
+    const walletScore = Number(candidate.wallet_score || 0);
+    const observedNotional = Number(candidate.observed_notional || 0);
+    const observedSize = Number(candidate.observed_size || 0);
+    const qualityParts = [`score ${score.toFixed(0)}`];
+    if (walletScore > 0) qualityParts.push(`wallet ${walletScore.toFixed(0)}`);
+    const sizeValue = observedNotional > 0
+      ? fmtUsd(observedNotional, false)
+      : observedSize > 0
+        ? `${observedSize.toFixed(0)} 份`
+        : "--";
+    return [
+      {
+        label: "综合分",
+        value: qualityParts.join(" · "),
+      },
+      {
+        label: "规模",
+        value: sizeValue,
+      },
+    ];
+  }
+
+  function candidateCardSummaryLead(candidate, side) {
+    const title = candidateExplainTitle(candidate);
+    const gateReason = candidateGateReason(candidate);
+    const prefix = title === "为什么忽略"
+      ? "不看"
+      : title === "为什么先观察"
+        ? "先看"
+        : title === "高分但被门禁拦住"
+          ? "高分但被门禁拦住"
+          : title === "当前不可执行"
+            ? "当前不可执行"
+            : "看";
+    const action = candidateActionText(candidateActionValue(candidate) || candidate.suggested_action, side);
+    const score = Number(candidate.score || 0);
+    const walletScore = Number(candidate.wallet_score || 0);
+    const confidence = Number(candidate.confidence || 0);
+    const sourceWalletCount = Math.max(1, Number(candidate.source_wallet_count || 1));
+    const reason = title === "高分但被门禁拦住" || title === "当前不可执行"
+      ? gateReason || candidateCardReason(candidate, side)
+      : candidateCardReason(candidate, side);
+    const pieces = [];
+    if (title === "为什么忽略") {
+      const skip = gateReason;
+      const spread = Number(candidate.spread_pct);
+      const chase = Number(candidate.chase_pct);
+      if (skip) pieces.push(skip);
+      if (!skip && Number.isFinite(spread)) pieces.push(`spread ${fmtPct(spread, 1)}`);
+      if (Number.isFinite(chase)) pieces.push(`chase ${fmtPct(chase, 1)}`);
+      if (score > 0) pieces.push(`score ${score.toFixed(0)}`);
+    } else if (title === "高分但被门禁拦住" || title === "当前不可执行") {
+      pieces.push(`score ${score.toFixed(0)}`);
+      const gateReason = candidateGateReason(candidate);
+      if (gateReason) pieces.push(gateReason);
+      if (walletScore > 0) pieces.push(`wallet ${walletScore.toFixed(0)}`);
+    } else if (title === "为什么先观察") {
+      pieces.push(action);
+      if (sourceWalletCount > 1) pieces.push(`${sourceWalletCount} 钱包`);
+      if (walletScore > 0) pieces.push(`wallet ${walletScore.toFixed(0)}`);
+      if (confidence > 0) pieces.push(`conf ${fmtPct(confidence * 100, 0)}`);
+    } else {
+      pieces.push(action);
+      if (score > 0) pieces.push(`score ${score.toFixed(0)}`);
+      if (sourceWalletCount > 1) pieces.push(`${sourceWalletCount} 钱包`);
+      if (walletScore > 0) pieces.push(`wallet ${walletScore.toFixed(0)}`);
+    }
+    const tail = pieces.filter(Boolean).join(" · ");
+    const combined = `${prefix}：${reason}${tail ? ` · ${tail}` : ""}`;
+    return combined.length > 72 ? `${combined.slice(0, 71)}…` : combined;
+  }
+
+  function candidateCardHoverText(candidate, side, reason, priorityItems) {
+    const sourceWalletCount = Math.max(1, Number(candidate.source_wallet_count || 1));
+    const bid = candidate.current_best_bid == null ? "--" : Number(candidate.current_best_bid).toFixed(3);
+    const ask = candidate.current_best_ask == null ? "--" : Number(candidate.current_best_ask).toFixed(3);
+    const mid = candidate.current_midpoint == null ? "--" : Number(candidate.current_midpoint).toFixed(3);
+    const spread = candidate.spread_pct == null ? "--" : fmtPct(candidate.spread_pct, 1);
+    const chase = candidate.chase_pct == null ? "--" : fmtPct(candidate.chase_pct, 1);
+    const wallet = shortWallet(candidate.wallet);
+    const action = candidateActionText(candidateActionValue(candidate) || candidate.suggested_action, side);
+    const gateState = candidateGateState(candidate, side);
+    const lines = [
+      `${candidate.market_slug || "-"} · ${candidate.outcome || "--"} · ${side}`,
+      `${wallet}${candidate.wallet_tier ? ` · ${candidate.wallet_tier}` : ""} · ${sourceWalletCount} 钱包`,
+      reason,
+      gateState.gated ? `${gateState.label} · ${gateState.reason}` : "门禁通过",
+      `score ${Number(candidate.score || 0).toFixed(1)} · wallet ${Number(candidate.wallet_score || 0).toFixed(1)} · conf ${fmtPct(Number(candidate.confidence || 0) * 100, 0)}`,
+      `bid ${bid} · ask ${ask} · mid ${mid} · spread ${spread} · chase ${chase}`,
+      `${action} · ${candidateCardReason(candidate, side)}`,
+    ];
+    for (const item of Array.isArray(priorityItems) ? priorityItems : []) {
+      if (!item || !item.label || !item.value) continue;
+      lines.push(`${item.label}: ${item.value}`);
+    }
+    return lines.join("\n");
+  }
+
+  function candidateCardShortSummary(candidate, side) {
+    return candidateCardSummaryLead(candidate, side);
+  }
+
+  function candidateFactorTone(value, positiveThreshold = 0.75, dangerThreshold = 0.4) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric)) return "neutral";
+    if (numeric >= positiveThreshold) return "positive";
+    if (numeric <= dangerThreshold) return "danger";
+    return "warn";
+  }
+
+  function candidateFactorValueClass(tone) {
+    const value = String(tone || "").trim().toLowerCase();
+    if (value === "positive") return "value-positive";
+    if (value === "danger") return "value-negative";
+    return "value-neutral";
+  }
+
+  function normalizeFactorTone(value) {
+    const tone = String(value || "").trim().toLowerCase();
+    if (tone === "bullish" || tone === "positive" || tone === "ok") return "positive";
+    if (tone === "bearish" || tone === "danger" || tone === "negative") return "danger";
+    if (tone === "warn" || tone === "warning") return "warn";
+    return "neutral";
+  }
+
+  function factorPillTone(tone) {
+    const value = normalizeFactorTone(tone);
+    if (value === "positive") return "bullish";
+    if (value === "danger") return "bearish";
+    return "neutral";
+  }
+
+  function factorPillText(tone) {
+    const value = normalizeFactorTone(tone);
+    if (value === "positive") return "偏正";
+    if (value === "danger") return "偏负";
+    if (value === "warn") return "注意";
+    return "中性";
+  }
+
+  function candidateReasonFactors(candidate) {
+    const rows = Array.isArray(candidate && candidate.reason_factors) ? candidate.reason_factors : [];
+    return rows
+      .filter((item) => item && typeof item === "object")
+      .map((item) => {
+        const key = String(item.key || item.label || "factor").trim();
+        const label = String(item.label || key || "factor").trim();
+        const value = item.value == null || String(item.value).trim() === "" ? "--" : String(item.value);
+        const detail = String(item.detail || "").trim();
+        const rawDirection = String(item.direction || "").trim().toLowerCase();
+        let weight = Number(item.weight);
+        if (!Number.isFinite(weight)) weight = null;
+        return {
+          key,
+          label,
+          value,
+          detail,
+          rawDirection: rawDirection || "neutral",
+          tone: normalizeFactorTone(rawDirection),
+          weight,
+        };
+      });
+  }
+
+  function candidateFactorCards(candidate, side) {
+    const score = Number(candidateField(candidate, "score") || candidate.score || 0);
+    const walletScore = Number(candidateField(candidate, "wallet_score") || candidate.wallet_score || 0);
+    const confidence = Number(candidateField(candidate, "confidence") || candidate.confidence || 0);
+    const sourceWalletCount = Number(candidateField(candidate, "source_wallet_count") || candidate.source_wallet_count || 0);
+    const momentum5m = Number(candidateField(candidate, "momentum_5m") || candidate.momentum_5m || 0);
+    const momentum30m = Number(candidateField(candidate, "momentum_30m") || candidate.momentum_30m || 0);
+    const spreadPct = candidateField(candidate, "spread_pct");
+    const chasePct = candidateField(candidate, "chase_pct");
+    const triggerType = String(candidateField(candidate, "trigger_type") || candidate.trigger_type || "wallet_event").trim();
+    const walletTier = String(candidateField(candidate, "wallet_tier") || candidate.wallet_tier || "WATCH").trim();
+    const recommendationReason = String(candidateField(candidate, "recommendation_reason") || candidate.recommendation_reason || candidate.skip_reason || "").trim();
+    const currentBid = candidate.current_best_bid == null ? null : Number(candidate.current_best_bid);
+    const currentAsk = candidate.current_best_ask == null ? null : Number(candidate.current_best_ask);
+    const currentMid = candidate.current_midpoint == null ? null : Number(candidate.current_midpoint);
+    const existingPosition = candidateField(candidate, "existing_position") === true
+      || candidate.existing_position_conflict === true
+      || candidate.has_existing_position === true;
+    const existingNotional = Number(candidateField(candidate, "existing_position_notional") || candidate.existing_position_notional || 0);
+    const skipReason = humanizeReason(candidateField(candidate, "skip_reason") || candidate.skip_reason);
+    const riskReason = humanizeReason(candidateField(candidate, "risk_reason") || candidate.risk_reason);
+    const duplicate = candidateField(candidate, "duplicate") === true;
+    const nettingLimited = candidateField(candidate, "netting_limited") === true;
+    const budgetLimited = candidateField(candidate, "budget_limited") === true;
+    const cooldownRemaining = Math.max(0, Number(candidateField(candidate, "cooldown_remaining") || candidate.cooldown_remaining || 0), Number(candidateField(candidate, "add_cooldown_remaining") || candidate.add_cooldown_remaining || 0));
+    const spreadValue = Number(spreadPct);
+    const chaseValue = Number(chasePct);
+    const costPressure = Number.isFinite(spreadValue) || Number.isFinite(chaseValue)
+      ? (Math.max(0, Number.isFinite(spreadValue) ? spreadValue : 0) + Math.max(0, Number.isFinite(chaseValue) ? chaseValue : 0))
+      : null;
+    const momentumSummary = `${fmtSignedRatioPct(momentum5m, 1)} / ${fmtSignedRatioPct(momentum30m, 1)}`;
+    const explainTitle = String(candidateExplainTitle(candidate));
+    const recommendedTone = candidateExplainTone(explainTitle);
+    const gateState = candidateGateState(candidate, side);
+    const reasonFactors = candidateReasonFactors(candidate);
+
+    const fallbackBreakdown = [
+      {
+        label: "执行门禁",
+        value: gateState.gated ? gateState.label : "已通过",
+        detail: gateState.gated ? gateState.detail : "当前可以进入执行层",
+        tone: gateState.tone,
+      },
+      {
+        label: "综合评分",
+        value: score.toFixed(1),
+        detail: recommendationReason || candidateActionText(candidate.suggested_action, side),
+        tone: candidateFactorTone(score / 100, 0.9, 0.7),
+      },
+      {
+        label: "钱包评分",
+        value: `${walletScore.toFixed(1)}${walletTier ? ` · ${walletTier}` : ""}`,
+        detail: String(candidate.wallet_tag || candidate.wallet_score_summary || "钱包质量"),
+        tone: candidateFactorTone(walletScore / 100, 0.85, 0.6),
+      },
+      {
+        label: "置信度",
+        value: fmtPct(confidence * 100, 0),
+        detail: String(candidate.wallet_score_summary || recommendationReason || "决策置信度"),
+        tone: candidateFactorTone(confidence, 0.7, 0.45),
+      },
+      {
+        label: "共振钱包",
+        value: `${sourceWalletCount} wallet${sourceWalletCount === 1 ? "" : "s"}`,
+        detail: sourceWalletCount > 1 ? "multi-wallet confirm" : "single wallet trigger",
+        tone: sourceWalletCount > 1 ? "positive" : "warn",
+      },
+      {
+        label: "动量",
+        value: momentumSummary,
+        detail: momentum30m < 0 ? "30m 回撤" : "顺风动量",
+        tone: momentum30m > 0 ? "positive" : momentum30m < -10 ? "danger" : "warn",
+      },
+      {
+        label: "盘口成本",
+        value: `${spreadPct == null || spreadPct === "" ? "--" : fmtPct(spreadValue, 1)} / ${chasePct == null || chasePct === "" ? "--" : fmtPct(chaseValue, 1)}`,
+        detail: `bid ${currentBid == null ? "--" : currentBid.toFixed(3)} · ask ${currentAsk == null ? "--" : currentAsk.toFixed(3)} · mid ${currentMid == null ? "--" : currentMid.toFixed(3)}`,
+        tone: costPressure == null ? "warn" : costPressure > 6 ? "danger" : costPressure > 2 ? "warn" : "positive",
+      },
+      {
+        label: "触发类型",
+        value: triggerType || "wallet_event",
+        detail: String(candidate.market_tag || candidate.resolution_bucket || "market context"),
+        tone: recommendedTone,
+      },
+    ];
+
+    const fallbackConflicts = [];
+    if (existingPosition) {
+      fallbackConflicts.push({
+        label: "已有仓位",
+        value: existingNotional > 0 ? fmtUsd(existingNotional, false) : "position conflict",
+        detail: "同 token / 同条件已有暴露",
+        tone: "danger",
+      });
+    }
+    if (duplicate) {
+      fallbackConflicts.push({
+        label: "重复信号",
+        value: "同轮已去重",
+        detail: "避免同一候选重复执行",
+        tone: "warn",
+      });
+    }
+    if (nettingLimited) {
+      fallbackConflicts.push({
+        label: "净额上限",
+        value: "netting capped",
+        detail: "同条件暴露已接近上限",
+        tone: "warn",
+      });
+    }
+    if (budgetLimited) {
+      fallbackConflicts.push({
+        label: "预算受限",
+        value: "budget capped",
+        detail: "当前可用名义金额不足",
+        tone: "danger",
+      });
+    }
+    if (cooldownRemaining > 0) {
+      fallbackConflicts.push({
+        label: "冷却中",
+        value: fmtAge(cooldownRemaining),
+        detail: "加仓 / 跟随冷却仍未结束",
+        tone: "warn",
+      });
+    }
+    if (riskReason) {
+      fallbackConflicts.push({
+        label: "风控原因",
+        value: riskReason,
+        detail: skipReason || "risk gate",
+        tone: "danger",
+      });
+    } else if (skipReason) {
+      fallbackConflicts.push({
+        label: "忽略原因",
+        value: skipReason,
+        detail: "skip / gate / cooldown",
+        tone: "warn",
+      });
+    }
+    if (fallbackConflicts.length <= 0) {
+      fallbackConflicts.push({
+        label: "风险冲突",
+        value: "none",
+        detail: "没有显著的已有仓位 / 重复 / 冷却 / 预算冲突",
+        tone: "positive",
+      });
+    }
+
+    const conflictKeys = new Set(["existing_position", "skip_reason"]);
+    const factorBreakdown = reasonFactors
+      .filter((item) => !conflictKeys.has(String(item.key || "").trim().toLowerCase()) && String(item.key || "").trim().toLowerCase() !== "decision")
+      .map((item) => ({
+        ...item,
+        detail: item.detail || item.label,
+      }));
+    const factorConflicts = reasonFactors
+      .filter((item) => conflictKeys.has(String(item.key || "").trim().toLowerCase()))
+      .map((item) => ({
+        ...item,
+        detail: item.detail || item.label,
+      }));
+
+    const breakdown = factorBreakdown.length > 0 ? factorBreakdown.slice(0, 6) : fallbackBreakdown;
+    const conflicts = factorConflicts.length > 0 ? factorConflicts.slice(0, 4) : fallbackConflicts;
+
+    return { breakdown, conflicts };
+  }
+
+  function renderFactorCards(items) {
+    const rows = Array.isArray(items) ? items : [];
+    return rows.length > 0
+      ? rows.map((item) => {
+          const tone = normalizeFactorTone(item && item.tone || "neutral");
+          const valueClass = candidateFactorValueClass(tone);
+          const rawWeight = Number(item && item.weight);
+          const weightText = Number.isFinite(rawWeight) && Math.abs(rawWeight) > 0.05 ? `${rawWeight >= 0 ? "+" : ""}${rawWeight.toFixed(1)}` : "";
+          const pillTone = factorPillTone(item && item.rawDirection ? item.rawDirection : tone);
+          const pillText = factorPillText(item && item.rawDirection ? item.rawDirection : tone);
+          return `<div class="component-card candidate-factor-card factor-card factor-${tone || "neutral"}">
+            <div class="factor-head">
+              <span>${escapeHtml(String(item && item.label || "factor"))}</span>
+              <span class="factor-pill factor-${pillTone}">${pillText}</span>
+            </div>
+            <b class="${valueClass}">${escapeHtml(String(item && item.value || "--"))}</b>
+            ${weightText ? `<small class="factor-weight">权重 ${escapeHtml(weightText)}</small>` : ""}
+            <p class="factor-detail">${escapeHtml(String(item && item.detail || ""))}</p>
+          </div>`;
+        }).join("")
+      : '<div class="component-card factor-card factor-neutral"><span>factor</span><b>等待数据...</b><p>暂无可展示的因子</p></div>';
+  }
+
+  function renderCandidateSummaryCards(items) {
+    const rows = Array.isArray(items) ? items.filter((item) => item && typeof item === "object") : [];
+    if (rows.length <= 0) {
+      return '<div class="component-card candidate-summary-card factor-card factor-neutral"><span>决策摘要</span><b>等待数据...</b><p>暂无可展示的摘要因子</p></div>';
+    }
+
+    const buildCard = (item, featured = false) => {
+      const tone = normalizeFactorTone(item && item.tone || "neutral");
+      const valueClass = candidateFactorValueClass(tone);
+      const rawWeight = Number(item && item.weight);
+      const weightText = Number.isFinite(rawWeight) && Math.abs(rawWeight) > 0.05 ? `${rawWeight >= 0 ? "+" : ""}${rawWeight.toFixed(1)}` : "";
+      const pillTone = factorPillTone(item && item.rawDirection ? item.rawDirection : tone);
+      const pillText = factorPillText(item && item.rawDirection ? item.rawDirection : tone);
+      const label = escapeHtml(String(item && item.label || "factor"));
+      const value = escapeHtml(String(item && item.value || "--"));
+      const detail = escapeHtml(String(item && item.detail || item && item.label || ""));
+      if (featured) {
+        return `<article class="component-card candidate-summary-hero factor-card factor-${tone || "neutral"}">
+          <div class="candidate-summary-hero-head">
+            <div class="candidate-summary-hero-copy">
+              <span class="candidate-summary-eyebrow">${label}</span>
+              <b class="${valueClass}">${value}</b>
+            </div>
+            <span class="factor-pill factor-${pillTone}">${pillText}</span>
+          </div>
+          ${weightText ? `<small class="factor-weight">权重 ${escapeHtml(weightText)}</small>` : ""}
+          <p class="candidate-summary-detail">${detail}</p>
+        </article>`;
+      }
+      return `<article class="component-card candidate-summary-card factor-card factor-${tone || "neutral"}">
+        <div class="candidate-summary-card-head">
+          <span>${label}</span>
+          <span class="factor-pill factor-${pillTone}">${pillText}</span>
+        </div>
+        <b class="${valueClass}">${value}</b>
+        ${weightText ? `<small class="factor-weight">权重 ${escapeHtml(weightText)}</small>` : ""}
+        <p>${detail}</p>
+      </article>`;
+    };
+
+    const [hero, ...rest] = rows;
+    return [
+      buildCard(hero, true),
+      rest.length > 0
+        ? `<div class="candidate-summary-grid">${rest.slice(0, 4).map((item) => buildCard(item)).join("")}</div>`
+        : "",
+    ].join("");
+  }
+
+  function candidateFocusStrip(candidate, side) {
+    const reasonFactors = candidateReasonFactors(candidate);
+    const factorCards = candidateFactorCards(candidate, side);
+    const decisionFactor = reasonFactors.find((item) => String(item.key || "").trim().toLowerCase() === "decision");
+    const topReasons = reasonFactors
+      .filter((item) => String(item.key || "").trim().toLowerCase() !== "decision")
+      .sort((left, right) => Math.abs(Number(right.weight || 0)) - Math.abs(Number(left.weight || 0)))
+      .slice(0, 3);
+    const scoreCard = factorCards.breakdown.find((item) => String(item.label || "") === "综合评分") || factorCards.breakdown[0] || {};
+    const momentumCard = factorCards.breakdown.find((item) => String(item.label || "") === "动量" || String(item.label || "") === "价格动量") || factorCards.breakdown[4] || {};
+    const costCard = factorCards.breakdown.find((item) => String(item.label || "") === "盘口成本" || String(item.label || "") === "盘口点差" || String(item.label || "") === "追价幅度") || factorCards.breakdown[5] || {};
+    const riskCard = factorCards.conflicts[0] || {};
+    const actionText = candidateActionText(candidate.suggested_action, side);
+    const gateState = candidateGateState(candidate, side);
+    const strip = [
+      {
+        label: "执行门禁",
+        value: gateState.gated ? gateState.label : "已通过",
+        detail: gateState.gated ? gateState.detail : "当前可以进入执行层",
+        tone: gateState.tone,
+      },
+      {
+        label: "决策主张",
+        value: actionText,
+        detail: String(decisionFactor && decisionFactor.detail || candidate.recommendation_reason || candidate.skip_reason || candidate.note || candidate.wallet_score_summary || "当前候选摘要"),
+        tone: normalizeFactorTone(decisionFactor && decisionFactor.tone || candidateExplainTone(candidateExplainTitle(candidate))),
+        rawDirection: decisionFactor && decisionFactor.rawDirection ? decisionFactor.rawDirection : "",
+        weight: decisionFactor && Number.isFinite(Number(decisionFactor.weight)) ? Number(decisionFactor.weight) : null,
+      },
+      {
+        label: "综合评分",
+        value: String(scoreCard.value || "0.0"),
+        detail: String(scoreCard.detail || "score breakdown"),
+        tone: String(scoreCard.tone || "neutral"),
+      },
+      {
+        label: "动量",
+        value: String(momentumCard.value || "--"),
+        detail: String(momentumCard.detail || "momentum"),
+        tone: String(momentumCard.tone || "neutral"),
+      },
+      {
+        label: "盘口",
+        value: String(costCard.value || "--"),
+        detail: String(costCard.detail || "spread / chase"),
+        tone: String(costCard.tone || "neutral"),
+      },
+      {
+        label: "风险",
+        value: String(riskCard.value || "none"),
+        detail: String(riskCard.detail || "no conflict"),
+        tone: String(riskCard.tone || "neutral"),
+      },
+    ];
+    for (const item of topReasons) {
+      const exists = strip.some((row) => String(row.label || "") === String(item.label || ""));
+      if (!exists) {
+        strip.push({
+          label: item.label,
+          value: item.value,
+          detail: item.detail || item.label,
+          tone: item.tone,
+          rawDirection: item.rawDirection,
+          weight: item.weight,
+        });
+      }
+    }
+    return strip.slice(0, 5);
+  }
+
+  function candidateReviewTrail(candidate, side) {
+    const status = candidateStatusValue(candidate);
+    const action = candidateActionValue(candidate) || String(candidate.suggested_action || "").trim().toLowerCase();
+    const reasonText = String(candidate.recommendation_reason || candidate.skip_reason || candidate.note || "").trim();
+    const reviewAction = String(candidate.review_action || "").trim().toLowerCase();
+    const reviewStatus = String(candidate.review_status || "").trim().toLowerCase();
+    const reviewNote = String(candidate.review_note || "").trim();
+    const createdTs = Number(candidate.created_ts || 0);
+    const updatedTs = Number(candidate.updated_ts || 0);
+    const expiresTs = Number(candidate.expires_ts || 0);
+    const signalTsRaw = candidate.signal_snapshot && candidate.signal_snapshot.timestamp ? Date.parse(candidate.signal_snapshot.timestamp) : 0;
+    const signalTs = Number.isFinite(signalTsRaw) ? Math.floor(signalTsRaw / 1000) : 0;
+    return [
+      {
+        label: "发现",
+        value: `${shortWallet(candidate.wallet)} · ${candidate.trigger_type || "wallet_event"}`,
+        detail: `${candidate.source_wallet_count || 1} 个钱包触发 · ${candidate.wallet_tier || "WATCH"}`,
+        tone: candidate.source_wallet_count > 1 ? "positive" : "warn",
+      },
+      {
+        label: "富化",
+        value: `${candidate.market_tag || "market"} · ${candidate.resolution_bucket || "unbucketed"}`,
+        detail: `${candidate.market_slug || candidate.token_id || "-"} · ${candidate.condition_id || "no condition"}`,
+        tone: candidate.market_tag ? "positive" : "neutral",
+      },
+      {
+        label: "评分",
+        value: `score ${Number(candidate.score || 0).toFixed(1)} · wallet ${Number(candidate.wallet_score || 0).toFixed(1)} · conf ${fmtPct(Number(candidate.confidence || 0) * 100, 0)}`,
+        detail: `${candidate.source_avg_price ? `来源均价 ${Number(candidate.source_avg_price).toFixed(3)}` : "无来源均价"} · ${candidateActionText(action, side)}`,
+        tone: candidate.score >= 75 ? "positive" : candidate.score < 50 ? "danger" : "warn",
+      },
+      {
+        label: "盘口",
+        value: candidateOrderbookSummary(candidate),
+        detail: `spread ${candidate.spread_pct == null ? "--" : fmtPct(candidate.spread_pct, 1)} · chase ${candidate.chase_pct == null ? "--" : fmtPct(candidate.chase_pct, 1)}`,
+        tone: Number(candidate.chase_pct || 0) > 4 || Number(candidate.spread_pct || 0) > 6 ? "danger" : "neutral",
+      },
+      {
+        label: "决策",
+        value: candidateActionText(candidate.suggested_action, side),
+        detail: reasonText || candidate.recommendation_reason || "等待解释",
+        tone: candidateExplainTone(candidateExplainTitle(candidate)),
+      },
+      {
+        label: "复盘",
+        value: reviewAction ? candidateActionText(reviewAction, side) : reviewStatus || "waiting",
+        detail: `${reviewStatus || "waiting"}${reviewNote ? ` · ${reviewNote}` : ""}`,
+        tone: reviewStatus === "executed" ? "positive" : reviewStatus === "ignored" ? "cancel" : reviewStatus === "pending" ? "warn" : "neutral",
+      },
+      {
+        label: "生命周期",
+        value: `${status}${expiresTs > 0 ? ` · ${fmtAge(Math.max(0, expiresTs - Math.floor(Date.now() / 1000)))}` : ""}`,
+        detail: `${createdTs > 0 ? `创建 ${fmtDateTime(createdTs)}` : "创建时间未知"}${updatedTs > 0 ? ` · 更新 ${fmtDateTime(updatedTs)}` : ""}${signalTs > 0 ? ` · signal ${fmtDateTime(signalTs)}` : ""}`,
+        tone: status === "executed" ? "positive" : status === "rejected" || status === "ignored" ? "danger" : "warn",
+      },
+    ];
+  }
+
+  function candidateObjectRows(payload, limit = 5) {
+    if (!payload || typeof payload !== "object") return [];
+    return Object.entries(payload)
+      .filter(([, value]) => value != null && String(value).trim() !== "")
+      .slice(0, limit)
+      .map(([key, value]) => ({
+        key: String(key).replaceAll("_", " "),
+        value: Array.isArray(value)
+          ? value.join(" / ")
+          : typeof value === "object"
+            ? JSON.stringify(value)
+            : String(value),
+      }));
+  }
+
+  function renderCandidateDetailPanel(candidate, side) {
+    const metaEl = $("candidate-detail-meta");
+    const overviewEl = $("candidate-detail-overview");
+    const timelineEl = $("candidate-detail-timeline");
+    const chainEl = $("candidate-detail-chain");
+    const actionsEl = $("candidate-detail-actions");
+    const journalEl = $("candidate-detail-journal");
+    if (!metaEl || !overviewEl || !timelineEl || !chainEl || !actionsEl || !journalEl) return;
+
+    const emptyLists = () => {
+      overviewEl.innerHTML = '<div class="component-card"><span>详情页</span><b>等待数据...</b></div>';
+      timelineEl.innerHTML = '<li><div class="review-main"><span>时间轴</span><b>等待数据...</b></div></li>';
+      chainEl.innerHTML = '<li><div class="review-main"><span>决策链</span><b>等待数据...</b></div></li>';
+      actionsEl.innerHTML = '<li><div class="review-main"><span>动作</span><b>等待数据...</b></div></li>';
+      journalEl.innerHTML = '<li><div class="review-main"><span>日记</span><b>等待数据...</b></div></li>';
+    };
+
+    if (!candidate || typeof candidate !== "object") {
+      metaEl.textContent = "等待候选详情...";
+      emptyLists();
+      return;
+    }
+
+    const candidateId = candidateKey(candidate);
+    const detailReady = candidateDetailMatches(candidate, lastCandidateDetail);
+    const pending = lastCandidateDetailApiState.pending && String(lastCandidateDetailApiState.candidateId || "") === candidateId;
+    if (!detailReady && pending) {
+      metaEl.textContent = `${candidateId || "candidate"} · 正在加载详情`;
+      overviewEl.innerHTML = '<div class="component-card"><span>详情页</span><b>正在加载...</b><p>正在读取单候选复盘链路、动作和日记。</p></div>';
+      timelineEl.innerHTML = '<li><div class="review-main"><span>时间轴</span><b>正在加载...</b></div></li>';
+      chainEl.innerHTML = '<li><div class="review-main"><span>决策链</span><b>正在加载...</b></div></li>';
+      actionsEl.innerHTML = '<li><div class="review-main"><span>动作</span><b>正在加载...</b></div></li>';
+      journalEl.innerHTML = '<li><div class="review-main"><span>日记</span><b>正在加载...</b></div></li>';
+      return;
+    }
+
+    if (!detailReady && !lastCandidateDetailApiState.ok && String(lastCandidateDetailApiState.candidateId || "") === candidateId) {
+      metaEl.textContent = `${candidateId || "candidate"} · 详情不可用`;
+      overviewEl.innerHTML = `<div class="component-card"><span>详情页</span><b>加载失败</b><p>${escapeHtml(lastCandidateDetailApiState.error || "candidate detail unavailable")}</p></div>`;
+      timelineEl.innerHTML = '<li><div class="review-main"><span>时间轴</span><b>不可用</b></div></li>';
+      chainEl.innerHTML = '<li><div class="review-main"><span>决策链</span><b>不可用</b></div></li>';
+      actionsEl.innerHTML = '<li><div class="review-main"><span>动作</span><b>不可用</b></div></li>';
+      journalEl.innerHTML = '<li><div class="review-main"><span>日记</span><b>不可用</b></div></li>';
+      return;
+    }
+
+    const detail = detailReady ? lastCandidateDetail : EMPTY_CANDIDATE_DETAIL;
+    const trace = detail.trace && typeof detail.trace === "object" ? detail.trace : {};
+    const summary = detail.summary && typeof detail.summary === "object" ? detail.summary : EMPTY_CANDIDATE_DETAIL.summary;
+    const timeline = Array.isArray(detail.timeline) ? detail.timeline.slice(0, 12) : [];
+    const decisionChain = Array.isArray(detail.decision_chain) ? detail.decision_chain.slice(0, 10) : [];
+    const relatedActions = Array.isArray(detail.related_actions) ? detail.related_actions.slice(0, 10) : [];
+    const relatedJournal = Array.isArray(detail.related_journal) ? detail.related_journal.slice(0, 10) : [];
+    const orders = Array.isArray(detail.orders) ? detail.orders : [];
+    const traceStatus = String(trace.status || candidate.status || "pending").trim() || "pending";
+    const latestTs = Math.max(
+      0,
+      ...timeline.map((item) => Number(item && item.ts || 0)),
+      Number(candidate.updated_ts || candidate.created_ts || 0)
+    );
+    const traceOpenedTs = Number(trace.opened_ts || trace.ts || 0);
+    const gateState = candidateGateState(candidate, side);
+
+    metaEl.textContent = `${candidate.market_slug || candidate.token_id || "candidate"} · ${timeline.length} timeline / ${decisionChain.length} chain`;
+    overviewEl.innerHTML = [
+      `<div class="component-card candidate-gate-card candidate-gate-${gateState.tone}"><span>执行门禁</span><b>${escapeHtml(gateState.label)}</b><p>${escapeHtml(gateState.reason || gateState.detail || "当前可以进入执行层")}${gateState.gated && Number(candidate.score || 0) > 0 ? ` · score ${Number(candidate.score || 0).toFixed(1)}` : ""}</p></div>`,
+      `<div class="component-card"><span>Trace</span><b>${escapeHtml(String(trace.trace_id || candidate.trace_id || "--"))}</b><p>${traceOpenedTs > 0 ? `opened ${fmtDateTime(traceOpenedTs)}` : "未记录 trace opened"}</p></div>`,
+      `<div class="component-card"><span>链路状态</span><b class="${traceStatus === "open" || traceStatus === "approved" ? "value-positive" : traceStatus === "closed" || traceStatus === "executed" ? "value-neutral" : "value-negative"}">${escapeHtml(traceStatus)}</b><p>orders ${Number(summary.order_count || orders.length || 0)} · actions ${Number(summary.related_action_count || relatedActions.length || 0)}</p></div>`,
+      `<div class="component-card"><span>决策链</span><b>${Number(summary.decision_chain_count || decisionChain.length || 0)} steps</b><p>cycles ${Number(summary.cycle_count || 0)} · trace ${summary.trace_found ? "found" : "missing"}</p></div>`,
+      `<div class="component-card"><span>最近事件</span><b>${latestTs > 0 ? fmtDateTime(latestTs) : "--"}</b><p>journal ${Number(summary.related_journal_count || relatedJournal.length || 0)} · ${candidateActionText(candidate.suggested_action, side)}</p></div>`,
+    ].join("");
+
+    timelineEl.innerHTML = timeline.length > 0
+      ? timeline.map((item) => {
+          const kind = String(item.kind || "event");
+          const detailText = [
+            item.action_label || item.action || item.result_tag || item.flow || "",
+            item.status || "",
+            item.trace_id || item.cycle_id || "",
+          ].filter(Boolean).join(" · ");
+          return `<li>
+            <div class="review-main">
+              <span><span class="tag wait">${escapeHtml(kind)}</span> ${escapeHtml(String(item.text || "-"))}</span>
+              <b>${Number(item.ts || 0) > 0 ? fmtDateTime(item.ts) : "--"}</b>
+            </div>
+            <div class="review-sub">${escapeHtml(detailText || "无额外事件细节")}</div>
+          </li>`;
+        }).join("")
+      : '<li><div class="review-main"><span>时间轴</span><b>暂无事件</b></div></li>';
+
+    chainEl.innerHTML = decisionChain.length > 0
+      ? decisionChain.map((item) => {
+          const mainText = [item.action_label || item.action || "-", item.side || "", item.wallet_tier || ""].filter(Boolean).join(" · ");
+          const detailText = [
+            item.topic_label ? `topic ${item.topic_label}` : "",
+            item.order_status ? `order ${item.order_status}` : "",
+            item.order_notional ? fmtUsd(item.order_notional, false) : "",
+            item.final_status || "",
+          ].filter(Boolean).join(" · ");
+          return `<li>
+            <div class="review-main">
+              <span>${escapeHtml(mainText)}</span>
+              <b>${escapeHtml(String(item.cycle_id || "--"))}</b>
+            </div>
+            <div class="review-sub">${escapeHtml(detailText || "无额外决策细节")}${Number(item.ts || 0) > 0 ? ` · ${fmtDateTime(item.ts)}` : ""}</div>
+          </li>`;
+        }).join("")
+      : '<li><div class="review-main"><span>决策链</span><b>暂无链路</b></div></li>';
+
+    actionsEl.innerHTML = relatedActions.length > 0
+      ? relatedActions.map((item) => {
+          const notional = Number(item.notional || 0);
+          return `<li>
+            <div class="review-main">
+              <span>${escapeHtml(candidateActionText(item.action, side))}</span>
+              <b>${Number(item.created_ts || 0) > 0 ? fmtDateTime(item.created_ts) : "--"}</b>
+            </div>
+            <div class="review-sub">${escapeHtml(String(item.note || "无备注"))}${notional > 0 ? ` · ${fmtUsd(notional, false)}` : ""}${item.status ? ` · ${escapeHtml(String(item.status))}` : ""}</div>
+          </li>`;
+        }).join("")
+      : '<li><div class="review-main"><span>动作</span><b>暂无记录</b></div></li>';
+
+    journalEl.innerHTML = relatedJournal.length > 0
+      ? relatedJournal.map((item) => {
+          const pnl = Number(item.pnl_realized || 0);
+          return `<li>
+            <div class="review-main">
+              <span>${escapeHtml(candidateActionText(item.action, side))}</span>
+              <b>${Number(item.created_ts || 0) > 0 ? fmtDateTime(item.created_ts) : "--"}</b>
+            </div>
+            <div class="review-sub">${escapeHtml(String(item.rationale || item.text || "无备注"))}${item.result_tag ? ` · ${escapeHtml(String(item.result_tag))}` : ""}${pnl !== 0 ? ` · ${fmtUsd(pnl)}` : ""}</div>
+          </li>`;
+        }).join("")
+      : '<li><div class="review-main"><span>日记</span><b>暂无记录</b></div></li>';
+  }
+
+  function renderCandidateFocus(candidatesPayload, apiState = { ok: true, error: "" }) {
+    const payload = candidatesPayload && typeof candidatesPayload === "object" ? candidatesPayload : EMPTY_CANDIDATES;
+    const items = Array.isArray(payload.items) ? payload.items : [];
+    const detailRoot = $("candidate-focus");
+    const metaEl = $("candidate-focus-meta");
+    const headEl = $("candidate-focus-head");
+    const summaryEl = $("candidate-focus-summary");
+    const listEl = $("candidate-focus-list");
+    const metricEl = $("candidate-focus-metrics");
+    const breakdownMetaEl = $("candidate-focus-breakdown-meta");
+    const breakdownEl = $("candidate-focus-breakdown");
+    const conflictMetaEl = $("candidate-focus-conflict-meta");
+    const conflictEl = $("candidate-focus-conflict");
+    const factorsMetaEl = $("candidate-focus-factors-meta");
+    const factorsEl = $("candidate-focus-factors");
+    const trailMetaEl = $("candidate-focus-trail-meta");
+    const trailEl = $("candidate-focus-trail");
+    const explainMetaEl = $("candidate-focus-explain-meta");
+    const explainEl = $("candidate-focus-explain");
+    const snapshotEl = $("candidate-focus-snapshot");
+    const actionEl = $("candidate-focus-action");
+    const statusEl = $("candidate-focus-status");
+    if (!detailRoot || !metaEl || !headEl || !summaryEl || !listEl || !metricEl || !breakdownMetaEl || !breakdownEl || !conflictMetaEl || !conflictEl || !factorsMetaEl || !factorsEl || !trailMetaEl || !trailEl || !explainMetaEl || !explainEl || !snapshotEl || !actionEl || !statusEl) return;
+
+    if (!apiState.ok && items.length <= 0) {
+      detailRoot.classList.add("panel-error");
+      metaEl.textContent = "candidate focus unavailable";
+      headEl.innerHTML = '<span class="tag danger">错误</span><span class="mono">无法加载候选详情</span>';
+      summaryEl.textContent = String(apiState.error || "candidate detail unavailable");
+      listEl.innerHTML = '<li><span>状态</span><b>接口暂不可用</b></li>';
+      metricEl.innerHTML = '<div class="component-card"><span>候选深读</span><b>接口不可用</b></div>';
+      breakdownMetaEl.textContent = "0 factors";
+      breakdownEl.innerHTML = '<div class="component-card factor-card factor-danger"><span>score breakdown</span><b>接口不可用</b><p>候选因子拆解暂时无法加载</p></div>';
+      conflictMetaEl.textContent = "0 conflicts";
+      conflictEl.innerHTML = '<div class="component-card factor-card factor-danger"><span>风险冲突</span><b>接口不可用</b><p>风险冲突拆解暂时无法加载</p></div>';
+      factorsMetaEl.textContent = "0 factors";
+      factorsEl.innerHTML = '<div class="component-card candidate-summary-card factor-card factor-danger"><span>决策摘要</span><b>接口不可用</b><p>无法加载候选总览因子</p></div>';
+      trailMetaEl.textContent = "0 steps";
+      trailEl.innerHTML = '<li><div class="review-main"><span>复盘链路</span><b>接口不可用</b></div></li>';
+      explainMetaEl.textContent = "0 lines";
+      explainEl.innerHTML = '<li><div class="review-main"><span>说明</span><b>等待数据...</b></div></li>';
+      snapshotEl.innerHTML = '<div class="component-card"><span>snapshot</span><b>等待数据...</b></div>';
+      actionEl.innerHTML = '<li><div class="review-main"><span>补充记录</span><b>不可用</b></div></li>';
+      statusEl.textContent = "不可用";
+      renderCandidateDetailPanel(null, "BUY");
+      return;
+    }
+
+    if (items.length <= 0) {
+      detailRoot.classList.remove("panel-error");
+      metaEl.textContent = "candidate focus";
+      headEl.innerHTML = '<span class="tag wait">等待</span><span class="mono">点击候选卡片查看完整解释</span>';
+      summaryEl.textContent = "这里会把单条候选的盘口、钱包、追价和题材 enrich 细节拆开给你看。";
+      listEl.innerHTML = "<li><span>状态</span><b>等待候选数据...</b></li>";
+      metricEl.innerHTML = '<div class="component-card"><span>候选深读</span><b>等待数据</b></div>';
+      breakdownMetaEl.textContent = "0 factors";
+      breakdownEl.innerHTML = '<div class="component-card factor-card factor-neutral"><span>score breakdown</span><b>等待数据</b><p>这里会展示综合分、钱包分、动量和盘口成本</p></div>';
+      conflictMetaEl.textContent = "0 conflicts";
+      conflictEl.innerHTML = '<div class="component-card factor-card factor-neutral"><span>风险冲突</span><b>等待数据</b><p>这里会展示已有仓位、重复、预算与冷却冲突</p></div>';
+      factorsMetaEl.textContent = "0 factors";
+      factorsEl.innerHTML = '<div class="component-card candidate-summary-card factor-card factor-neutral"><span>决策摘要</span><b>等待数据</b><p>这里会展示主结论、关键因子和风险摘要</p></div>';
+      trailMetaEl.textContent = "0 steps";
+      trailEl.innerHTML = '<li><div class="review-main"><span>复盘链路</span><b>等待数据...</b></div></li>';
+      explainMetaEl.textContent = "0 lines";
+      explainEl.innerHTML = '<li><div class="review-main"><span>说明</span><b>等待数据...</b></div></li>';
+      snapshotEl.innerHTML = '<div class="component-card"><span>snapshot</span><b>等待数据...</b></div>';
+      actionEl.innerHTML = '<li><div class="review-main"><span>补充记录</span><b>等待数据...</b></div></li>';
+      statusEl.textContent = "等待数据...";
+      renderCandidateDetailPanel(null, "BUY");
+      return;
+    }
+
+    const availableIds = new Set(items.map((item) => candidateKey(item)));
+    if (!availableIds.has(String(selectedCandidateId || ""))) {
+      selectedCandidateId = candidateKey(items[0]);
+      persistExitReviewUiState();
+    }
+    const candidate = selectedCandidate(payload) || items[0];
+    const side = String(candidate.side || "BUY").toUpperCase();
+    const [statusCls, statusText] = candidateStatusMeta(candidate.status);
+    const explain = Array.isArray(candidate.explanation) && candidate.explanation.length > 0
+      ? candidate.explanation.map((line) => ({
+          label: String(line && line.label || "说明"),
+          value: String(line && line.value || ""),
+        }))
+      : candidateExplanation(candidate, side);
+    const signalSnapshotRows = candidateObjectRows(candidate.signal_snapshot || {}, 4);
+    const topicSnapshotRows = candidateObjectRows(candidate.topic_snapshot || {}, 4);
+    const currentBid = candidate.current_best_bid == null ? "--" : Number(candidate.current_best_bid).toFixed(3);
+    const currentAsk = candidate.current_best_ask == null ? "--" : Number(candidate.current_best_ask).toFixed(3);
+    const currentMid = candidate.current_midpoint == null ? "--" : Number(candidate.current_midpoint).toFixed(3);
+    const spreadPct = candidate.spread_pct == null ? "--" : fmtPct(candidate.spread_pct, 1);
+    const chasePct = candidate.chase_pct == null ? "--" : fmtPct(candidate.chase_pct, 1);
+    const momentum5m = candidate.momentum_5m == null ? "--" : fmtSignedRatioPct(candidate.momentum_5m, 1);
+    const momentum30m = candidate.momentum_30m == null ? "--" : fmtSignedRatioPct(candidate.momentum_30m, 1);
+    const explainTitle = candidateExplainTitle(candidate);
+    const score = Number(candidate.score || 0);
+    const confidence = Number(candidate.confidence || 0);
+    const hasConflict = candidate.existing_position_conflict === true || candidate.has_existing_position === true;
+    const existingNotional = Number(candidate.existing_position_notional || 0);
+    const ageSec = Math.max(0, Math.floor(Date.now() / 1000) - Number(candidate.updated_ts || candidate.created_ts || 0));
+    const factorCards = candidateFactorCards(candidate, side);
+    const factorStrip = candidateFocusStrip(candidate, side);
+    const trail = candidateReviewTrail(candidate, side);
+    const gateState = candidateGateState(candidate, side);
+
+    metaEl.textContent = `${candidate.market_slug || candidate.token_id || "candidate"} · ${candidate.trigger_type || "wallet_event"} · ${candidateKey(candidate)}`;
+    headEl.innerHTML =
+      `<span class="tag ${statusCls}">${statusText}</span>` +
+      `<span class="tag ${side === "SELL" ? "danger" : "ok"}">${side}</span>` +
+      `<span class="tag ${gateState.gated ? gateState.tone : "ok"}">${gateState.gated ? gateState.label : "门禁通过"}</span>` +
+      `<span class="tag ${candidate.suggested_action === "watch" ? "wait" : candidate.suggested_action === "ignore" ? "cancel" : "ok"}">${candidateActionText(candidate.suggested_action, side)}</span>` +
+      `<span class="tag ${hasConflict ? "danger" : "ok"}">${hasConflict ? "已有冲突" : "无冲突"}</span>`;
+    summaryEl.textContent = candidateCardSummaryLead(candidate, side);
+    listEl.innerHTML = [
+      `<li><span>一句话</span><b>${escapeHtml(candidateCardSummaryLead(candidate, side))}</b></li>`,
+      `<li><span>执行门禁</span><b class="${gateState.gated ? "value-negative" : "value-positive"}">${escapeHtml(gateState.label)} · ${escapeHtml(gateState.reason || gateState.detail || "通过")}</b></li>`,
+      `<li><span>来源钱包</span><b>${shortWallet(candidate.wallet)}${candidate.wallet_tag ? ` · ${candidate.wallet_tag}` : ""}${candidate.wallet_tier ? ` · ${candidate.wallet_tier}` : ""}</b></li>`,
+      `<li><span>Condition / Token</span><b>${candidate.condition_id || "--"}${candidate.token_id ? ` · ${candidate.token_id}` : ""}</b></li>`,
+      `<li><span>观察金额</span><b>${fmtUsd(candidate.observed_notional || 0, false)} · ${Number(candidate.observed_size || 0).toFixed(2)} 份</b></li>`,
+      `<li><span>来源均价</span><b>${Number(candidate.source_avg_price || 0).toFixed(4)} · 当前 bid ${currentBid} / ask ${currentAsk} / mid ${currentMid}</b></li>`,
+      `<li><span>盘口成本</span><b>spread ${spreadPct} · chase ${chasePct}</b></li>`,
+      `<li><span>动量</span><b>5m ${momentum5m} · 30m ${momentum30m}</b></li>`,
+      `<li><span>已有仓位</span><b>${hasConflict ? `冲突 ${fmtUsd(existingNotional, false)}` : "无冲突"}</b></li>`,
+      `<li><span>建议动作</span><b>${candidateActionText(candidate.suggested_action, side)} · ${fmtPct(confidence * 100, 0)} 置信度</b></li>`,
+      `<li><span>过期 / 新鲜度</span><b>${candidate.expires_ts > 0 ? `${fmtAge(Math.max(0, Number(candidate.expires_ts || 0) - Math.floor(Date.now() / 1000)))}` : "长期有效"} · ${fmtAge(ageSec)}前更新</b></li>`,
+    ].join("");
+
+    metricEl.innerHTML = [
+      `<div class="component-card"><span>候选评分</span><b class="${clsForScore(score)}">${score.toFixed(1)}</b></div>`,
+      `<div class="component-card"><span>钱包评分</span><b class="${clsForScore(candidate.wallet_score || 0)}">${Number(candidate.wallet_score || 0).toFixed(1)}</b></div>`,
+      `<div class="component-card"><span>钱包分组</span><b>${candidate.wallet_tier || "WATCH"}</b></div>`,
+      `<div class="component-card"><span>来源钱包数</span><b>${Number(candidate.source_wallet_count || 1)}</b></div>`,
+    ].join("");
+    breakdownMetaEl.textContent = `${factorCards.breakdown.length} factors`;
+    breakdownEl.innerHTML = renderFactorCards(factorCards.breakdown);
+    conflictMetaEl.textContent = `${factorCards.conflicts.length} conflicts`;
+    conflictEl.innerHTML = renderFactorCards(factorCards.conflicts);
+    factorsMetaEl.textContent = `${factorStrip.length} factors`;
+    factorsEl.innerHTML = renderCandidateSummaryCards(factorStrip);
+    trailMetaEl.textContent = `${trail.length} steps`;
+    trailEl.innerHTML = trail.length > 0
+      ? trail.map((item) => `<li>
+          <div class="review-main">
+            <span>${escapeHtml(item.label)}</span>
+            <b class="${candidateFactorValueClass(item.tone)}">${escapeHtml(item.value)}</b>
+          </div>
+          <div class="review-sub">${escapeHtml(item.detail || "")}</div>
+        </li>`).join("")
+      : '<li><div class="review-main"><span>复盘链路</span><b>暂无链路</b></div></li>';
+
+    explainMetaEl.textContent = `${explain.length} lines`;
+    explainEl.innerHTML = explain.length > 0
+      ? explain.map((line) => `<li><div class="review-main"><span>${escapeHtml(line.label)}</span><b>${escapeHtml(line.value || "")}</b></div></li>`).join("")
+      : '<li><div class="review-main"><span>说明</span><b>暂无解释</b></div></li>';
+
+    snapshotEl.innerHTML = [
+      `<div class="component-card"><span>推荐理由</span><b>${escapeHtml(candidate.recommendation_reason || "暂无")}</b></div>`,
+      `<div class="component-card"><span>市场标签</span><b>${escapeHtml(candidate.market_tag || "未标记")}</b></div>`,
+      `<div class="component-card"><span>解析桶</span><b>${escapeHtml(candidate.resolution_bucket || "未标记")}</b></div>`,
+      `<div class="component-card"><span>冲突</span><b class="${hasConflict ? "value-negative" : "value-positive"}">${hasConflict ? "existing position" : "clear"}</b></div>`,
+    ].join("");
+
+    const snapshotLines = [];
+    if (signalSnapshotRows.length > 0) {
+      snapshotLines.push(`<li><div class="review-main"><span>signal snapshot</span><b>${signalSnapshotRows.length} keys</b></div><div class="review-sub">${signalSnapshotRows.map((row) => `${escapeHtml(row.key)}=${escapeHtml(row.value)}`).join(" · ")}</div></li>`);
+    }
+    if (topicSnapshotRows.length > 0) {
+      snapshotLines.push(`<li><div class="review-main"><span>topic snapshot</span><b>${topicSnapshotRows.length} keys</b></div><div class="review-sub">${topicSnapshotRows.map((row) => `${escapeHtml(row.key)}=${escapeHtml(row.value)}`).join(" · ")}</div></li>`);
+    }
+    if (candidate.note) {
+      snapshotLines.push(`<li><div class="review-main"><span>备注</span><b>${escapeHtml(candidate.note)}</b></div><div class="review-sub">selected_action=${escapeHtml(candidate.selected_action || "none")}</div></li>`);
+    }
+    actionEl.innerHTML = snapshotLines.length > 0
+      ? snapshotLines.join("")
+      : '<li><div class="review-main"><span>补充记录</span><b>暂无额外记录</b></div></li>';
+    statusEl.textContent = snapshotLines.length > 0 ? `${snapshotLines.length} items` : "无额外记录";
+    detailRoot.dataset.side = side;
+    renderCandidateDetailPanel(candidate, side);
+  }
+
+  function renderNotifierPanel(payload) {
+    const data = payload && typeof payload === "object" ? payload : EMPTY_NOTIFIER;
+    lastNotifierSummary = data;
+    const metaEl = $("notifier-meta");
+    const statusEl = $("notifier-status");
+    const summaryEl = $("notifier-summary");
+    const eventsEl = $("notifier-events");
+    const detailEl = $("notifier-detail");
+    if (!metaEl || !statusEl || !summaryEl || !eventsEl || !detailEl) return;
+
+    const recent = Array.isArray(data.recent) ? data.recent.slice(0, 5) : [];
+    const channels = Array.isArray(data.channels) ? data.channels : [];
+    const deliveryStats = data.delivery_stats && typeof data.delivery_stats === "object" ? data.delivery_stats : EMPTY_NOTIFIER.delivery_stats;
+    const webhookChannel = channels.find((item) => String(item && item.name || "").trim().toLowerCase() === "webhook");
+    const telegramChannel = channels.find((item) => String(item && item.name || "").trim().toLowerCase() === "telegram");
+    const configuredParts = [];
+    if (data.local_available) configuredParts.push("local");
+    if (data.webhook_configured) configuredParts.push(`webhook${webhookChannel && webhookChannel.target_count ? `×${Number(webhookChannel.target_count || 0)}` : ""}`);
+    if (data.telegram_configured) configuredParts.push("telegram");
+    metaEl.textContent = `${recent.length} recent`;
+    statusEl.textContent = configuredParts.length > 0
+      ? `${configuredParts.join(" + ")} · ${data.updated_ts > 0 ? fmtDateTime(data.updated_ts) : "waiting"}`
+      : "no notifier backend configured";
+    summaryEl.innerHTML = [
+      `<div class="component-card"><span>本地通知</span><b>${data.local_available ? "可用" : "不可用"}</b></div>`,
+      `<div class="component-card"><span>Webhook</span><b>${data.webhook_configured ? `已配置${webhookChannel && webhookChannel.target_count ? ` · ${Number(webhookChannel.target_count || 0)} targets` : ""}` : "未配置"}</b></div>`,
+      `<div class="component-card"><span>Telegram</span><b>${data.telegram_configured ? "已配置" : "未配置"}</b></div>`,
+      `<div class="component-card"><span>投递统计</span><b>${Number(deliveryStats.ok_events || 0)} / ${Number(deliveryStats.event_count || 0)} OK</b></div>`,
+      `<div class="component-card"><span>更新时间</span><b>${data.updated_ts > 0 ? fmtDateTime(data.updated_ts) : "--"}</b></div>`,
+    ].join("");
+    detailEl.innerHTML = recent.length > 0
+      ? recent.map((item) => {
+          const [cls, label] = item.ok ? ["ok", "OK"] : ["danger", "FAIL"];
+          const backend = String(item.backend || item.channel || "local");
+          const title = String(item.title || "通知");
+          const body = String(item.body || item.detail || "");
+          const deliveryCount = Number(item.delivery_count || (Array.isArray(item.deliveries) ? item.deliveries.length : 0) || 0);
+          return `<li>
+            <div class="review-main">
+              <span>${escapeHtml(title)}</span>
+              <b><span class="tag ${cls}">${label}</span> <span class="tag wait">${escapeHtml(backend)}</span></b>
+            </div>
+            <div class="review-sub">${escapeHtml(body)}${deliveryCount > 0 ? ` · deliveries ${deliveryCount}` : ""}${item.status_code ? ` · ${item.status_code}` : ""}${item.ts ? ` · ${fmtDateTime(item.ts)}` : ""}</div>
+          </li>`;
+        }).join("")
+      : '<li><div class="review-main"><span>最近通知</span><b>暂无事件</b></div></li>';
+    eventsEl.innerHTML = recent.length > 0
+      ? recent.map((item) => `<div class="component-card">
+          <span>${escapeHtml(String(item.channel || item.backend || "local"))}</span>
+          <b>${escapeHtml(String(item.title || "通知"))}</b>
+          <p>${escapeHtml(String(item.body || item.detail || "no body"))}</p>
+        </div>`).join("")
+      : channels.length > 0
+        ? channels.map((item) => `<div class="component-card">
+            <span>${escapeHtml(String(item.name || "channel"))}</span>
+            <b>${item.configured ? "已配置" : "未配置"}</b>
+            <p>${escapeHtml(item.name === "webhook"
+              ? `${Number(item.target_count || 0)} targets`
+              : item.name === "telegram"
+                ? `${String(item.chat_id || "chat unavailable")} · ${String(item.parse_mode || "plain").trim() || "plain"}`
+                : String(item.backend || "local"))}</p>
+          </div>`).join("")
+        : '<div class="component-card"><span>最近通知</span><b>暂无事件</b></div>';
+  }
+
+  function renderArchivePanel(data, monitor30m, monitor12h, reconciliationEod, now) {
+    const metaEl = $("archive-meta");
+    const summaryEl = $("archive-summary");
+    const actionsEl = $("archive-actions");
+    const statsEl = $("archive-stats");
+    const tagsEl = $("archive-tags");
+    const snapshotsEl = $("archive-snapshots");
+    const recentEl = $("archive-recent");
+    if (!metaEl || !summaryEl || !actionsEl || !statsEl || !tagsEl || !snapshotsEl || !recentEl) return;
+
+    const state = data && typeof data === "object" ? data : {};
+    const summary = state.summary || {};
+    const candidates = state.candidates || EMPTY_CANDIDATES;
+    const journal = state.journal_summary || EMPTY_JOURNAL;
+    const notifier = state.notifier || lastNotifierSummary || EMPTY_NOTIFIER;
+    const walletProfiles = state.wallet_profiles || EMPTY_WALLET_PROFILES;
+    const monitor30 = monitor30m || EMPTY_MONITOR_REPORT("monitor_30m");
+    const monitor12 = monitor12h || EMPTY_MONITOR_REPORT("monitor_12h");
+    const eod = reconciliationEod || EMPTY_RECONCILIATION_EOD_REPORT;
+    const eodRecon = eod.reconciliation && typeof eod.reconciliation === "object" ? eod.reconciliation : {};
+    const topTags = Array.isArray(journal.top_tags) ? journal.top_tags : [];
+    const recentNotes = Array.isArray(journal.recent) ? journal.recent : [];
+    const notifierRecent = Array.isArray(notifier.recent) ? notifier.recent : [];
+    const candidateCount = Number(candidates.summary && candidates.summary.count || 0);
+    const pendingCount = Number(candidates.summary && candidates.summary.pending || 0);
+    const journalCount = Number(journal.count || journal.total_entries || 0);
+    const notifierCount = Number(notifierRecent.length || 0);
+    const openPositions = Number(summary.open_positions || 0);
+    const slotUtil = Number(summary.slot_utilization_pct || summary.exposure_pct || 0);
+    const monitor30Tag = reportDecisionMeta(monitor30.final_recommendation || monitor30.recommendation, monitor30.reconciliation_status);
+    const monitor12Tag = reportDecisionMeta(monitor12.final_recommendation || monitor12.recommendation, monitor12.reconciliation_status);
+    const eodTag = reportStatusMeta(eod.status || eodRecon.status || "unknown");
+    const eodGap = Number(eodRecon.internal_vs_ledger_diff || 0);
+    const report30Freshness = reportFreshnessMeta(monitor30, 30 * 60, now);
+    const report12Freshness = reportFreshnessMeta(monitor12, 12 * 60 * 60, now);
+    const eodFreshness = reportFreshnessMeta(eod, 24 * 60 * 60, now);
+
+    metaEl.textContent = [
+      `state ${Number(data && data.ts || 0) > 0 ? historyAgeLabel(data.ts, now) : "未记录"}`,
+      `30m ${report30Freshness.ageLabel}${report30Freshness.stale ? " · STALE" : ""}`,
+      `12h ${report12Freshness.ageLabel}${report12Freshness.stale ? " · STALE" : ""}`,
+      `EOD ${eodFreshness.ageLabel}`,
+    ].join(" · ");
+
+    summaryEl.innerHTML = [
+      `<div class="review-chip"><span>候选</span><b>${candidateCount}</b></div>`,
+      `<div class="review-chip"><span>待审批</span><b>${pendingCount}</b></div>`,
+      `<div class="review-chip"><span>日记</span><b>${journalCount}</b></div>`,
+      `<div class="review-chip"><span>通知</span><b>${notifierCount}</b></div>`,
+      `<div class="review-chip"><span>持仓</span><b>${openPositions}</b></div>`,
+      `<div class="review-chip"><span>槽位</span><b>${fmtPct(slotUtil, 1)}</b></div>`,
+    ].join("");
+
+    actionsEl.innerHTML = [
+      { label: "导出状态包 JSON", action: "state_bundle", detail: "包含 state / monitor / reconciliation / candidates / journal / notifier" },
+      { label: "导出候选 CSV", action: "candidates_csv", detail: "用于离线筛选和复盘候选机会" },
+      { label: "导出日记 JSON", action: "journal_json", detail: "包含最近笔记、标签和动作摘要" },
+      { label: "导出监控包 JSON", action: "monitor_bundle", detail: "包含 30m / 12h / EOD 对账结果" },
+    ].map((item) => `
+      <button class="btn export-btn" type="button" data-export-action="${item.action}">
+        <span>${item.label}</span>
+        <small>${item.detail}</small>
+      </button>
+    `).join("");
+
+    statsEl.innerHTML = [
+      `<div class="component-card"><span>30m / 12h</span><b><span class="tag ${monitor30Tag[0]}">${monitor30Tag[1]}</span> <span class="tag ${monitor12Tag[0]}">${monitor12Tag[1]}</span></b><p>${monitorWindowDisplaySummary(monitor30, 30 * 60, now)} / ${monitorWindowDisplaySummary(monitor12, 12 * 60 * 60, now)}</p></div>`,
+      `<div class="component-card"><span>EOD 对账</span><b><span class="tag ${eodTag[0]}">${eodTag[1]}</span></b><p>internal vs ledger ${fmtUsd(eodGap)} · fills ${Number(eodRecon.fill_count_today || 0)}</p></div>`,
+      `<div class="component-card"><span>钱包池</span><b>${Number(walletProfiles.summary && walletProfiles.summary.count || 0)} profiles</b><p>enabled ${Number(walletProfiles.summary && walletProfiles.summary.enabled || 0)} · notifier ${notifier.local_available ? "local on" : "local off"}</p></div>`,
+      `<div class="component-card"><span>最近通知</span><b>${notifierCount} events</b><p>${notifier.webhook_configured ? "webhook on" : "webhook off"} · ${notifier.telegram_configured ? "telegram on" : "telegram off"} · latest ${notifier.last && notifier.last.title ? String(notifier.last.title) : "none"}</p></div>`,
+    ].join("");
+
+    tagsEl.innerHTML = topTags.length > 0
+      ? topTags.map((tag) => `<span class="tag wait">${escapeHtml(String(tag.tag || tag.label || "tag"))} · ${Number(tag.count || 0)}</span>`).join("")
+      : '<span class="tag wait">暂无 journal 标签</span>';
+
+    snapshotsEl.innerHTML = [
+      `<div class="component-card"><span>最近 EOD</span><b>${eod.day_key || "--"}</b><p>${Number(eod.generated_ts || 0) > 0 ? `${fmtDateTime(eod.generated_ts)} · ${historyAgeLabel(eod.generated_ts, now)}` : "未生成"} · ${String(eod.status || "unknown")}</p></div>`,
+      `<div class="component-card"><span>monitor 30m</span><b>${String(monitor30.sample_status || "unknown")}</b><p>${monitorWindowDisplaySummary(monitor30, 30 * 60, now)}</p></div>`,
+      `<div class="component-card"><span>monitor 12h</span><b>${String(monitor12.sample_status || "unknown")}</b><p>${monitorWindowDisplaySummary(monitor12, 12 * 60 * 60, now)}</p></div>`,
+      `<div class="component-card"><span>日记最近</span><b>${recentNotes.length}</b><p>${recentNotes[0] ? String(recentNotes[0].text || recentNotes[0].rationale || "").slice(0, 80) : "暂无日记"}</p></div>`,
+    ].join("");
+
+    recentEl.innerHTML = notifierRecent.length > 0
+      ? notifierRecent.map((item) => {
+          const [cls, tag] = item.ok ? ["ok", "OK"] : ["danger", "FAIL"];
+          return `<li>
+            <div class="review-main">
+              <span>${escapeHtml(String(item.title || item.channel || "通知"))}</span>
+              <b><span class="tag ${cls}">${tag}</span> <span class="tag wait">${escapeHtml(String(item.backend || item.channel || "local"))}</span></b>
+            </div>
+            <div class="review-sub">${escapeHtml(String(item.body || item.detail || ""))}${item.status_code ? ` · ${item.status_code}` : ""}${item.ts ? ` · ${fmtDateTime(item.ts)}` : ""}</div>
+          </li>`;
+        }).join("")
+      : '<li><div class="review-main"><span>最近通知</span><b>暂无事件</b></div></li>';
+  }
+
+  async function exportJsonSnapshot(filename, payloadPromise) {
+    const payload = typeof payloadPromise === "function" ? await payloadPromise() : payloadPromise;
+    downloadJson(filename, payload);
+  }
+
+  async function exportCsvSnapshot(filename, rows, columns) {
+    downloadCsv(filename, rows, columns);
+  }
+
+  function candidateExportRows(payload) {
+    const items = Array.isArray(payload && payload.items) ? payload.items : [];
+    return items.map((candidate) => ({
+      id: candidateKey(candidate),
+      wallet: String(candidate.wallet || ""),
+      market_slug: String(candidate.market_slug || ""),
+      outcome: String(candidate.outcome || ""),
+      side: String(candidate.side || ""),
+      trigger_type: String(candidate.trigger_type || ""),
+      suggested_action: String(candidate.suggested_action || ""),
+      status: String(candidate.status || ""),
+      wallet_score: Number(candidate.wallet_score || 0).toFixed(1),
+      score: Number(candidate.score || 0).toFixed(1),
+      confidence: fmtPct(Number(candidate.confidence || 0) * 100, 0),
+      observed_notional: fmtUsd(candidate.observed_notional || 0, false),
+      source_avg_price: Number(candidate.source_avg_price || 0).toFixed(4),
+      current_best_bid: candidate.current_best_bid == null ? "" : Number(candidate.current_best_bid).toFixed(4),
+      current_best_ask: candidate.current_best_ask == null ? "" : Number(candidate.current_best_ask).toFixed(4),
+      current_midpoint: candidate.current_midpoint == null ? "" : Number(candidate.current_midpoint).toFixed(4),
+      spread_pct: candidate.spread_pct == null ? "" : fmtPct(candidate.spread_pct, 2),
+      chase_pct: candidate.chase_pct == null ? "" : fmtPct(candidate.chase_pct, 2),
+      market_tag: String(candidate.market_tag || ""),
+      resolution_bucket: String(candidate.resolution_bucket || ""),
+      note: String(candidate.note || candidate.skip_reason || ""),
+    }));
+  }
+
+  async function buildStateBundle() {
+    const [state, monitor30m, monitor12h, reconciliationEod, candidates, journal, notifier, walletProfiles] = await Promise.all([
+      fetchJson("/api/state", null),
+      fetchJson("/api/monitor/30m", EMPTY_MONITOR_REPORT("monitor_30m")),
+      fetchJson("/api/monitor/12h", EMPTY_MONITOR_REPORT("monitor_12h")),
+      fetchJson("/api/reconciliation/eod", EMPTY_RECONCILIATION_EOD_REPORT),
+      fetchJsonState("/api/candidates", EMPTY_CANDIDATES),
+      fetchJsonState("/api/journal", EMPTY_JOURNAL),
+      Promise.resolve(lastNotifierSummary || EMPTY_NOTIFIER),
+      fetchJsonState("/api/wallet-profiles", EMPTY_WALLET_PROFILES),
+    ]);
+    return {
+      generated_ts: Math.floor(Date.now() / 1000),
+      state,
+      monitor_30m: monitor30m,
+      monitor_12h: monitor12h,
+      reconciliation_eod: reconciliationEod,
+      candidates: candidates && candidates.data ? candidates.data : EMPTY_CANDIDATES,
+      journal: journal && journal.data ? journal.data : EMPTY_JOURNAL,
+      notifier: state && state.notifier ? state.notifier : notifier,
+      wallet_profiles: walletProfiles && walletProfiles.data ? walletProfiles.data : EMPTY_WALLET_PROFILES,
+    };
+  }
+
+  function bindArchiveActions() {
+    const archiveRoot = $("archive-panel");
+    if (!archiveRoot || archiveRoot.dataset.bound === "1") return;
+    archiveRoot.dataset.bound = "1";
+    archiveRoot.addEventListener("click", async (event) => {
+      const button = event.target.closest("[data-export-action]");
+      if (!button) return;
+      const action = String(button.getAttribute("data-export-action") || "").trim();
+      if (!action) return;
+      setButtonBusy(button, true);
+      try {
+        if (action === "state_bundle") {
+          await exportJsonSnapshot(`poly_state_bundle_${Date.now()}.json`, buildStateBundle);
+        } else if (action === "candidates_csv") {
+          await exportCsvSnapshot(
+            `poly_candidates_${Date.now()}.csv`,
+            candidateExportRows(lastDecisionCandidates || EMPTY_CANDIDATES),
+            [
+              { key: "id", label: "id", value: (row) => row.id },
+              { key: "wallet", label: "wallet", value: (row) => row.wallet },
+              { key: "market_slug", label: "market_slug", value: (row) => row.market_slug },
+              { key: "outcome", label: "outcome", value: (row) => row.outcome },
+              { key: "side", label: "side", value: (row) => row.side },
+              { key: "trigger_type", label: "trigger_type", value: (row) => row.trigger_type },
+              { key: "suggested_action", label: "suggested_action", value: (row) => row.suggested_action },
+              { key: "status", label: "status", value: (row) => row.status },
+              { key: "wallet_score", label: "wallet_score", value: (row) => row.wallet_score },
+              { key: "score", label: "score", value: (row) => row.score },
+              { key: "confidence", label: "confidence", value: (row) => row.confidence },
+              { key: "observed_notional", label: "observed_notional", value: (row) => row.observed_notional },
+              { key: "source_avg_price", label: "source_avg_price", value: (row) => row.source_avg_price },
+              { key: "current_best_bid", label: "current_best_bid", value: (row) => row.current_best_bid },
+              { key: "current_best_ask", label: "current_best_ask", value: (row) => row.current_best_ask },
+              { key: "current_midpoint", label: "current_midpoint", value: (row) => row.current_midpoint },
+              { key: "spread_pct", label: "spread_pct", value: (row) => row.spread_pct },
+              { key: "chase_pct", label: "chase_pct", value: (row) => row.chase_pct },
+              { key: "market_tag", label: "market_tag", value: (row) => row.market_tag },
+              { key: "resolution_bucket", label: "resolution_bucket", value: (row) => row.resolution_bucket },
+              { key: "note", label: "note", value: (row) => row.note },
+            ]
+          );
+        } else if (action === "journal_json") {
+          await exportJsonSnapshot(`poly_journal_${Date.now()}.json`, {
+            generated_ts: Math.floor(Date.now() / 1000),
+            journal: lastJournalSummary || EMPTY_JOURNAL,
+          });
+        } else if (action === "monitor_bundle") {
+          await exportJsonSnapshot(`poly_monitor_bundle_${Date.now()}.json`, async () => {
+            const [state, monitor30m, monitor12h, reconciliationEod] = await Promise.all([
+              fetchJson("/api/state", null),
+              fetchJson("/api/monitor/30m", EMPTY_MONITOR_REPORT("monitor_30m")),
+              fetchJson("/api/monitor/12h", EMPTY_MONITOR_REPORT("monitor_12h")),
+              fetchJson("/api/reconciliation/eod", EMPTY_RECONCILIATION_EOD_REPORT),
+            ]);
+            return {
+              generated_ts: Math.floor(Date.now() / 1000),
+              state,
+              monitor_30m: monitor30m,
+              monitor_12h: monitor12h,
+              reconciliation_eod: reconciliationEod,
+            };
+          });
+        }
+      } finally {
+        setButtonBusy(button, false);
+      }
+    });
+  }
+
   async function fetchJson(path, fallback) {
     try {
       const res = await fetch(path, { cache: "no-store" });
@@ -361,6 +2469,367 @@
     } catch (_err) {
       return fallback;
     }
+  }
+
+  async function fetchJsonState(path, fallback) {
+    try {
+      const res = await fetch(path, { cache: "no-store" });
+      if (!res.ok) {
+        return {
+          ok: false,
+          data: fallback,
+          error: `${path} ${res.status}`,
+        };
+      }
+      const data = await res.json();
+      if (!data || typeof data !== "object") {
+        return {
+          ok: false,
+          data: fallback,
+          error: `${path} invalid payload`,
+        };
+      }
+      return {
+        ok: true,
+        data,
+        error: "",
+      };
+    } catch (_err) {
+      return {
+        ok: false,
+        data: fallback,
+        error: `${path} unavailable`,
+      };
+    }
+  }
+
+  async function postJson(path, body) {
+    const res = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+    const payload = await res.json().catch(() => ({}));
+    if (!res.ok) {
+      throw new Error(`request failed: ${res.status}`);
+    }
+    return payload;
+  }
+
+  async function pushMode(mode) {
+    const payload = await postJson("/api/mode", { mode });
+    const next = payload && payload.decision_mode ? payload.decision_mode : { mode };
+    controlState.decision_mode = String(next.mode || mode || "manual");
+    return next;
+  }
+
+  async function pushCandidateAction(candidateId, action, note = "") {
+    return postJson("/api/candidate/action", {
+      candidate_id: candidateId,
+      action,
+      note,
+    });
+  }
+
+  function renderStatusMessage(id, meta, fallbackText) {
+    const el = $(id);
+    if (!el) return;
+    const cls = String(meta && meta.cls || "wait");
+    const text = String(meta && meta.text || fallbackText || "");
+    el.className = `api-status ${cls}`;
+    el.textContent = text || fallbackText || "";
+  }
+
+  function walletProfileSource(wallet) {
+    const items = Array.isArray(lastWalletProfiles && lastWalletProfiles.items) ? lastWalletProfiles.items : [];
+    const target = normalizeWallet(wallet);
+    return items.find((item) => normalizeWallet(item && item.wallet) === target) || null;
+  }
+
+  function walletProfileDraft(item) {
+    const wallet = normalizeWallet(item && item.wallet);
+    const draft = wallet ? walletProfileDrafts[wallet] : null;
+    if (draft && typeof draft === "object") {
+      return {
+        tag: String(draft.tag || ""),
+        notes: String(draft.notes || ""),
+        enabled: !!draft.enabled,
+      };
+    }
+    return {
+      tag: String(item && item.tag || ""),
+      notes: String(item && item.notes || ""),
+      enabled: !!(item && item.enabled !== false),
+    };
+  }
+
+  function walletProfileChanged(item, draft) {
+    if (!item) return false;
+    return String(draft.tag || "").trim() !== String(item.tag || "").trim()
+      || String(draft.notes || "").trim() !== String(item.notes || "").trim()
+      || !!draft.enabled !== !!(item.enabled !== false);
+  }
+
+  function decisionPanelStatus(payload, decision, apiState) {
+    if (String(decisionConsoleNotice.text || "").trim()) return decisionConsoleNotice;
+    if (!apiState.candidates.ok || !apiState.mode.ok) {
+      const parts = [];
+      if (!apiState.candidates.ok) parts.push(`candidates ${apiState.candidates.error || "unavailable"}`);
+      if (!apiState.mode.ok) parts.push(`mode ${apiState.mode.error || "unavailable"}`);
+      return {
+        cls: "danger",
+        text: `机会队列接口异常: ${parts.join(" · ")}`,
+      };
+    }
+    const count = Number(payload && payload.summary && payload.summary.count || 0);
+    return {
+      cls: count > 0 ? "ok" : "wait",
+      text: count > 0
+        ? `当前为 ${modeLabel(decision && decision.mode)} 模式，优先处理 suggested_action 和解释区。`
+        : "当前没有新机会，继续观察下方 operator / monitor / reconciliation 面板。",
+    };
+  }
+
+  function renderDecisionConsole(candidatesPayload, decisionModePayload, apiState = {}) {
+    const payload = candidatesPayload && typeof candidatesPayload === "object" ? candidatesPayload : EMPTY_CANDIDATES;
+    const decision = decisionModePayload && typeof decisionModePayload === "object" ? decisionModePayload : EMPTY_DECISION_MODE;
+    lastDecisionCandidates = payload;
+    lastDecisionMode = decision;
+    lastDecisionApiState = {
+      candidates: apiState.candidates && typeof apiState.candidates === "object" ? apiState.candidates : { ok: true, error: "" },
+      mode: apiState.mode && typeof apiState.mode === "object" ? apiState.mode : { ok: true, error: "" },
+    };
+    const allItems = Array.isArray(payload.items) ? payload.items.slice(0, 32) : [];
+    const filteredItems = candidateSortCandidates(
+      allItems.filter((candidate) => candidateMatchesQueueFilter(candidate, candidateQueueFilter)),
+      candidateQueueFilter.sort
+    );
+    const compactCards = filteredItems.length >= 8;
+    const candidatePanelEl = $("candidate-panel");
+    if (candidatePanelEl) {
+      candidatePanelEl.classList.toggle("is-compact", compactCards);
+    }
+    const summary = payload.summary || {};
+    const mode = String(decision.mode || "manual");
+    controlState.decision_mode = mode;
+    renderStatusMessage("candidate-panel-status", decisionPanelStatus(payload, decision, lastDecisionApiState), "等待 candidates / mode 数据...");
+
+    if ($("candidate-meta")) {
+      const updatedTs = Number(decision.updated_ts || payload.updated_ts || 0);
+      $("candidate-meta").textContent = `${modeLabel(mode)} · ${allItems.length} candidates · ${filteredItems.length} visible · ${candidateSortLabel(candidateQueueFilter.sort)}${updatedTs > 0 ? ` · ${fmtDateTime(updatedTs)}` : ""}`;
+    }
+    if ($("candidate-grid-meta")) {
+      $("candidate-grid-meta").textContent = `${filteredItems.length}/${allItems.length} visible · ${candidateFocusViewLabel(candidateFocusView)}`;
+    }
+    if ($("candidate-summary")) {
+      const visibleSummary = candidateSummaryCounts(filteredItems);
+      $("candidate-summary").innerHTML = [
+        `<span class="chip active">待处理 ${Number(visibleSummary.pending || 0)}</span>`,
+        `<span class="chip">已批准 ${Number(visibleSummary.approved || 0)}</span>`,
+        `<span class="chip">观察中 ${Number(visibleSummary.watched || 0)}</span>`,
+        `<span class="chip">已执行 ${Number(visibleSummary.executed || 0)}</span>`,
+        `<span class="chip">可见 ${filteredItems.length}/${allItems.length}</span>`,
+      ].join("");
+    }
+    const filterMetaEl = $("candidate-filter-meta");
+    if (filterMetaEl) {
+      filterMetaEl.textContent = candidateFilterSummary(candidateQueueFilter, filteredItems.length, allItems.length);
+    }
+    renderCandidateFilterToggle();
+    const switchEl = $("decision-mode-switch");
+    if (switchEl) {
+      switchEl.querySelectorAll("[data-mode]").forEach((btn) => {
+        btn.classList.toggle("active", String(btn.getAttribute("data-mode") || "") === mode);
+      });
+    }
+    const searchInput = $("candidate-search-input");
+    if (searchInput && searchInput !== document.activeElement) {
+      searchInput.value = String(candidateQueueFilter.search || "");
+    }
+    const sortSelect = $("candidate-sort-select");
+    if (sortSelect && sortSelect.value !== String(candidateQueueFilter.sort || "score_desc")) {
+      sortSelect.value = String(candidateQueueFilter.sort || "score_desc");
+    }
+    renderCandidateFocusViewSwitch();
+    document.querySelectorAll("[data-candidate-filter]").forEach((button) => {
+      const key = String(button.getAttribute("data-candidate-filter") || "").trim();
+      const value = String(button.getAttribute("data-filter-value") || "").trim();
+      const activeValue = String(candidateQueueFilter[key] || "all").trim();
+      button.classList.toggle("active", value === activeValue);
+    });
+    const grid = $("candidate-grid");
+    const visiblePayload = { ...payload, items: filteredItems };
+    const activeCandidateId = candidateKey(selectedCandidate(visiblePayload) || filteredItems[0] || {});
+    if (!grid) {
+      renderCandidateFocus(visiblePayload, lastDecisionApiState);
+      return;
+    }
+    if (!lastDecisionApiState.candidates.ok && filteredItems.length <= 0) {
+      grid.innerHTML = `<article class="candidate-card candidate-empty candidate-error"><div><h3>候选接口暂时不可用</h3><p>${escapeHtml(lastDecisionApiState.candidates.error || "无法加载 /api/candidates")}</p></div></article>`;
+      renderCandidateFocus(visiblePayload, lastDecisionApiState);
+      return;
+    }
+    if (filteredItems.length <= 0) {
+      const hasFilters = Boolean(String(candidateQueueFilter.search || "").trim()) || String(candidateQueueFilter.status || "all") !== "all" || String(candidateQueueFilter.action || "all") !== "all" || String(candidateQueueFilter.side || "all") !== "all";
+      grid.innerHTML = `<article class="candidate-card candidate-empty"><div><h3>${hasFilters ? "没有匹配的候选" : "当前没有新机会"}</h3><p>${hasFilters ? "换个关键词、状态或排序再看一次。" : "没有候选信号时，页面会继续保留现有的执行/对账/监控面板。"}</p></div></article>`;
+      renderCandidateFocus(visiblePayload, lastDecisionApiState);
+      return;
+    }
+
+    grid.innerHTML = filteredItems.map((candidate) => {
+      const candidateId = candidateKey(candidate);
+      const side = String(candidate.side || "BUY").toUpperCase();
+      const status = candidateStatusValue(candidate);
+      const [statusCls, statusText] = candidateStatusMeta(status);
+      const gateState = candidateGateState(candidate, side);
+      const priorityItems = candidateCardPriorityItems(candidate, side);
+      const reason = candidateCardShortSummary(candidate, side);
+      const hoverText = candidateCardHoverText(candidate, side, reason, priorityItems);
+      const actionPlan = candidateCardActionButtons(candidate, side);
+      const hasAction = actionPlan.canOperate && actionPlan.primary;
+      const primaryAction = actionPlan.primary;
+      const actionState = candidateRequestState[candidateId] || {};
+      const actionStatusCls = actionPlan.canOperate
+        ? (actionState.kind === "error" ? "danger" : actionState.kind === "success" ? "ok" : actionState.kind === "pending" ? "wait" : "cancel")
+        : "cancel";
+      const actionStatusText = actionState.kind === "error"
+        ? String(actionState.message || "提交失败")
+        : actionState.kind === "success"
+          ? String(actionState.message || "已提交")
+          : actionState.kind === "pending"
+            ? String(actionState.message || "提交中...")
+            : "";
+      const secondaryActions = Array.isArray(actionPlan.secondary) ? actionPlan.secondary : [];
+      const secondaryButtons = hasAction ? secondaryActions.map((button) => `
+              <button class="candidate-action ${button.cls || "subtle"}" type="button" data-action="${button.action}">${button.label}</button>`).join("") : "";
+      const showAction = hasAction || secondaryActions.length > 0;
+      const cardMeta = [];
+      if (gateState.gated) {
+        cardMeta.push(`<span class="tag ${gateState.tone}">门禁 · ${escapeHtml(gateState.reason)}</span>`);
+      }
+      if (actionStatusText) {
+        cardMeta.push(`<span class="candidate-card-status tag ${actionStatusCls}">${escapeHtml(actionStatusText)}</span>`);
+      }
+      const cardCompactCls = compactCards ? " candidate-card-compact" : "";
+      const cardGateCls = gateState.gated ? " gated" : "";
+      return `
+        <article class="candidate-card${cardCompactCls}${cardGateCls}${candidateId && candidateId === activeCandidateId ? " active" : ""}" data-candidate-id="${candidateId}" data-candidate-side="${side}" title="${escapeHtml(hoverText)}">
+          <div class="candidate-card-top">
+            <div class="candidate-card-top-main">
+              <h3>${escapeHtml(candidate.market_slug || candidate.token_id || "-")}</h3>
+              <p class="candidate-card-kicker candidate-card-reason">${escapeHtml(reason)}</p>
+              ${gateState.gated ? `<p class="candidate-card-gate candidate-card-gate-${gateState.tone}">${escapeHtml(gateState.label)} · ${escapeHtml(gateState.reason)}</p>` : ""}
+            </div>
+            <div class="candidate-card-badges">
+              <span class="tag ${side === "SELL" ? "danger" : "ok"}">${side}</span>
+              <span class="tag ${statusCls}">${statusText}</span>
+              ${cardMeta.join("")}
+            </div>
+          </div>
+          <div class="candidate-card-strip">
+            ${priorityItems.map((item) => `<div class="candidate-strip-item"><span>${escapeHtml(item.label)}</span><b>${escapeHtml(item.value)}</b></div>`).join("")}
+          </div>
+          <div class="candidate-card-actions">
+            ${showAction
+      ? hasAction
+        ? `<button class="candidate-action primary" type="button" data-action="${primaryAction}" ${actionPlan.canOperate ? "" : "disabled"}>${candidateActionText(primaryAction, side)}</button>`
+        : ""
+      : `<span class="mono">${statusText ? `状态 ${statusText}` : "暂无可执行动作"}</span>`}
+            ${showAction ? `<div class="candidate-card-actions-secondary">${secondaryButtons}</div>` : ""}
+          </div>
+        </article>
+      `;
+    }).join("");
+    renderCandidateFocus(visiblePayload, lastDecisionApiState);
+  }
+
+  function renderWalletProfilesPanel(payload, apiState = { ok: true, error: "" }) {
+    const data = payload && typeof payload === "object" ? payload : EMPTY_WALLET_PROFILES;
+    lastWalletProfiles = data;
+    lastWalletProfilesApiState = apiState && typeof apiState === "object" ? apiState : { ok: true, error: "" };
+    const items = Array.isArray(data.items) ? data.items.slice(0, 8) : [];
+    if ($("wallet-profiles-meta")) {
+      const enabled = Number(data.summary && data.summary.enabled || 0);
+      $("wallet-profiles-meta").textContent = `${items.length} wallets · enabled ${enabled}`;
+    }
+    renderStatusMessage(
+      "wallet-profiles-status",
+      !lastWalletProfilesApiState.ok
+        ? { cls: "danger", text: `钱包池接口异常: ${lastWalletProfilesApiState.error || "wallet profiles unavailable"}` }
+        : { cls: "wait", text: "支持直接改 tag / notes / enabled，保存后写回 wallet profile store。" },
+      "等待钱包池数据..."
+    );
+    replaceRows(
+      $("wallet-profiles-body"),
+      items.map((item) => {
+        const wallet = normalizeWallet(item.wallet);
+        const draft = walletProfileDraft(item);
+        const dirty = walletProfileChanged(item, draft);
+        const requestState = walletProfileRequestState[wallet] || {};
+        const requestLabel = requestState.kind === "error"
+          ? String(requestState.message || "保存失败")
+          : requestState.kind === "success"
+            ? String(requestState.message || "已保存")
+            : requestState.kind === "pending"
+              ? String(requestState.message || "保存中...")
+              : dirty ? "有未保存改动" : "已同步";
+        const requestCls = requestState.kind === "error" ? "danger" : requestState.kind === "success" ? "ok" : requestState.kind === "pending" ? "wait" : dirty ? "wait" : "cancel";
+        return `
+          <tr data-wallet-profile="${attrToken(wallet)}">
+            <td class="wrap"><div class="cell-stack"><span class="cell-main">${shortWallet(item.wallet)}</span><span class="cell-sub">${escapeHtml(item.category || "未分组")}</span></div></td>
+            <td><label class="inline-toggle"><input type="checkbox" data-wallet-profile-field="enabled" data-wallet-profile-key="${attrToken(wallet)}" ${draft.enabled ? "checked" : ""} /><span>${draft.enabled ? "启用" : "停用"}</span></label></td>
+            <td><input class="editor-input wallet-profile-input" type="text" data-wallet-profile-field="tag" data-wallet-profile-key="${attrToken(wallet)}" value="${escapeHtml(draft.tag)}" placeholder="标签" /></td>
+            <td class="wrap"><div class="cell-stack"><span class="cell-main ${clsForScore(item.trust_score)}">${Number(item.trust_score || 0).toFixed(1)}</span><span class="cell-sub">follow ${Number(item.followability_score || 0).toFixed(1)}</span></div></td>
+            <td class="wrap"><input class="editor-input wallet-profile-input" type="text" data-wallet-profile-field="notes" data-wallet-profile-key="${attrToken(wallet)}" value="${escapeHtml(draft.notes)}" placeholder="备注" /></td>
+            <td class="wrap">
+              <div class="wallet-profile-actions">
+                <button class="btn btn-mini" type="button" data-wallet-profile-save="${attrToken(wallet)}">保存</button>
+                <span class="mono wallet-profile-row-status ${requestCls === "danger" ? "value-negative" : requestCls === "ok" ? "value-positive" : "value-neutral"}">${escapeHtml(requestLabel)}</span>
+              </div>
+            </td>
+          </tr>
+        `;
+      }),
+      !lastWalletProfilesApiState.ok
+        ? '<tr><td colspan="6">wallet profiles API 暂不可用</td></tr>'
+        : '<tr><td colspan="6">暂无钱包画像</td></tr>'
+    );
+  }
+
+  function renderJournalPanel(payload, apiState = { ok: true, error: "" }) {
+    const data = payload && typeof payload === "object" ? payload : EMPTY_JOURNAL;
+    lastJournalSummary = data;
+    lastJournalApiState = apiState && typeof apiState === "object" ? apiState : { ok: true, error: "" };
+    const items = Array.isArray(data.recent) ? data.recent.slice(0, 6) : [];
+    if ($("journal-meta")) {
+      $("journal-meta").textContent = `最近 ${items.length} 条`;
+    }
+    renderStatusMessage(
+      "journal-panel-status",
+      !lastJournalApiState.ok
+        ? { cls: "danger", text: `交易日记接口异常: ${lastJournalApiState.error || "journal unavailable"}` }
+        : { cls: "wait", text: `最近 ${Number(data.total_entries || 0)} 条记录，支持快速写一句理由。` },
+      "等待日记数据..."
+    );
+    renderStatusMessage("journal-note-status", journalComposerNotice, "支持快速写一句理由");
+    const grid = $("journal-grid");
+    if (!grid) return;
+    if (!lastJournalApiState.ok && items.length <= 0) {
+      grid.innerHTML = `<div class="component-card journal-card journal-card-error"><span>交易日记</span><b>接口暂不可用</b><p>${escapeHtml(lastJournalApiState.error || "无法加载 /api/journal")}</p></div>`;
+      return;
+    }
+    if (items.length <= 0) {
+      grid.innerHTML = '<div class="component-card journal-card"><span>交易日记</span><b>还没有动作记录</b><p>可以直接在上方写一句观察理由，后端会写入 /api/journal/note。</p></div>';
+      return;
+    }
+    grid.innerHTML = items.map((item) => `
+      <div class="component-card journal-card">
+        <span>${fmtDateTime(item.created_ts || item.ts || 0)}</span>
+        <b>${candidateActionText(item.action, "BUY")}</b>
+        <small>${escapeHtml(item.market_slug || shortWallet(item.wallet) || "-")}</small>
+        <p>${escapeHtml(String(item.rationale || item.text || "无备注"))}</p>
+      </div>
+    `).join("");
   }
 
   async function copyText(text) {
@@ -391,14 +2860,39 @@
     }
   }
 
-  function computeOpsGate(data, monitor30m, monitor12h, eodReport) {
+  function computeOpsGate(data, monitor30m, monitor12h, eodReport, now) {
     const startup = data && data.startup && typeof data.startup === "object" ? data.startup : {};
     const reconciliation = data && data.reconciliation && typeof data.reconciliation === "object" ? data.reconciliation : {};
     const eod = eodReport && typeof eodReport === "object" ? eodReport : EMPTY_RECONCILIATION_EOD_REPORT;
     const report30 = monitor30m && typeof monitor30m === "object" ? monitor30m : EMPTY_MONITOR_REPORT("monitor_30m");
     const report12 = monitor12h && typeof monitor12h === "object" ? monitor12h : EMPTY_MONITOR_REPORT("monitor_12h");
+    const nowTs = Number(now || data && data.ts || Math.floor(Date.now() / 1000));
     const checks = Array.isArray(startup.checks) ? startup.checks : [];
+    const reconciliationIssues = Array.isArray(reconciliation.issues) ? reconciliation.issues.filter((item) => String(item || "").trim()) : [];
     const eodIssues = Array.isArray(eod.issues) ? eod.issues : [];
+    const reconciliationStatus = String(reconciliation.status || "").toLowerCase();
+    const eodStatus = String(eod.status || "").toLowerCase();
+    const report30FinalKind = recommendationKind(report30.final_recommendation);
+    const report12FinalKind = recommendationKind(report12.final_recommendation);
+    const report30RawKind = recommendationKind(report30.recommendation);
+    const report12RawKind = recommendationKind(report12.recommendation);
+    const report30Freshness = reportFreshnessMeta(report30, 30 * 60, nowTs);
+    const report12Freshness = reportFreshnessMeta(report12, 12 * 60 * 60, nowTs);
+    const report30GateKind = report30Freshness.stale ? "ready" : report30FinalKind;
+    const report12GateKind = report12Freshness.stale ? "ready" : report12FinalKind;
+    const pendingOrderCount = Math.max(
+      Number(reconciliation.pending_orders || 0),
+      Number(reconciliation.pending_entry_orders || 0) + Number(reconciliation.pending_exit_orders || 0),
+      Number(eod.reconciliation && eod.reconciliation.pending_orders || 0)
+    );
+    const monitorFocus = [
+      report30RawKind !== "ready" || report30Freshness.stale ? `30m ${monitorWindowDisplaySummary(report30, 30 * 60, nowTs)}` : "",
+      report12RawKind !== "ready" || report12Freshness.stale ? `12h ${monitorWindowDisplaySummary(report12, 12 * 60 * 60, nowTs)}` : "",
+    ].filter(Boolean);
+    const staleMonitorWindows = [
+      report30Freshness.stale ? `30m ${report30Freshness.ageLabel}` : "",
+      report12Freshness.stale ? `12h ${report12Freshness.ageLabel}` : "",
+    ].filter(Boolean);
     const actions = [];
     const actionKeys = new Set();
 
@@ -423,11 +2917,18 @@
     };
 
     let level = "ready";
-    if (startup.ready === false || recommendationKind(report30.final_recommendation) === "block" || recommendationKind(report12.final_recommendation) === "block") {
+    if (startup.ready === false || report30GateKind === "block" || report12GateKind === "block") {
       level = "block";
-    } else if (String(reconciliation.status || "").toLowerCase() === "fail" || String(eod.status || "").toLowerCase() === "fail" || recommendationKind(report30.final_recommendation) === "escalate" || recommendationKind(report12.final_recommendation) === "escalate") {
+    } else if (reconciliationStatus === "fail" || eodStatus === "fail" || report30GateKind === "escalate" || report12GateKind === "escalate") {
       level = "escalate";
-    } else if (String(reconciliation.status || "").toLowerCase() === "warn" || String(eod.status || "").toLowerCase() === "warn" || recommendationKind(report30.final_recommendation) === "observe" || recommendationKind(report12.final_recommendation) === "observe") {
+    } else if (
+      reconciliationStatus === "warn"
+      || eodStatus === "warn"
+      || report30GateKind === "observe"
+      || report12GateKind === "observe"
+      || report30Freshness.stale
+      || report12Freshness.stale
+    ) {
       level = "observe";
     }
 
@@ -438,10 +2939,24 @@
       detail = String(report12.final_recommendation || report30.final_recommendation || "启动自检未通过，或 live 前置条件缺失。优先修复环境与账户问题。");
     } else if (level === "escalate") {
       title = "执行对账需要升级处理";
-      detail = String(report12.final_recommendation || report30.final_recommendation || "账本与 broker 事实层可能已经漂移，建议先停参数变更。");
+      if (reconciliationStatus === "fail" || eodStatus === "fail") {
+        const summary = (reconciliationIssues.length > 0 ? reconciliationIssues : eodIssues).slice(0, 2).join("; ");
+        detail = `reconciliation 当前为 FAIL${summary ? `（${summary}）` : ""}。先停参数变更并生成 EOD 对账报告核对账本漂移。`;
+      } else {
+        detail = String(report12.final_recommendation || report30.final_recommendation || "账本与 broker 事实层可能已经漂移，建议先停参数变更。");
+      }
     } else if (level === "observe") {
       title = "运行中有警告，先观察再调参";
-      detail = String(report12.final_recommendation || report30.final_recommendation || "当前更多像执行告警而不是策略信号结论。");
+      if (reconciliationStatus === "warn" || eodStatus === "warn") {
+        const summary = (reconciliationIssues.length > 0 ? reconciliationIssues : eodIssues).slice(0, 2).join("; ");
+        detail = `reconciliation 当前为 WARN${summary ? `（${summary}）` : ""}。先核对对账与同步新鲜度，再判断 monitor 是否只是样本不足。`;
+      } else if (monitorFocus.length > 0) {
+        detail = `monitor 当前仍在观察：${monitorFocus.join(" / ")}。先补样本或刷新过期报告，再决定是否调参数。`;
+      } else if (staleMonitorWindows.length > 0) {
+        detail = `monitor 报告已过期：${staleMonitorWindows.join(" / ")}。先刷新 30m / 12h 报告，再判断是否真的需要调参。`;
+      } else {
+        detail = "当前更多像执行告警而不是策略信号结论。";
+      }
     }
 
     const items = [
@@ -451,24 +2966,25 @@
       },
       {
         label: "30m",
-        value: String(report30.final_recommendation || report30.recommendation || report30.sample_status || "unknown"),
+        value: monitorWindowDisplaySummary(report30, 30 * 60, nowTs),
       },
       {
         label: "12h",
-        value: String(report12.final_recommendation || report12.recommendation || report12.sample_status || "unknown"),
+        value: monitorWindowDisplaySummary(report12, 12 * 60 * 60, nowTs),
       },
       {
         label: "对账",
-        value: String(reconciliation.status || eod.status || "unknown"),
+        value: reconciliationStatusSummary(reconciliation, eod),
       },
     ];
 
     const issueParts = [];
-    for (const row of checks.slice(0, 4)) {
+    for (const row of checks.filter((item) => {
+      const status = String(item && item.status || "").toUpperCase();
+      return status === "FAIL" || status === "WARN";
+    }).slice(0, 4)) {
       const status = String(row && row.status || "");
-      if (status === "FAIL" || status === "WARN") {
-        issueParts.push(`${String(row.name || "startup")}: ${String(row.message || status)}`);
-      }
+      issueParts.push(`${String(row.name || "startup")}: ${String(row.message || status)}`);
     }
     for (const item of eodIssues.slice(0, 4)) {
       issueParts.push(String(item));
@@ -521,15 +3037,17 @@
           ]
         );
       } else if (name === "heartbeat_support") {
-        pushAction(
-          "wait",
-          "确认 heartbeat 策略",
-          `当前 SDK 可能缺少 heartbeat 能力，先避免依赖长时间 resting orders；当前提示: ${message || name}.`,
-          [
-            { type: "open", label: "打开状态 JSON", value: "/api/state" },
-            { type: "jump", label: "跳到诊断", value: "diagnostics-panel" },
-          ]
-        );
+        if (pendingOrderCount > 0) {
+          pushAction(
+            "wait",
+            "确认 heartbeat 策略",
+            `当前有 <code>${pendingOrderCount}</code> 个 pending orders，但 SDK 可能缺少 heartbeat 能力，先避免依赖长时间 resting orders；当前提示: ${message || name}.`,
+            [
+              { type: "open", label: "打开状态 JSON", value: "/api/state" },
+              { type: "jump", label: "跳到诊断", value: "diagnostics-panel" },
+            ]
+          );
+        }
       } else if (name === "user_stream") {
         pushAction(
           "wait",
@@ -600,12 +3118,14 @@
       );
     }
 
-    if (String(report30.sample_status || "").toUpperCase() === "INCONCLUSIVE" || String(report12.sample_status || "").toUpperCase() === "INCONCLUSIVE") {
-      const maxInconclusive = Math.max(Number(report30.consecutive_inconclusive_windows || 0), Number(report12.consecutive_inconclusive_windows || 0));
+    if (inconclusiveWindows.length > 0) {
+      const windowSummary = inconclusiveWindows
+        .map((item) => `${item.label} 连续 ${item.count > 0 ? item.count : "?"} 个`)
+        .join(" / ");
       pushAction(
         "wait",
         "补足样本窗口",
-        `当前 monitor 仍有 <code>${maxInconclusive}</code> 个连续 INCONCLUSIVE 窗口，先继续观察 EXEC 样本，不要基于 0 样本调参数。`,
+        `当前 monitor 仍有 <code>${windowSummary}</code> INCONCLUSIVE 窗口，先继续观察 EXEC 样本，不要基于 0 样本调参数。`,
         [
           { type: "jump", label: "跳到诊断", value: "diagnostics-panel" },
           { type: "jump", label: "跳到监控面板", value: "monitor-report-panel" },
@@ -613,11 +3133,11 @@
       );
     }
 
-    if (recommendationKind(report30.final_recommendation) !== "ready" || recommendationKind(report12.final_recommendation) !== "ready") {
+    if (report30RawKind !== "ready" || report12RawKind !== "ready" || report30Freshness.stale || report12Freshness.stale) {
       pushAction(
         level === "block" || level === "escalate" ? "danger" : "wait",
         "先处理 monitor 摘要里的执行问题",
-        `优先阅读 30m / 12h monitor 的最终建议，先解决 skip / reject / exit 比例异常，再讨论策略参数是否要调整。`,
+        `优先阅读 30m / 12h monitor 的原始建议，并刷新过期窗口；当前 30m ${monitorWindowDisplaySummary(report30, 30 * 60, nowTs)} / 12h ${monitorWindowDisplaySummary(report12, 12 * 60 * 60, nowTs)}。`,
         [
           { type: "jump", label: "跳到诊断", value: "diagnostics-panel" },
           { type: "jump", label: "跳到监控面板", value: "monitor-report-panel" },
@@ -1409,6 +3929,7 @@
     const items = Array.isArray(gate && gate.items) ? gate.items : [];
     const issues = Array.isArray(gate && gate.issues) ? gate.issues : [];
     const actions = Array.isArray(gate && gate.actions) ? gate.actions : [];
+    const visibleActions = actions.slice(0, 5);
     checksEl.innerHTML = items.length > 0
       ? items.map((item) => `<li><span>${String(item.label || "-")}</span><b>${String(item.value || "-")}</b></li>`).join("")
       : '<li><span>状态</span><b>等待数据...</b></li>';
@@ -1416,9 +3937,9 @@
       checksEl.innerHTML += issues.slice(0, 2).map((item) => `<li><span>重点问题</span><b>${String(item)}</b></li>`).join("");
     }
 
-    actionsMetaEl.textContent = `${actions.length} actions`;
-    actionsEl.innerHTML = actions.length > 0
-      ? actions.slice(0, 5).map((item) => {
+    actionsMetaEl.textContent = actions.length > visibleActions.length ? `${visibleActions.length}/${actions.length} actions` : `${actions.length} actions`;
+    actionsEl.innerHTML = visibleActions.length > 0
+      ? visibleActions.map((item) => {
           const cls = String(item && item.cls || "wait");
           const tag = cls === "danger" ? "优先" : cls === "ok" ? "继续" : "观察";
           const controls = Array.isArray(item && item.controls) ? item.controls : [];
@@ -1472,13 +3993,16 @@
     const [recon30Cls, recon30Tag] = reportDecisionMeta(report30.final_recommendation || report30.recommendation, report30.reconciliation_status);
     const [recon12Cls, recon12Tag] = reportDecisionMeta(report12.final_recommendation || report12.recommendation, report12.reconciliation_status);
     const [eodCls, eodTag] = reportStatusMeta(eod.status || eodReconciliation.status || "unknown");
+    const report30Freshness = reportFreshnessMeta(report30, 30 * 60, now);
+    const report12Freshness = reportFreshnessMeta(report12, 12 * 60 * 60, now);
+    const eodFreshness = reportFreshnessMeta(eod, 24 * 60 * 60, now);
     const internalDiff = Number(eodReconciliation.internal_vs_ledger_diff || 0);
     const fillCount = Number(ledgerSummary.fill_count || 0);
-    const generatedTs = Math.max(Number(report30.generated_ts || 0), Number(report12.generated_ts || 0), Number(eod.generated_ts || 0));
-
-    metaEl.textContent = generatedTs > 0
-      ? `latest ${fmtDateTime(generatedTs)} · ${fmtAge(Math.max(0, Math.floor(Date.now() / 1000) - generatedTs))}前`
-      : "30m / 12h / EOD";
+    metaEl.textContent = [
+      `30m ${report30Freshness.ageLabel}${report30Freshness.stale ? " · STALE" : ""}`,
+      `12h ${report12Freshness.ageLabel}${report12Freshness.stale ? " · STALE" : ""}`,
+      `EOD ${eodFreshness.ageLabel}`,
+    ].join(" · ");
 
     summaryEl.innerHTML = [
       `<div class="review-chip"><span>启动就绪</span><b><span class="tag ${startupCls}">${startupTag}</span></b></div>`,
@@ -1492,7 +4016,7 @@
     let calloutCls = "ok";
     let calloutTag = "对齐";
     let calloutTitle = "执行与监控链路已接通";
-    let calloutBody = "可以直接从 dashboard 读取 30m、12h 和 EOD 摘要，不再需要人工翻 shell 文本。";
+    let calloutBody = `30m ${report30Freshness.ageLabel}${report30Freshness.stale ? " · STALE" : ""}，12h ${report12Freshness.ageLabel}${report12Freshness.stale ? " · STALE" : ""}，EOD ${eodFreshness.ageLabel}。`;
     if (startupReady === false) {
       calloutCls = "danger";
       calloutTag = "阻断";
@@ -1502,22 +4026,33 @@
       calloutCls = "danger";
       calloutTag = "对账失败";
       calloutTitle = "执行事实层存在漂移";
-      calloutBody = String(report12.final_recommendation || report30.final_recommendation || recommendations[0] || "请优先检查 ledger 漂移、broker 同步和陈旧 pending 单。");
-    } else if (String(eod.status || "").toLowerCase() === "warn" || String(report12.reconciliation_status || "").toLowerCase() === "warn" || String(report30.reconciliation_status || "").toLowerCase() === "warn") {
+      calloutBody = String(eodIssues[0] || report12.final_recommendation || report30.final_recommendation || recommendations[0] || "请优先检查 ledger 漂移、broker 同步和陈旧 pending 单。");
+    } else if (String(eod.status || "").toLowerCase() === "warn" || String(report12.reconciliation_status || "").toLowerCase() === "warn" || String(report30.reconciliation_status || "").toLowerCase() === "warn" || report12Freshness.stale || report30Freshness.stale) {
       calloutCls = "wait";
       calloutTag = "观察";
       calloutTitle = "执行层有警告，暂不适合调参数";
-      calloutBody = String(report12.final_recommendation || report30.final_recommendation || recommendations[0] || "先处理 stale pending orders、snapshot age 和 reconcile age。");
+      calloutBody = String(
+        report12Freshness.stale || report30Freshness.stale
+          ? `monitor 报告存在过期窗口：30m ${report30Freshness.ageLabel}${report30Freshness.stale ? " · STALE" : ""}，12h ${report12Freshness.ageLabel}${report12Freshness.stale ? " · STALE" : ""}。`
+          : eodIssues[0] || report12.final_recommendation || report30.final_recommendation || recommendations[0] || "先处理 stale pending orders、snapshot age 和 reconcile age。"
+      );
     }
     calloutEl.innerHTML = `<span class="tag ${calloutCls}">${calloutTag}</span><div><b>${calloutTitle}</b><p>${calloutBody}</p></div>`;
 
-    const renderMonitorWindow = (el, report, label) => {
+    const renderMonitorWindow = (el, report, label, windowSeconds) => {
       const counts = report.counts && typeof report.counts === "object" ? report.counts : {};
       const ratios = report.ratios && typeof report.ratios === "object" ? report.ratios : {};
       const reconciliation = report.reconciliation && typeof report.reconciliation === "object" ? report.reconciliation : {};
       const [sampleCls, sampleTag] = reportStatusMeta(report.sample_status || "unknown");
       const [decisionCls, decisionTag] = reportDecisionMeta(report.final_recommendation || report.recommendation, report.reconciliation_status || reconciliation.status || "unknown");
       const [reconCls, reconTag] = reportStatusMeta(report.reconciliation_status || reconciliation.status || "unknown");
+      const freshness = reportFreshnessMeta(report, windowSeconds, now);
+      const [freshCls, freshTag] = freshness.stale ? ["danger", `STALE · ${freshness.ageLabel}`] : ["wait", freshness.ageLabel];
+      const rawRecommendation = String(report.recommendation || "").trim();
+      const finalRecommendation = String(report.final_recommendation || "").trim();
+      const recommendationText = finalRecommendation && rawRecommendation && finalRecommendation !== rawRecommendation
+        ? `${finalRecommendation} · 原始 monitor: ${rawRecommendation}`
+        : finalRecommendation || rawRecommendation || "";
       const issueText = String(report.reconciliation_issue_summary || "").trim() || "(none)";
       const generated = Number(report.generated_ts || 0);
       const exec = Number(counts.exec || 0);
@@ -1531,15 +4066,15 @@
       const recAge = Number(reconciliation.broker_reconcile_age_seconds || 0);
       const eventAge = Number(reconciliation.broker_event_sync_age_seconds || 0);
       el.innerHTML = [
-        `<li><div class="review-main"><span>${label} 窗口</span><b><span class="tag ${sampleCls}">${sampleTag}</span> <span class="tag ${decisionCls}">${decisionTag}</span></b></div><div class="review-sub">${generated > 0 ? `${fmtDateTime(generated)} · ${fmtAge(Math.max(0, Math.floor(Date.now() / 1000) - generated))}前` : "尚未生成报告"}</div></li>`,
+        `<li><div class="review-main"><span>${label} 窗口</span><b><span class="tag ${sampleCls}">${sampleTag}</span> <span class="tag ${decisionCls}">${decisionTag}</span> <span class="tag ${freshCls}">${freshTag}</span></b></div><div class="review-sub">${generated > 0 ? `${fmtDateTime(generated)} · ${historyAgeLabel(generated, now)}` : "尚未生成报告"}</div></li>`,
         `<li><div class="review-main"><span>样本与计数</span><b>${exec} EXEC</b></div><div class="review-sub">skip max ${skipMax} · cooldown ${addCd} · time exit ${timeExit}${reject > 0 ? ` · reject ${reject}` : ""}</div></li>`,
         `<li><div class="review-main"><span>比例与同步</span><b><span class="tag ${reconCls}">${reconTag}</span></b></div><div class="review-sub">skip ${skipRatio} · exit ${exitRatio}${reject > 0 || ratios.reject_wallet_failures_per_exec != null ? ` · reject ${rejectRatio}` : ""} · reconcile ${recAge > 0 ? fmtAge(recAge) : "--"} · events ${eventAge > 0 ? fmtAge(eventAge) : "--"}</div></li>`,
-        `<li><div class="review-main"><span>最终建议</span><b>${decisionTag}</b></div><div class="review-sub">${String(report.final_recommendation || report.recommendation || issueText || "暂无建议")}</div></li>`,
+        `<li><div class="review-main"><span>最终建议</span><b>${decisionTag}</b></div><div class="review-sub">${recommendationText || issueText || "暂无建议"}</div></li>`,
       ].join("");
     };
 
-    renderMonitorWindow(list30El, report30, "30m");
-    renderMonitorWindow(list12El, report12, "12h");
+    renderMonitorWindow(list30El, report30, "30m", 30 * 60);
+    renderMonitorWindow(list12El, report12, "12h", 12 * 60 * 60);
 
     const startupFailures = Number(eodStartup.failure_count || 0);
     const startupWarnings = Number(eodStartup.warning_count || 0);
@@ -1614,7 +4149,9 @@
       ? { ...lastOperatorAction, status: "requested" }
       : lastOperatorAction;
     const operatorMeta = operatorActionMeta(operatorActionStatus);
-    const generatedTs = Math.max(Number(report30.generated_ts || 0), Number(report12.generated_ts || 0), Number(eod.generated_ts || 0), Number(state.ts || 0));
+    const report30Freshness = reportFreshnessMeta(report30, 30 * 60, now);
+    const report12Freshness = reportFreshnessMeta(report12, 12 * 60 * 60, now);
+    const eodFreshness = reportFreshnessMeta(eod, 24 * 60 * 60, now);
 
     lastDiagnosticsState = state;
     lastDiagnosticsMonitor30 = report30;
@@ -1622,9 +4159,12 @@
     lastDiagnosticsEod = eod;
     lastDiagnosticsNow = now;
 
-    metaEl.textContent = generatedTs > 0
-      ? `${fmtDateTime(generatedTs)} · ${fmtAge(Math.max(0, Math.floor(Date.now() / 1000) - generatedTs))}前`
-      : "startup / reconciliation / monitor";
+    metaEl.textContent = [
+      `startup ${Number(state.ts || 0) > 0 ? historyAgeLabel(state.ts, now) : "未记录"}`,
+      `30m ${report30Freshness.ageLabel}${report30Freshness.stale ? " · STALE" : ""}`,
+      `12h ${report12Freshness.ageLabel}${report12Freshness.stale ? " · STALE" : ""}`,
+      `EOD ${eodFreshness.ageLabel}`,
+    ].join(" · ");
 
     const startupKeys = new Set(startupChecks.map((row) => String(row && row.name || "startup")));
     const pendingKeys = new Set(pendingOrders.map((row) => String(row._diagKey || "")));
@@ -1722,8 +4262,12 @@
 
     const stateIssues = Array.isArray(reconciliation.issues) ? reconciliation.issues : [];
     stateIssues.slice(0, 4).forEach((item) => pushIssue("state reconciliation", String(item), String(reconciliation.status || "wait")));
-    if (report30.final_recommendation) pushIssue("30m monitor", String(report30.final_recommendation), recommendationKind(report30.final_recommendation) === "ready" ? "ok" : recommendationKind(report30.final_recommendation));
-    if (report12.final_recommendation) pushIssue("12h monitor", String(report12.final_recommendation), recommendationKind(report12.final_recommendation) === "ready" ? "ok" : recommendationKind(report12.final_recommendation));
+    if (report30.final_recommendation || report30Freshness.stale) {
+      pushIssue("30m monitor", monitorWindowDisplaySummary(report30, 30 * 60, now), report30Freshness.stale ? "warn" : (recommendationKind(report30.final_recommendation) === "ready" ? "ok" : recommendationKind(report30.final_recommendation)));
+    }
+    if (report12.final_recommendation || report12Freshness.stale) {
+      pushIssue("12h monitor", monitorWindowDisplaySummary(report12, 12 * 60 * 60, now), report12Freshness.stale ? "warn" : (recommendationKind(report12.final_recommendation) === "ready" ? "ok" : recommendationKind(report12.final_recommendation)));
+    }
     eodIssues.slice(0, 3).forEach((item) => pushIssue("EOD issue", String(item), String(eod.status || "wait")));
     eodRecommendations.slice(0, 3).forEach((item) => pushIssue("EOD recommendation", String(item), String(eod.status || "wait")));
     if (operatorRequestTs > 0) {
@@ -2391,26 +4935,334 @@
     }
   }
 
+  function bindDecisionConsoleActions() {
+    const workspaceNav = $("workspace-nav");
+    if (workspaceNav && workspaceNav.dataset.bound !== "1") {
+      workspaceNav.dataset.bound = "1";
+      workspaceNav.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-workspace-view]");
+        if (!button) return;
+        const next = String(button.getAttribute("data-workspace-view") || "").trim();
+        if (!next || next === workspaceView) return;
+        workspaceView = next;
+        persistExitReviewUiState();
+        renderWorkspaceShell();
+      });
+    }
+
+    const focusSwitch = $("candidate-focus-view-switch");
+    if (focusSwitch && focusSwitch.dataset.bound !== "1") {
+      focusSwitch.dataset.bound = "1";
+      focusSwitch.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-candidate-focus-view]");
+        if (!button) return;
+        const next = String(button.getAttribute("data-candidate-focus-view") || "").trim();
+        if (!next || next === candidateFocusView) return;
+        candidateFocusView = next;
+        persistExitReviewUiState();
+        renderCandidateFocusViewSwitch();
+        if ($("candidate-grid-meta")) {
+          const visiblePayload = filteredCandidatePayload(lastDecisionCandidates || EMPTY_CANDIDATES).visiblePayload;
+          const visibleCount = Array.isArray(visiblePayload.items) ? visiblePayload.items.length : 0;
+          const totalCount = Array.isArray((lastDecisionCandidates && lastDecisionCandidates.items) || []) ? lastDecisionCandidates.items.length : 0;
+          $("candidate-grid-meta").textContent = `${visibleCount}/${totalCount} visible · ${candidateFocusViewLabel(candidateFocusView)}`;
+        }
+      });
+    }
+
+    const switchEl = $("decision-mode-switch");
+    if (switchEl && switchEl.dataset.bound !== "1") {
+      switchEl.dataset.bound = "1";
+      switchEl.addEventListener("click", async (event) => {
+        const button = event.target.closest("[data-mode]");
+        if (!button) return;
+        const mode = String(button.getAttribute("data-mode") || "").trim();
+        if (!mode || mode === controlState.decision_mode) return;
+        decisionConsoleNotice = { cls: "wait", text: `切换 decision mode 到 ${modeLabel(mode)}...` };
+        renderDecisionConsole(lastDecisionCandidates, lastDecisionMode, lastDecisionApiState);
+        setButtonBusy(button, true);
+        try {
+          const next = await pushMode(mode);
+          lastDecisionMode = {
+            ...lastDecisionMode,
+            ...(next && typeof next === "object" ? next : {}),
+          };
+          decisionConsoleNotice = { cls: "ok", text: `decision mode 已切换为 ${modeLabel(mode)}` };
+          renderDecisionConsole(lastDecisionCandidates, lastDecisionMode, lastDecisionApiState);
+          await refresh();
+        } catch (_err) {
+          decisionConsoleNotice = { cls: "danger", text: `decision mode 切换失败: ${modeLabel(mode)}` };
+          renderDecisionConsole(lastDecisionCandidates, lastDecisionMode, lastDecisionApiState);
+        } finally {
+          setButtonBusy(button, false);
+        }
+      });
+    }
+
+    const candidatePanel = $("candidate-panel");
+    if (candidatePanel && candidatePanel.dataset.filterBound !== "1") {
+      candidatePanel.dataset.filterBound = "1";
+      candidatePanel.addEventListener("click", (event) => {
+        const filterButton = event.target.closest("[data-candidate-filter]");
+        if (filterButton) {
+          const key = String(filterButton.getAttribute("data-candidate-filter") || "").trim();
+          const value = String(filterButton.getAttribute("data-filter-value") || "all").trim();
+          if (key) updateCandidateQueueFilter({ [key]: value });
+          return;
+        }
+        const clearButton = event.target.closest("#candidate-clear-filters");
+        if (clearButton) {
+          resetCandidateQueueFilter();
+          return;
+        }
+        const toggleButton = event.target.closest("#candidate-toggle-filters");
+        if (toggleButton) {
+          candidateFiltersExpanded = !candidateFiltersExpanded;
+          persistExitReviewUiState();
+          renderCandidateFilterToggle();
+        }
+      });
+      candidatePanel.addEventListener("input", (event) => {
+        const searchInput = event.target.closest("#candidate-search-input");
+        if (!searchInput) return;
+        updateCandidateQueueFilter({ search: String(searchInput.value || "") });
+      });
+      candidatePanel.addEventListener("change", (event) => {
+        const sortSelect = event.target.closest("#candidate-sort-select");
+        if (!sortSelect) return;
+        updateCandidateQueueFilter({ sort: String(sortSelect.value || "score_desc") });
+      });
+    }
+
+    const grid = $("candidate-grid");
+    if (grid && grid.dataset.bound !== "1") {
+      grid.dataset.bound = "1";
+      grid.addEventListener("click", async (event) => {
+        const button = event.target.closest("[data-action]");
+        const card = button ? button.closest("[data-candidate-id]") : event.target.closest("[data-candidate-id]");
+        const candidateId = card ? String(card.getAttribute("data-candidate-id") || "").trim() : "";
+        const candidateSide = card ? String(card.getAttribute("data-candidate-side") || "BUY").trim().toUpperCase() : "BUY";
+        if (!candidateId) return;
+        if (!button) {
+          if (candidateId === selectedCandidateId) return;
+          selectedCandidateId = candidateId;
+          candidateFocusView = "summary";
+          persistExitReviewUiState();
+          lastCandidateDetailApiState = {
+            ok: lastCandidateDetailApiState.ok,
+            error: "",
+            candidateId,
+            pending: true,
+          };
+          renderCandidateFocusViewSwitch();
+          renderDecisionConsole(lastDecisionCandidates, lastDecisionMode, lastDecisionApiState);
+          loadCandidateDetail(candidateId, { force: true })
+            .catch(() => null)
+            .finally(() => {
+              renderDecisionConsole(lastDecisionCandidates, lastDecisionMode, lastDecisionApiState);
+            });
+          return;
+        }
+        const action = String(button.getAttribute("data-action") || "").trim();
+        if (!action) return;
+        candidateRequestState[candidateId] = {
+          kind: "pending",
+          message: `${candidateActionText(action, candidateSide)} 提交中...`,
+        };
+        renderDecisionConsole(lastDecisionCandidates, lastDecisionMode, lastDecisionApiState);
+        setButtonBusy(button, true);
+        try {
+          await pushCandidateAction(candidateId, action, "");
+          candidateRequestState[candidateId] = {
+            kind: "success",
+            message: `${candidateActionText(action, candidateSide)} 已提交`,
+          };
+          renderDecisionConsole(lastDecisionCandidates, lastDecisionMode, lastDecisionApiState);
+          await refresh();
+        } catch (_err) {
+          candidateRequestState[candidateId] = {
+            kind: "error",
+            message: `${candidateActionText(action, candidateSide)} 提交失败`,
+          };
+          renderDecisionConsole(lastDecisionCandidates, lastDecisionMode, lastDecisionApiState);
+        } finally {
+          setButtonBusy(button, false);
+        }
+      });
+    }
+  }
+
+  function bindWalletProfileEditors() {
+    const body = $("wallet-profiles-body");
+    if (!body || body.dataset.bound === "1") return;
+    body.dataset.bound = "1";
+
+    const syncDraft = (target) => {
+      const field = String(target.getAttribute("data-wallet-profile-field") || "").trim();
+      const wallet = readAttrToken(target.getAttribute("data-wallet-profile-key") || "");
+      const source = walletProfileSource(wallet);
+      if (!field || !wallet || !source) return;
+      const draft = walletProfileDraft(source);
+      draft[field] = field === "enabled" ? !!target.checked : String(target.value || "");
+      walletProfileDrafts[wallet] = draft;
+    };
+
+    body.addEventListener("input", (event) => {
+      const input = event.target.closest("[data-wallet-profile-field][data-wallet-profile-key]");
+      if (!input) return;
+      syncDraft(input);
+    });
+    body.addEventListener("change", (event) => {
+      const input = event.target.closest("[data-wallet-profile-field][data-wallet-profile-key]");
+      if (!input) return;
+      syncDraft(input);
+      renderWalletProfilesPanel(lastWalletProfiles, lastWalletProfilesApiState);
+    });
+    body.addEventListener("click", async (event) => {
+      const button = event.target.closest("button[data-wallet-profile-save]");
+      if (!button) return;
+      const wallet = readAttrToken(button.getAttribute("data-wallet-profile-save") || "");
+      const source = walletProfileSource(wallet);
+      if (!wallet || !source) return;
+      const draft = walletProfileDraft(source);
+      if (!walletProfileChanged(source, draft)) {
+        walletProfileRequestState[wallet] = { kind: "success", message: "无改动" };
+        renderWalletProfilesPanel(lastWalletProfiles, lastWalletProfilesApiState);
+        return;
+      }
+      walletProfileRequestState[wallet] = { kind: "pending", message: "保存中..." };
+      renderWalletProfilesPanel(lastWalletProfiles, lastWalletProfilesApiState);
+      try {
+        await postJson("/api/wallet-profiles/update", {
+          wallet,
+          tag: String(draft.tag || "").trim(),
+          notes: String(draft.notes || "").trim(),
+          enabled: !!draft.enabled,
+          trust_score: Number(source.trust_score || 0),
+          followability_score: Number(source.followability_score || 0),
+          avg_hold_minutes: source.avg_hold_minutes,
+          category: String(source.category || ""),
+        });
+        walletProfileDrafts[wallet] = {
+          tag: String(draft.tag || "").trim(),
+          notes: String(draft.notes || "").trim(),
+          enabled: !!draft.enabled,
+        };
+        walletProfileRequestState[wallet] = { kind: "success", message: "已保存" };
+        renderWalletProfilesPanel(lastWalletProfiles, lastWalletProfilesApiState);
+        await refresh();
+      } catch (_err) {
+        walletProfileRequestState[wallet] = { kind: "error", message: "保存失败" };
+        renderWalletProfilesPanel(lastWalletProfiles, lastWalletProfilesApiState);
+      }
+    });
+  }
+
+  function bindJournalComposer() {
+    const input = $("journal-note-input");
+    const button = $("journal-note-save");
+    if (!input || !button || button.dataset.bound === "1") return;
+    button.dataset.bound = "1";
+
+    const submit = async () => {
+      const text = String(input.value || "").trim();
+      if (!text) {
+        journalComposerNotice = { cls: "danger", text: "请输入一句理由后再提交" };
+        renderJournalPanel(lastJournalSummary, lastJournalApiState);
+        return;
+      }
+      journalComposerNotice = { cls: "wait", text: "日记提交中..." };
+      renderJournalPanel(lastJournalSummary, lastJournalApiState);
+      setButtonBusy(button, true);
+      try {
+        await postJson("/api/journal/note", {
+          text,
+          action: "note",
+          wallet: selectedWallet || "",
+          trace_id: selectedTraceId || "",
+          result_tag: "manual_note",
+        });
+        input.value = "";
+        journalComposerNotice = { cls: "ok", text: "已写入交易日记" };
+        renderJournalPanel(lastJournalSummary, lastJournalApiState);
+        await refresh();
+      } catch (_err) {
+        journalComposerNotice = { cls: "danger", text: "写入日记失败" };
+        renderJournalPanel(lastJournalSummary, lastJournalApiState);
+      } finally {
+        setButtonBusy(button, false);
+      }
+    };
+
+    button.addEventListener("click", submit);
+    input.addEventListener("keydown", (event) => {
+      if (event.key !== "Enter" || event.shiftKey) return;
+      event.preventDefault();
+      submit();
+    });
+  }
+
   async function refresh() {
     try {
-      const [data, monitor30m, monitor12h, reconciliationEod] = await Promise.all([
+      const [data, monitor30m, monitor12h, reconciliationEod, candidateResult, modeResult, journalResult, walletProfilesResult] = await Promise.all([
         fetchJson("/api/state", null),
         fetchJson("/api/monitor/30m", EMPTY_MONITOR_REPORT("monitor_30m")),
         fetchJson("/api/monitor/12h", EMPTY_MONITOR_REPORT("monitor_12h")),
         fetchJson("/api/reconciliation/eod", EMPTY_RECONCILIATION_EOD_REPORT),
+        fetchJsonState("/api/candidates", EMPTY_CANDIDATES),
+        fetchJsonState("/api/mode", EMPTY_DECISION_MODE),
+        fetchJsonState("/api/journal", EMPTY_JOURNAL),
+        fetchJsonState("/api/wallet-profiles", EMPTY_WALLET_PROFILES),
       ]);
+      const candidateData = candidateResult && candidateResult.data ? candidateResult.data : EMPTY_CANDIDATES;
+      const modeData = modeResult && modeResult.data ? modeResult.data : EMPTY_DECISION_MODE;
+      const journalData = journalResult && journalResult.data ? journalResult.data : EMPTY_JOURNAL;
+      const walletProfilesData = walletProfilesResult && walletProfilesResult.data ? walletProfilesResult.data : EMPTY_WALLET_PROFILES;
+      const stateData = data || {};
+      renderWorkspaceShell();
+      renderCandidateFocusViewSwitch();
+      const visibleCandidatePayload = filteredCandidatePayload(candidateData || EMPTY_CANDIDATES).visiblePayload;
+      const activeCandidate = selectedCandidate(visibleCandidatePayload) || null;
+      await loadCandidateDetail(candidateKey(activeCandidate || ""), {
+        force: candidateKey(activeCandidate || "") !== String(lastCandidateDetailApiState.candidateId || ""),
+      });
+      if (decisionConsoleNotice.cls === "ok" && candidateResult.ok && modeResult.ok) {
+        decisionConsoleNotice = { cls: "", text: "" };
+      }
+      renderDecisionConsole(candidateData || (data && data.candidates) || EMPTY_CANDIDATES, modeData || (data && data.decision_mode) || EMPTY_DECISION_MODE, {
+        candidates: { ok: !!(candidateResult && candidateResult.ok), error: String(candidateResult && candidateResult.error || "") },
+        mode: { ok: !!(modeResult && modeResult.ok), error: String(modeResult && modeResult.error || "") },
+      });
+      renderWalletProfilesPanel(walletProfilesData || (data && data.wallet_profiles) || EMPTY_WALLET_PROFILES, {
+        ok: !!(walletProfilesResult && walletProfilesResult.ok),
+        error: String(walletProfilesResult && walletProfilesResult.error || ""),
+      });
+      renderJournalPanel(journalData || (data && data.journal_summary) || EMPTY_JOURNAL, {
+        ok: !!(journalResult && journalResult.ok),
+        error: String(journalResult && journalResult.error || ""),
+      });
+      renderNotifierPanel(stateData.notifier || EMPTY_NOTIFIER);
+      const now = Number(stateData.ts || 0);
+      renderArchivePanel(stateData, monitor30m, monitor12h, reconciliationEod, now);
       if (!data) return;
 
-      const summary = data.summary || {};
-      const config = data.config || {};
-      const control = data.control || {};
-      const now = Number(data.ts || 0);
+      const summary = stateData.summary || {};
+      const account = stateData.account || {};
+      const config = stateData.config || {};
+      const control = stateData.control || {};
       const pollSec = Number(config.poll_interval_seconds || 0);
       const stateAgeSec = Math.max(0, Math.floor(Date.now() / 1000 - now));
       const slotUtil = Number(summary.slot_utilization_pct || summary.exposure_pct || 0);
       const mode = String(config.execution_mode || (config.dry_run ? "paper" : "live")).toLowerCase();
       const brokerName = String(config.broker_name || (mode === "live" ? "LiveClobBroker" : "PaperBroker"));
-      const opsGate = computeOpsGate(data, monitor30m, monitor12h, reconciliationEod);
+      const accountEquity = Number(account.equity_usd || stateData.account_equity || summary.equity || 0);
+      const cashBalance = Number(account.cash_balance_usd || stateData.cash_balance_usd || summary.cash_balance_usd || 0);
+      const positionsValue = Number(account.positions_value_usd || stateData.positions_value_usd || summary.positions_value_usd || 0);
+      const trackedNotional = Number(account.tracked_notional_usd || stateData.tracked_notional_usd || summary.tracked_notional_usd || 0);
+      const availableNotional = Number(account.available_notional_usd || stateData.available_notional_usd || summary.available_notional_usd || config.bankroll_usd || 0);
+      const accountSnapshotTs = Number(account.account_snapshot_ts || stateData.account_snapshot_ts || summary.account_snapshot_ts || 0);
+      const accountSnapshotLabel = accountSnapshotTs > 0 ? `${hhmm(accountSnapshotTs)} · ${historyAgeLabel(accountSnapshotTs, now)}` : "等待账户同步";
+      const opsGate = computeOpsGate(data, monitor30m, monitor12h, reconciliationEod, now);
       renderControlState(control);
       updateModeBadge(config);
       renderOpsGate(opsGate);
@@ -2426,9 +5278,7 @@
       }
 
       if ($("budget-meta")) {
-        const trackedNotional = Number(summary.tracked_notional_usd || 0);
-        const availableNotional = Number(summary.available_notional_usd || config.bankroll_usd || 0);
-        $("budget-meta").textContent = `槽位 ${Number(summary.open_positions || 0)}/${Number(summary.max_open_positions || 0)} · 已用 ${trackedNotional.toFixed(2)}U / 可用 ${availableNotional.toFixed(2)}U`;
+        $("budget-meta").textContent = `权益 ${accountEquity.toFixed(2)}U · 现金 ${cashBalance.toFixed(2)}U · 已用 ${trackedNotional.toFixed(2)}U / 可用 ${availableNotional.toFixed(2)}U`;
       }
       if ($("budget-fill")) {
         $("budget-fill").style.width = `${Math.max(0, Math.min(100, slotUtil)).toFixed(1)}%`;
@@ -2438,12 +5288,19 @@
       if ($("kpi-mode-note")) {
         $("kpi-mode-note").textContent = mode === "live" ? `${brokerName} · 会发送真实订单` : `${brokerName} · 不会发送真实订单`;
       }
+      if ($("kpi-equity")) $("kpi-equity").textContent = fmtUsd(accountEquity, false);
+      if ($("kpi-equity-note")) {
+        $("kpi-equity-note").textContent = `现金 ${fmtUsd(cashBalance, false)} · 仓位 ${fmtUsd(positionsValue, false)}`;
+      }
+      if ($("kpi-cash")) $("kpi-cash").textContent = fmtUsd(cashBalance, false);
+      if ($("kpi-cash-note")) {
+        $("kpi-cash-note").textContent = `可用预算 ${availableNotional.toFixed(2)}U · ${accountSnapshotLabel}`;
+      }
       if ($("kpi-pos")) $("kpi-pos").textContent = `${Number(summary.open_positions || 0)} / ${Number(summary.max_open_positions || 0)}`;
       if ($("kpi-slot-note")) $("kpi-slot-note").textContent = `槽位利用率 ${fmtPct(slotUtil, 2)}`;
-      if ($("kpi-notional")) $("kpi-notional").textContent = fmtUsd(summary.tracked_notional_usd || 0, false);
+      if ($("kpi-notional")) $("kpi-notional").textContent = fmtUsd(trackedNotional, false);
       if ($("kpi-notional-note")) {
-        const available = Number(summary.available_notional_usd || 0);
-        $("kpi-notional-note").textContent = `每轮信号 ${Number(summary.signals || 0)} · 可用预算 ${available.toFixed(2)}U`;
+        $("kpi-notional-note").textContent = `每轮信号 ${Number(summary.signals || 0)} · 账本快照 ${accountSnapshotLabel}`;
       }
       if ($("kpi-risk-mode")) {
         $("kpi-risk-mode").textContent = slotUtil >= Number(config.congested_utilization_threshold || 1) * 100 ? "拥堵自适应" : "常规风控";
@@ -2663,7 +5520,13 @@
   }
 
   loadUiState();
+  renderWorkspaceShell();
+  renderCandidateFocusViewSwitch();
   bindControlActions();
+  bindDecisionConsoleActions();
+  bindWalletProfileEditors();
+  bindJournalComposer();
+  bindArchiveActions();
   bindOpsGateActions();
   bindWalletSelection();
   bindExitReviewFilters();

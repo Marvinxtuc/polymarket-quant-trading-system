@@ -10,6 +10,7 @@ from typing import Any
 
 from polymarket_bot.config import Settings
 from polymarket_bot.main import build_trader, setup_logger
+from polymarket_bot.notifier import Notifier
 
 
 def _safe_write_json(path: str, payload: dict[str, Any]) -> None:
@@ -18,6 +19,402 @@ def _safe_write_json(path: str, payload: dict[str, Any]) -> None:
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)
     os.replace(tmp_path, path)
+
+
+def _safe_read_json(path: str, fallback: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(fallback)
+    if not path:
+        return payload
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            payload.update(data)
+    except FileNotFoundError:
+        return payload
+    except Exception:
+        return dict(fallback)
+    return payload
+
+
+def _default_decision_mode() -> dict[str, Any]:
+    return {
+        "mode": "auto",
+        "updated_ts": 0,
+        "updated_by": "",
+        "note": "",
+        "available_modes": ["manual", "semi_auto", "auto"],
+    }
+
+
+def _default_candidate_action_store() -> dict[str, Any]:
+    return {"items": []}
+
+
+def _default_wallet_profile_store() -> dict[str, Any]:
+    return {"profiles": {}, "updated_ts": 0}
+
+
+def _default_journal_store() -> dict[str, Any]:
+    return {"notes": []}
+
+
+def _empty_stats_summary() -> dict[str, Any]:
+    return {
+        "days": 30,
+        "recent_days": 7,
+        "updated_ts": 0,
+        "candidates": {
+            "days": 30,
+            "window_start_ts": 0,
+            "total_candidates": 0,
+            "avg_score": 0.0,
+            "by_status": [],
+            "updated_ts": 0,
+        },
+        "candidate_actions": {
+            "days": 30,
+            "window_start_ts": 0,
+            "total_actions": 0,
+            "total_notional": 0.0,
+            "by_action": [],
+            "updated_ts": 0,
+        },
+        "journal": _build_journal_summary({"notes": []}),
+        "archive": _empty_archive_summary(),
+        "wallet_profiles": {"count": 0, "enabled": 0, "watched": 0},
+        "totals": {"candidate_count": 0, "action_count": 0, "journal_count": 0},
+    }
+
+
+def _empty_archive_summary() -> dict[str, Any]:
+    return {
+        "days": 30,
+        "recent_days": 7,
+        "window_start_ts": 0,
+        "recent_window_start_ts": 0,
+        "day_count": 0,
+        "summary": {
+            "candidate_count": 0,
+            "action_count": 0,
+            "journal_count": 0,
+            "days": 30,
+        },
+        "daily_rows": [],
+        "recent_summary": {
+            "days": 7,
+            "window_start_ts": 0,
+            "day_count": 0,
+            "candidate_count": 0,
+            "action_count": 0,
+            "journal_count": 0,
+            "updated_ts": 0,
+        },
+        "updated_ts": 0,
+    }
+
+
+def _as_str_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def _normalize_decision_mode(payload: dict[str, Any] | None) -> dict[str, Any]:
+    source = dict(payload or {})
+    mode = str(source.get("mode") or "auto").strip().lower()
+    if mode not in {"manual", "semi_auto", "auto"}:
+        mode = "auto"
+    return {
+        "mode": mode,
+        "updated_ts": int(source.get("updated_ts") or 0),
+        "updated_by": str(source.get("updated_by") or ""),
+        "note": str(source.get("note") or ""),
+        "available_modes": ["manual", "semi_auto", "auto"],
+    }
+
+
+def _candidate_action_index(payload: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    index: dict[str, dict[str, Any]] = {}
+    items = list((payload or {}).get("items") or [])
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        signal_id = str(raw.get("signal_id") or "").strip()
+        if not signal_id:
+            continue
+        row = dict(raw)
+        row["updated_ts"] = int(row.get("updated_ts") or row.get("requested_ts") or 0)
+        existing = index.get(signal_id)
+        if existing is None or int(row.get("updated_ts") or 0) >= int(existing.get("updated_ts") or 0):
+            index[signal_id] = row
+    return index
+
+
+def _build_candidates(
+    signal_review: dict[str, Any],
+    candidate_actions: dict[str, Any] | None,
+) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    action_index = _candidate_action_index(candidate_actions)
+    cycles = list(signal_review.get("cycles") or [])
+    for cycle in cycles:
+        if not isinstance(cycle, dict):
+            continue
+        cycle_id = str(cycle.get("cycle_id") or "")
+        cycle_ts = int(cycle.get("ts") or 0)
+        for raw in list(cycle.get("candidates") or []):
+            if not isinstance(raw, dict):
+                continue
+            signal_id = str(raw.get("signal_id") or "")
+            action = action_index.get(signal_id, {})
+            final_status = str(raw.get("final_status") or "candidate")
+            review_status = str(action.get("status") or ("waiting" if final_status == "candidate" else "closed"))
+            items.append(
+                {
+                    "cycle_id": cycle_id,
+                    "cycle_ts": cycle_ts,
+                    "signal_id": signal_id,
+                    "trace_id": str(raw.get("trace_id") or ""),
+                    "title": str(raw.get("title") or ""),
+                    "token_id": str(raw.get("token_id") or ""),
+                    "outcome": str(raw.get("outcome") or ""),
+                    "wallet": str(raw.get("wallet") or ""),
+                    "side": str(raw.get("side") or ""),
+                    "action": str(raw.get("action") or ""),
+                    "action_label": str(raw.get("action_label") or ""),
+                    "final_status": final_status,
+                    "wallet_score": float(raw.get("wallet_score") or 0.0),
+                    "wallet_tier": str(raw.get("wallet_tier") or ""),
+                    "topic_label": str(raw.get("topic_label") or ""),
+                    "topic_bias": str(raw.get("topic_bias") or ""),
+                    "topic_multiplier": float(raw.get("topic_multiplier") or 1.0),
+                    "decision_reason": str(raw.get("decision_reason") or ""),
+                    "sized_notional": float(raw.get("sized_notional") or 0.0),
+                    "final_notional": float(raw.get("final_notional") or 0.0),
+                    "budget_limited": bool(raw.get("budget_limited", False)),
+                    "duplicate": bool(raw.get("duplicate", False)),
+                    "order_status": str(raw.get("order_status") or ""),
+                    "order_reason": str(raw.get("order_reason") or ""),
+                    "order_notional": float(raw.get("order_notional") or 0.0),
+                    "review_action": str(action.get("action") or ""),
+                    "review_status": review_status,
+                    "review_note": str(action.get("note") or ""),
+                    "review_updated_ts": int(action.get("updated_ts") or 0),
+                }
+            )
+    summary = {
+        "count": len(items),
+        "candidate": sum(1 for row in items if str(row.get("final_status") or "") == "candidate"),
+        "filled": sum(1 for row in items if str(row.get("final_status") or "") == "filled"),
+        "rejected": sum(1 for row in items if "reject" in str(row.get("final_status") or "")),
+        "skipped": sum(
+            1
+            for row in items
+            if str(row.get("final_status") or "") not in {"candidate", "filled"}
+            and "reject" not in str(row.get("final_status") or "")
+        ),
+        "waiting_review": sum(1 for row in items if str(row.get("review_status") or "") == "waiting"),
+        "queued_actions": sum(
+            1
+            for row in items
+            if str(row.get("review_status") or "") in {"pending", "queued", "requested"}
+        ),
+    }
+    return {"summary": summary, "items": items[:32]}
+
+
+def _wallet_profile_store_map(payload: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
+    store = dict((payload or {}).get("profiles") or {})
+    mapped: dict[str, dict[str, Any]] = {}
+    for wallet, raw in store.items():
+        key = str(wallet or "").strip().lower()
+        if not key or not isinstance(raw, dict):
+            continue
+        mapped[key] = dict(raw)
+    for raw in list((payload or {}).get("items") or []):
+        if not isinstance(raw, dict):
+            continue
+        key = str(raw.get("wallet") or "").strip().lower()
+        if not key:
+            continue
+        mapped[key] = dict(raw)
+    return mapped
+
+
+def _build_wallet_profiles(
+    wallets: list[dict[str, Any]],
+    payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    store_map = _wallet_profile_store_map(payload)
+    items: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    for raw in wallets:
+        wallet = str(raw.get("wallet") or "").strip().lower()
+        if not wallet:
+            continue
+        seen.add(wallet)
+        overlay = store_map.get(wallet, {})
+        items.append(
+            {
+                "wallet": wallet,
+                "score": float(raw.get("score") or 0.0),
+                "tier": str(raw.get("tier") or ""),
+                "trading_enabled": bool(raw.get("trading_enabled", False)),
+                "history_available": bool(raw.get("history_available", False)),
+                "recent_activity_events": raw.get("recent_activity_events"),
+                "closed_positions": int(raw.get("closed_positions") or 0),
+                "resolved_markets": int(raw.get("resolved_markets") or 0),
+                "alias": str(overlay.get("alias") or ""),
+                "status": str(overlay.get("status") or ""),
+                "note": str(overlay.get("note") or ""),
+                "tags": _as_str_list(overlay.get("tags")),
+                "watch": bool(overlay.get("watch", False)),
+                "priority": int(overlay.get("priority") or 0),
+                "updated_ts": int(overlay.get("updated_ts") or 0),
+            }
+        )
+
+    for wallet, overlay in store_map.items():
+        if wallet in seen:
+            continue
+        items.append(
+            {
+                "wallet": wallet,
+                "score": 0.0,
+                "tier": "",
+                "trading_enabled": False,
+                "history_available": False,
+                "recent_activity_events": None,
+                "closed_positions": 0,
+                "resolved_markets": 0,
+                "alias": str(overlay.get("alias") or ""),
+                "status": str(overlay.get("status") or ""),
+                "note": str(overlay.get("note") or ""),
+                "tags": _as_str_list(overlay.get("tags")),
+                "watch": bool(overlay.get("watch", False)),
+                "priority": int(overlay.get("priority") or 0),
+                "updated_ts": int(overlay.get("updated_ts") or 0),
+            }
+        )
+
+    items.sort(
+        key=lambda row: (
+            int(row.get("priority") or 0),
+            float(row.get("score") or 0.0),
+            str(row.get("wallet") or ""),
+        ),
+        reverse=True,
+    )
+    summary = {
+        "count": len(items),
+        "watched": sum(1 for row in items if bool(row.get("watch", False))),
+        "annotated": sum(
+            1
+            for row in items
+            if str(row.get("alias") or "").strip()
+            or str(row.get("note") or "").strip()
+            or list(row.get("tags") or [])
+        ),
+        "updated_ts": int((payload or {}).get("updated_ts") or 0),
+    }
+    return {"summary": summary, "items": items[:32]}
+
+
+def _journal_notes(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    notes: list[dict[str, Any]] = []
+    for raw in list((payload or {}).get("notes") or []):
+        if not isinstance(raw, dict):
+            continue
+        notes.append(
+            {
+                "note_id": str(raw.get("note_id") or ""),
+                "ts": int(raw.get("ts") or 0),
+                "text": str(raw.get("text") or ""),
+                "tags": _as_str_list(raw.get("tags")),
+                "wallet": str(raw.get("wallet") or ""),
+                "signal_id": str(raw.get("signal_id") or ""),
+                "trace_id": str(raw.get("trace_id") or ""),
+            }
+        )
+    notes.sort(key=lambda row: int(row.get("ts") or 0), reverse=True)
+    return notes
+
+
+def _build_journal_summary(payload: dict[str, Any] | None) -> dict[str, Any]:
+    notes = _journal_notes(payload)
+    top_tags: dict[str, int] = {}
+    for note in notes:
+        for tag in list(note.get("tags") or []):
+            top_tags[tag] = top_tags.get(tag, 0) + 1
+    latest = notes[0] if notes else {}
+    return {
+        "count": len(notes),
+        "latest_ts": int(latest.get("ts") or 0),
+        "latest_note": str(latest.get("text") or ""),
+        "recent": notes[:5],
+        "top_tags": [
+            {"tag": tag, "count": count}
+            for tag, count in sorted(top_tags.items(), key=lambda item: (item[1], item[0]), reverse=True)[:8]
+        ],
+    }
+
+
+def _build_pending_actions(
+    candidates: dict[str, Any],
+    candidate_actions: dict[str, Any] | None,
+) -> dict[str, Any]:
+    items: list[dict[str, Any]] = []
+    action_index = _candidate_action_index(candidate_actions)
+    for candidate in list(candidates.get("items") or []):
+        if not isinstance(candidate, dict):
+            continue
+        if str(candidate.get("final_status") or "") != "candidate":
+            continue
+        signal_id = str(candidate.get("signal_id") or "")
+        action = action_index.get(signal_id)
+        if action:
+            items.append(
+                {
+                    "type": "candidate_action",
+                    "signal_id": signal_id,
+                    "trace_id": str(candidate.get("trace_id") or ""),
+                    "wallet": str(candidate.get("wallet") or ""),
+                    "title": str(candidate.get("title") or ""),
+                    "token_id": str(candidate.get("token_id") or ""),
+                    "requested_action": str(action.get("action") or ""),
+                    "status": str(action.get("status") or "pending"),
+                    "note": str(action.get("note") or ""),
+                    "updated_ts": int(action.get("updated_ts") or 0),
+                }
+            )
+            continue
+        items.append(
+            {
+                "type": "candidate_review",
+                "signal_id": signal_id,
+                "trace_id": str(candidate.get("trace_id") or ""),
+                "wallet": str(candidate.get("wallet") or ""),
+                "title": str(candidate.get("title") or ""),
+                "token_id": str(candidate.get("token_id") or ""),
+                "requested_action": "review",
+                "status": "waiting",
+                "note": "",
+                "updated_ts": int(candidate.get("cycle_ts") or 0),
+            }
+        )
+    items.sort(key=lambda row: int(row.get("updated_ts") or 0), reverse=True)
+    return {
+        "summary": {
+            "count": len(items),
+            "waiting": sum(1 for row in items if str(row.get("status") or "") == "waiting"),
+            "pending": sum(1 for row in items if str(row.get("status") or "") in {"pending", "queued", "requested"}),
+        },
+        "items": items[:32],
+    }
 
 
 def _fmt_ago(seconds: int) -> str:
@@ -559,6 +956,57 @@ def _build_exit_event_chain(order: dict[str, Any], orders: list[dict[str, Any]])
     return chain
 
 
+def _position_decision_advice(position: dict[str, Any], *, now: int, settings: Settings, utilization_pct: float) -> dict[str, Any]:
+    hold_minutes = max(0, int((now - int(position.get("opened_ts") or now)) // 60))
+    notional = max(0.0, float(position.get("notional") or 0.0))
+    last_exit_kind = str(position.get("last_exit_kind") or "").strip().lower()
+    last_exit_ts = int(position.get("last_exit_ts") or 0)
+    stale_minutes = max(1, int(settings.stale_position_minutes))
+    congested_threshold_pct = float(settings.congested_utilization_threshold) * 100.0
+
+    if hold_minutes >= stale_minutes * 2 or (notional > 0.0 and notional <= float(settings.stale_position_close_notional_usd)):
+        return {
+            "action": "close_all",
+            "label": "平仓",
+            "urgency": "high",
+            "reason": f"持有 {hold_minutes} 分钟，已明显超过 stale 阈值",
+        }
+    if utilization_pct >= congested_threshold_pct and hold_minutes >= int(settings.congested_stale_minutes):
+        return {
+            "action": "close_partial",
+            "label": "减仓",
+            "urgency": "medium",
+            "reason": f"组合利用率 {utilization_pct:.0f}% 偏拥堵，先释放仓位",
+        }
+    if hold_minutes >= stale_minutes:
+        return {
+            "action": "close_partial",
+            "label": "减仓",
+            "urgency": "medium",
+            "reason": f"持有 {hold_minutes} 分钟，已到时间退出观察区",
+        }
+    if last_exit_kind == "resonance_exit" and last_exit_ts > 0 and (now - last_exit_ts) <= 3600:
+        return {
+            "action": "close_partial",
+            "label": "减仓",
+            "urgency": "medium",
+            "reason": "近期已有共振退出信号，建议先减一部分",
+        }
+    if last_exit_kind == "smart_wallet_exit" and last_exit_ts > 0 and (now - last_exit_ts) <= 3600:
+        return {
+            "action": "close_partial",
+            "label": "减仓",
+            "urgency": "medium",
+            "reason": "来源钱包近期有减仓动作，适合收缩风险",
+        }
+    return {
+        "action": "hold",
+        "label": "继续拿",
+        "urgency": "low",
+        "reason": "当前没有明显退出压力，可以继续观察",
+    }
+
+
 def _build_signal_review(
     signal_cycles: list[dict[str, Any]],
     trace_records: list[dict[str, Any]],
@@ -899,7 +1347,15 @@ def _build_exit_review(orders: list[dict[str, Any]], positions: list[dict[str, A
     }
 
 
-def _build_state(trader, settings: Settings) -> dict[str, Any]:
+def _build_state(
+    trader,
+    settings: Settings,
+    *,
+    decision_mode_path: str = "",
+    candidate_actions_path: str = "",
+    wallet_profiles_path: str = "",
+    journal_path: str = "",
+) -> dict[str, Any]:
     now = int(time.time())
     execution_mode = "paper" if settings.dry_run else "live"
     broker_name = type(trader.broker).__name__
@@ -1022,13 +1478,23 @@ def _build_state(trader, settings: Settings) -> dict[str, Any]:
             }
         )
 
+    tracked_notional_usd = sum(max(0.0, float(pos.get("notional") or 0.0)) for pos in trader.positions_book.values())
+    portfolio_utilization_pct = 0.0 if settings.bankroll_usd <= 0 else min(100.0, tracked_notional_usd / settings.bankroll_usd * 100.0)
     positions = []
     exit_modes = _position_exit_modes(settings)
     for pos in list(trader.positions_book.values())[:8]:
         notional = float(pos.get("notional") or 0.0)
+        opened_ts = int(pos.get("opened_ts") or now)
+        hold_minutes = max(0, int((now - opened_ts) // 60))
         last_exit_label = str(pos.get("last_exit_label") or "")
         last_exit_summary = str(pos.get("last_exit_summary") or "")
         last_exit_ts = int(pos.get("last_exit_ts") or 0)
+        advice = _position_decision_advice(
+            pos,
+            now=now,
+            settings=settings,
+            utilization_pct=portfolio_utilization_pct,
+        )
         positions.append(
             {
                 "title": str(pos.get("market_slug") or pos.get("token_id") or "-"),
@@ -1038,7 +1504,8 @@ def _build_state(trader, settings: Settings) -> dict[str, Any]:
                 "quantity": float(pos.get("quantity") or 0.0),
                 "notional": notional,
                 "book_price": float(pos.get("price") or 0.0),
-                "opened_ts": int(pos.get("opened_ts") or now),
+                "opened_ts": opened_ts,
+                "hold_minutes": hold_minutes,
                 "reason": (
                     (
                         f"wallet follower / {str(pos.get('entry_wallet_tier') or 'LOW')}"
@@ -1064,6 +1531,10 @@ def _build_state(trader, settings: Settings) -> dict[str, Any]:
                 "trace_id": str(pos.get("trace_id") or ""),
                 "origin_signal_id": str(pos.get("origin_signal_id") or ""),
                 "last_signal_id": str(pos.get("last_signal_id") or ""),
+                "suggested_action": str(advice.get("action") or "hold"),
+                "suggested_action_label": str(advice.get("label") or "继续拿"),
+                "suggested_urgency": str(advice.get("urgency") or "low"),
+                "suggested_reason": str(advice.get("reason") or ""),
             }
         )
 
@@ -1148,6 +1619,70 @@ def _build_state(trader, settings: Settings) -> dict[str, Any]:
         orders,
     )
     attribution_review = _build_attribution_review(orders, now=now)
+    decision_mode = {
+        "mode": str(getattr(trader, "decision_mode", settings.decision_mode) or settings.decision_mode or "manual"),
+        "updated_ts": int(getattr(getattr(trader, "control_state", None), "updated_ts", 0) or 0),
+        "updated_by": "control",
+        "note": "",
+        "available_modes": ["manual", "semi_auto", "auto"],
+    }
+    active_candidate_statuses = [
+        "pending",
+        "queued",
+        "requested",
+        "submitted",
+        "approved",
+        "watched",
+        "executed",
+    ]
+    candidate_items = list(
+        getattr(trader, "list_candidates", lambda **_: [])(
+            statuses=active_candidate_statuses,
+            limit=24,
+        )
+        or []
+    )
+    wallet_profile_items = list(getattr(trader, "list_wallet_profiles", lambda **_: [])(limit=24) or [])
+    journal_entries = list(getattr(trader, "list_journal_entries", lambda **_: [])(limit=12) or [])
+    journal_summary = dict(getattr(trader, "journal_summary", lambda **_: {})(days=30) or {})
+    pending_action_items = list(getattr(trader, "pending_candidate_actions", lambda **_: [])(limit=24) or [])
+    candidate_store = getattr(trader, "candidate_store", None)
+    try:
+        stats_summary = dict(candidate_store.stats_summary(days=30, recent_days=7)) if candidate_store is not None else _empty_stats_summary()
+    except Exception:
+        stats_summary = _empty_stats_summary()
+    try:
+        archive_summary = dict(candidate_store.archive_summary(days=30, recent_days=7)) if candidate_store is not None else _empty_archive_summary()
+    except Exception:
+        archive_summary = _empty_archive_summary()
+    candidates = {
+        "summary": {
+            "count": len(candidate_items),
+            "pending": sum(
+                1
+                for item in candidate_items
+                if str(item.get("status") or "") in {"pending", "queued", "requested", "submitted"}
+            ),
+            "approved": sum(1 for item in candidate_items if str(item.get("status") or "") == "approved"),
+            "watched": sum(1 for item in candidate_items if str(item.get("status") or "") == "watched"),
+            "executed": sum(1 for item in candidate_items if str(item.get("status") or "") == "executed"),
+        },
+        "items": candidate_items,
+    }
+    wallet_profiles = {
+        "summary": {
+            "count": len(wallet_profile_items),
+            "enabled": sum(1 for item in wallet_profile_items if bool(item.get("enabled", True))),
+        },
+        "items": wallet_profile_items,
+    }
+    journal_summary["recent"] = journal_entries
+    pending_actions = {
+        "count": len(pending_action_items),
+        "items": pending_action_items,
+    }
+    notifier = Notifier()
+    notifier_summary = notifier.summary(limit=5)
     timeline = [
         {
             "time": time.strftime("%H:%M", time.localtime(int(o.get("ts", now)))),
@@ -1225,7 +1760,6 @@ def _build_state(trader, settings: Settings) -> dict[str, Any]:
     slot_utilization_pct = 0.0
     if settings.max_open_positions > 0:
         slot_utilization_pct = min(100.0, trader.state.open_positions / settings.max_open_positions * 100.0)
-    tracked_notional_usd = sum(max(0.0, float(pos.get("notional") or 0.0)) for pos in trader.positions_book.values())
     cash_balance_usd = float(getattr(trader.state, "cash_balance_usd", 0.0) or 0.0)
     positions_value_usd = float(getattr(trader.state, "positions_value_usd", 0.0) or tracked_notional_usd)
     effective_pnl_today = float(getattr(trader.state, "effective_daily_realized_pnl", getattr(trader.state, "daily_realized_pnl", 0.0)))
@@ -1253,6 +1787,8 @@ def _build_state(trader, settings: Settings) -> dict[str, Any]:
             "execution_mode": execution_mode,
             "broker_name": broker_name,
             "poll_interval_seconds": int(settings.poll_interval_seconds),
+            "decision_mode": str(getattr(trader, "decision_mode", settings.decision_mode) or settings.decision_mode or "manual"),
+            "candidate_ttl_seconds": int(settings.candidate_ttl_seconds),
             "bankroll_usd": float(settings.bankroll_usd),
             "risk_per_trade_pct": float(settings.risk_per_trade_pct),
             "daily_max_loss_pct": float(settings.daily_max_loss_pct),
@@ -1303,6 +1839,10 @@ def _build_state(trader, settings: Settings) -> dict[str, Any]:
             "wallet_discovery_topic_bonus": float(settings.wallet_discovery_topic_bonus),
             "account_sync_refresh_seconds": int(settings.account_sync_refresh_seconds),
             "user_stream_enabled": bool(settings.user_stream_enabled),
+            "candidate_buy_small_fraction": float(settings.candidate_buy_small_fraction),
+            "candidate_buy_normal_fraction": float(settings.candidate_buy_normal_fraction),
+            "candidate_follow_fraction": float(settings.candidate_follow_fraction),
+            "candidate_close_partial_fraction": float(settings.candidate_close_partial_fraction),
         },
         "startup": {
             "ready": bool(getattr(trader, "startup_ready", True)),
@@ -1312,12 +1852,17 @@ def _build_state(trader, settings: Settings) -> dict[str, Any]:
         },
         "reconciliation": reconciliation,
         "control": {
+            "decision_mode": str(getattr(trader.control_state, "decision_mode", settings.decision_mode) or settings.decision_mode or "manual"),
             "pause_opening": bool(trader.control_state.pause_opening),
             "reduce_only": bool(trader.control_state.reduce_only),
             "emergency_stop": bool(trader.control_state.emergency_stop),
             "clear_stale_pending_requested_ts": int(getattr(trader.control_state, "clear_stale_pending_requested_ts", 0) or 0),
             "updated_ts": int(trader.control_state.updated_ts),
         },
+        "mode": str(decision_mode.get("mode") or "manual"),
+        "decision_mode": decision_mode,
+        "startup_ready": bool(getattr(trader, "startup_ready", True)),
+        "reconciliation_status": str(reconciliation.get("status") or "unknown"),
         "summary": {
             "pnl_today": effective_pnl_today,
             "internal_pnl_today": float(trader.state.daily_realized_pnl),
@@ -1343,7 +1888,29 @@ def _build_state(trader, settings: Settings) -> dict[str, Any]:
             "slot_remaining": int(slot_remaining),
             "est_openings": int(max(0, est_openings)),
         },
+        "account": {
+            "equity_usd": float(equity_usd),
+            "cash_balance_usd": float(cash_balance_usd),
+            "positions_value_usd": float(positions_value_usd),
+            "tracked_notional_usd": float(tracked_notional_usd),
+            "available_notional_usd": float(available_notional_usd),
+            "account_snapshot_ts": int(getattr(trader.state, "account_snapshot_ts", 0) or 0),
+        },
+        "account_equity": float(equity_usd),
+        "cash_balance_usd": float(cash_balance_usd),
+        "positions_value_usd": float(positions_value_usd),
+        "tracked_notional_usd": float(tracked_notional_usd),
+        "available_notional_usd": float(available_notional_usd),
+        "account_snapshot_ts": int(getattr(trader.state, "account_snapshot_ts", 0) or 0),
+        "open_positions": int(trader.state.open_positions),
         "operator_feedback": operator_feedback,
+        "candidates": candidates,
+        "wallet_profiles": wallet_profiles,
+        "journal_summary": journal_summary,
+        "stats": stats_summary,
+        "archive": archive_summary,
+        "pending_actions": pending_actions,
+        "notifier": notifier_summary,
         "positions": positions,
         "orders": orders,
         "pending_order_details": pending_order_details,
@@ -1405,6 +1972,22 @@ def _build_wallet_score_cache(trader) -> dict[str, Any]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Polymarket runtime daemon")
     parser.add_argument("--state-path", default="/tmp/poly_runtime_data/state.json")
+    parser.add_argument(
+        "--decision-mode-path",
+        default=os.getenv("POLY_DECISION_MODE_PATH", "/tmp/poly_runtime_data/decision_mode.json"),
+    )
+    parser.add_argument(
+        "--candidate-actions-path",
+        default=os.getenv("POLY_CANDIDATE_ACTIONS_PATH", "/tmp/poly_runtime_data/candidate_actions.json"),
+    )
+    parser.add_argument(
+        "--wallet-profiles-path",
+        default=os.getenv("POLY_WALLET_PROFILES_PATH", "/tmp/poly_runtime_data/wallet_profiles.json"),
+    )
+    parser.add_argument(
+        "--journal-path",
+        default=os.getenv("POLY_JOURNAL_PATH", "/tmp/poly_runtime_data/journal.json"),
+    )
     parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
     args = parser.parse_args()
 
@@ -1415,7 +1998,14 @@ def main() -> None:
     try:
         while True:
             trader.step()
-            payload = _build_state(trader, settings)
+            payload = _build_state(
+                trader,
+                settings,
+                decision_mode_path=args.decision_mode_path,
+                candidate_actions_path=args.candidate_actions_path,
+                wallet_profiles_path=args.wallet_profiles_path,
+                journal_path=args.journal_path,
+            )
             _safe_write_json(args.state_path, payload)
             try:
                 _safe_write_json(settings.wallet_score_path, _build_wallet_score_cache(trader))

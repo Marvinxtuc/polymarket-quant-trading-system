@@ -10,7 +10,15 @@ from typing import Any
 import zipfile
 
 import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential
+from tenacity import retry, retry_if_exception, stop_after_attempt, wait_exponential
+
+
+def _is_retryable_http_error(exc: BaseException) -> bool:
+    if isinstance(exc, httpx.HTTPStatusError):
+        response = exc.response
+        status_code = int(getattr(response, "status_code", 0) or 0)
+        return status_code == 429 or status_code >= 500
+    return isinstance(exc, httpx.RequestError)
 
 
 @dataclass(slots=True)
@@ -70,6 +78,15 @@ class OrderBookSummary:
         if not self.asks:
             return 0.0
         return float(self.asks[0].price)
+
+
+@dataclass(slots=True)
+class PriceHistoryPoint:
+    market: str
+    timestamp: int
+    price: float
+    interval: str = ""
+    fidelity: int = 0
 
 
 @dataclass(slots=True)
@@ -146,7 +163,11 @@ class PolymarketDataClient:
     def close(self) -> None:
         self._client.close()
 
-    @retry(wait=wait_exponential(multiplier=0.5, min=0.5, max=4), stop=stop_after_attempt(4))
+    @retry(
+        retry=retry_if_exception(_is_retryable_http_error),
+        wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
+        stop=stop_after_attempt(4),
+    )
     def _get_json_from_base(
         self,
         base_url: str,
@@ -158,7 +179,11 @@ class PolymarketDataClient:
         r.raise_for_status()
         return r.json()
 
-    @retry(wait=wait_exponential(multiplier=0.5, min=0.5, max=4), stop=stop_after_attempt(4))
+    @retry(
+        retry=retry_if_exception(_is_retryable_http_error),
+        wait=wait_exponential(multiplier=0.5, min=0.5, max=4),
+        stop=stop_after_attempt(4),
+    )
     def _get_bytes_from_base(
         self,
         base_url: str,
@@ -317,6 +342,79 @@ class PolymarketDataClient:
         if midpoint <= 0.0:
             return None
         return midpoint
+
+    def get_prices_history(
+        self,
+        token_id: str,
+        *,
+        start_ts: int | None = None,
+        end_ts: int | None = None,
+        interval: str | None = None,
+        fidelity: int | None = 1,
+    ) -> list[PriceHistoryPoint]:
+        normalized = str(token_id).strip()
+        if not normalized:
+            return []
+
+        params: dict[str, Any] = {"market": normalized}
+        if start_ts is not None:
+            params["startTs"] = int(start_ts)
+        if end_ts is not None:
+            params["endTs"] = int(end_ts)
+        if interval:
+            params["interval"] = str(interval).strip()
+        if fidelity is not None:
+            params["fidelity"] = max(1, int(fidelity))
+
+        data = self._get_json_from_base(self.market_base_url, "/prices-history", params=params)
+        rows: list[dict[str, Any]] = []
+        if isinstance(data, dict):
+            for key in ("history", "data", "prices"):
+                value = data.get(key)
+                if isinstance(value, list):
+                    rows = [row for row in value if isinstance(row, dict)]
+                    break
+        elif isinstance(data, list):
+            rows = [row for row in data if isinstance(row, dict)]
+
+        points: list[PriceHistoryPoint] = []
+        for row in rows:
+            timestamp = self._coerce_int(row.get("t") or row.get("timestamp") or row.get("ts"))
+            price = self._coerce_float(row.get("p") or row.get("price"))
+            if timestamp <= 0 or price <= 0.0:
+                continue
+            points.append(
+                PriceHistoryPoint(
+                    market=normalized,
+                    timestamp=timestamp,
+                    price=price,
+                    interval=str(interval or ""),
+                    fidelity=max(1, int(fidelity or 1)),
+                )
+            )
+
+        points.sort(key=lambda point: (point.timestamp, point.price))
+        deduped: dict[int, PriceHistoryPoint] = {}
+        for point in points:
+            deduped[point.timestamp] = point
+        return list(deduped.values())
+
+    def get_price_history(
+        self,
+        token_id: str,
+        *,
+        start_ts: int | None = None,
+        end_ts: int | None = None,
+        interval: str | None = None,
+        fidelity: int | None = 1,
+    ) -> list[PriceHistoryPoint]:
+        return self.get_prices_history(
+            token_id,
+            start_ts=start_ts,
+            end_ts=end_ts,
+            interval=interval,
+            fidelity=fidelity,
+        )
 
     def get_user_trades(
         self,

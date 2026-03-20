@@ -8,6 +8,7 @@ BOT_PID_FILE="$RUNTIME_DATA/poly_bot.pid"
 WEB_LOG="$RUNTIME_DATA/poly_web.log"
 BOT_LOG="$RUNTIME_DATA/poly_bot.log"
 STATE_PATH="$RUNTIME_DATA/state.json"
+PUBLIC_STATE_PATH="/tmp/poly_public_state.json"
 VERIFY_SCRIPT="$BASE/scripts/verify_stack.sh"
 PY_BIN="$BASE/.venv/bin/python"
 CURL_BIN="/usr/bin/curl"
@@ -213,6 +214,7 @@ write_web_plist() {
     <string>--host</string><string>127.0.0.1</string>
     <string>--port</string><string>8787</string>
     <string>--state-path</string><string>$STATE_PATH</string>
+    <string>--public-state-path</string><string>$PUBLIC_STATE_PATH</string>
     <string>--frontend-dir</string><string>$BASE/frontend</string>
   </array>
   <key>EnvironmentVariables</key>
@@ -350,6 +352,7 @@ start_stack() {
       --host 127.0.0.1 \
       --port 8787 \
       --state-path "$STATE_PATH" \
+      --public-state-path "$PUBLIC_STATE_PATH" \
       --frontend-dir "$BASE/frontend"
 
     start_direct_process \
@@ -385,7 +388,7 @@ fi
 if [[ -f "$STATE_PATH" ]]; then
   cp "$STATE_PATH" "$STATE_PATH.before-start.$RUN_START_TS" 2>/dev/null || true
 fi
-rm -f "$STATE_PATH"
+rm -f "$STATE_PATH" "$PUBLIC_STATE_PATH"
 
 start_stack
 
@@ -428,6 +431,12 @@ fi
 if [[ ! -x "$VERIFY_SCRIPT" ]]; then
   echo "verify script missing or not executable: $VERIFY_SCRIPT"
   exit 1
+fi
+
+if [[ -x "$BASE/scripts/install_monitor_scheduler.sh" ]]; then
+  if ! "$BASE/scripts/install_monitor_scheduler.sh" >/dev/null 2>&1; then
+    echo "warning: failed to start monitor scheduler; 12h/30m reports may stay stale" >&2
+  fi
 fi
 
 echo "--- runtime verify ---"

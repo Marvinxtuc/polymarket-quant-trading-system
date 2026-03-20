@@ -228,7 +228,7 @@ class LiveClobBroker(Broker):
     ) -> None:
         try:
             from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import OrderArgs, OrderType
+            from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
             from py_clob_client.order_builder.constants import BUY, SELL
         except Exception as exc:  # pragma: no cover
             raise RuntimeError(
@@ -237,6 +237,7 @@ class LiveClobBroker(Broker):
 
         self._OrderArgs = OrderArgs
         self._OrderType = OrderType
+        self._PartialCreateOrderOptions = PartialCreateOrderOptions
         self._side_map = {"BUY": BUY, "SELL": SELL}
         self.market_client = market_client
         self.maker_buffer_ticks = max(0, int(maker_buffer_ticks))
@@ -510,7 +511,15 @@ class LiveClobBroker(Broker):
         tick_size: float,
         neg_risk: bool,
     ) -> object:
-        options = {"tick_size": str(tick_size), "neg_risk": bool(neg_risk)}
+        tick_size_text = str(self._safe_float(tick_size, 0.01))
+        options_cls = getattr(self, "_PartialCreateOrderOptions", None)
+        if options_cls is not None:
+            try:
+                options = options_cls(tick_size=tick_size_text, neg_risk=bool(neg_risk))
+            except Exception:
+                options = {"tick_size": tick_size_text, "neg_risk": bool(neg_risk)}
+        else:
+            options = {"tick_size": tick_size_text, "neg_risk": bool(neg_risk)}
         create_and_post = getattr(self.client, "create_and_post_order", None)
         if callable(create_and_post):
             try:
@@ -528,7 +537,7 @@ class LiveClobBroker(Broker):
             try:
                 signed = create_order(
                     order_args,
-                    tick_size=str(tick_size),
+                    tick_size=tick_size_text,
                     neg_risk=bool(neg_risk),
                 )
             except TypeError:
@@ -679,12 +688,12 @@ class LiveClobBroker(Broker):
             for args in ((active_ids,), tuple()):
                 try:
                     heartbeat(*args)
-                    return False
-        return False
+                    return True
                 except TypeError:
                     continue
                 except Exception:
-                    return True
+                    return False
+        return False
 
     @staticmethod
     def _clean_order_ids(order_ids: list[str]) -> list[str]:
