@@ -151,6 +151,7 @@ class _FakeHistoryStore:
         self.metrics = dict(metrics or {})
         self.topic_profiles = dict(topic_profiles or {})
 
+        return True
     def sync_wallets(self, wallets, *, max_wallets=None):
         selected = []
         limit = len(wallets) if max_wallets is None else max_wallets
@@ -547,6 +548,42 @@ class TraderControlTests(unittest.TestCase):
         fresh_order = dict(stale_order)
         fresh_order["key"] = "fresh-live-token-demo"
         fresh_order["order_id"] = "live-token-demo-fresh"
+    def test_pending_order_heartbeat_ts_not_updated_when_broker_heartbeat_noops(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 24,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _PendingBroker()
+
+        def _noop_heartbeat(order_ids: list[str]):
+            broker.heartbeat_calls.append(list(order_ids))
+            return False
+
+        broker.heartbeat = _noop_heartbeat  # type: ignore[assignment]
+        trader = Trader(
+            settings=self._make_settings(control_path, dry_run=False, funder_address="0xabc"),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([_signal("BUY")]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+
+        trader.step()
+        self.assertEqual(len(trader.pending_orders), 1)
+        trader._reconcile_runtime_with_broker()
+
+        pending = next(iter(trader.pending_orders.values()))
+        self.assertEqual(broker.heartbeat_calls[-1], ["live-token-demo"])
+        self.assertEqual(int(pending.get("last_heartbeat_ts") or 0), 0)
+
         fresh_order["signal_id"] = "sig-fresh"
         fresh_order["trace_id"] = "trc-fresh"
         fresh_order["token_id"] = "token-demo-fresh"

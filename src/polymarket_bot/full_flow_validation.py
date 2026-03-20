@@ -11,6 +11,10 @@ from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+DEFAULT_MONITOR_30M_WINDOW_SECONDS = 1800
+DEFAULT_MONITOR_12H_WINDOW_SECONDS = 43200
+MONITOR_FRESHNESS_GRACE_SECONDS = 600
+
 
 def _utc_iso(ts: int | float | None = None) -> str:
     return datetime.fromtimestamp(int(ts or time.time()), tz=timezone.utc).isoformat()
@@ -235,6 +239,34 @@ def _recommendation_kind(text: object) -> str:
     return "ready"
 
 
+def _monitor_default_window_seconds(report_type: object) -> int:
+    normalized = str(report_type or "").strip().lower()
+    if normalized == "monitor_30m":
+        return DEFAULT_MONITOR_30M_WINDOW_SECONDS
+    if normalized == "monitor_12h":
+        return DEFAULT_MONITOR_12H_WINDOW_SECONDS
+    return 0
+
+
+def _monitor_freshness(payload: Mapping[str, object] | None, *, now_ts: int) -> dict[str, int | bool]:
+    report = dict(payload or {})
+    generated_ts = _safe_int(report.get("generated_ts"))
+    window_seconds = _monitor_default_window_seconds(report.get("report_type"))
+    max_age_seconds = max(
+        MONITOR_FRESHNESS_GRACE_SECONDS,
+        window_seconds + max(MONITOR_FRESHNESS_GRACE_SECONDS, window_seconds // 10),
+    ) if window_seconds > 0 else MONITOR_FRESHNESS_GRACE_SECONDS
+    age_seconds = max_age_seconds + 1
+    if generated_ts > 0:
+        age_seconds = max(0, now_ts - generated_ts)
+    return {
+        "fresh": generated_ts > 0 and age_seconds <= max_age_seconds,
+        "generated_ts": generated_ts,
+        "age_seconds": age_seconds,
+        "max_age_seconds": max_age_seconds,
+    }
+
+
 def _compute_operational_readiness(
     *,
     state_payload: Mapping[str, object] | None,
@@ -248,32 +280,51 @@ def _compute_operational_readiness(
     report30 = dict(monitor_30m_payload or {})
     report12 = dict(monitor_12h_payload or {})
     eod = dict(eod_payload or {})
+    now_ts = max(
+        _safe_int(state.get("ts")),
+        _safe_int(eod.get("generated_ts")),
+        int(time.time()),
+    )
+    report30_freshness = _monitor_freshness(report30, now_ts=now_ts)
+    report12_freshness = _monitor_freshness(report12, now_ts=now_ts)
+    report30_kind = _recommendation_kind(report30.get("final_recommendation")) if report30_freshness["fresh"] else "ready"
+    report12_kind = _recommendation_kind(report12.get("final_recommendation")) if report12_freshness["fresh"] else "ready"
 
     level = "ready"
     if (
         startup.get("ready") is False
-        or _recommendation_kind(report30.get("final_recommendation")) == "block"
-        or _recommendation_kind(report12.get("final_recommendation")) == "block"
+        or report30_kind == "block"
+        or report12_kind == "block"
     ):
         level = "block"
     elif (
         str(reconciliation.get("status") or "").lower() == "fail"
         or str(eod.get("status") or "").lower() == "fail"
-        or _recommendation_kind(report30.get("final_recommendation")) == "escalate"
-        or _recommendation_kind(report12.get("final_recommendation")) == "escalate"
+        or report30_kind == "escalate"
+        or report12_kind == "escalate"
     ):
         level = "escalate"
     elif (
         str(reconciliation.get("status") or "").lower() == "warn"
         or str(eod.get("status") or "").lower() == "warn"
-        or _recommendation_kind(report30.get("final_recommendation")) == "observe"
-        or _recommendation_kind(report12.get("final_recommendation")) == "observe"
+        or report30_kind == "observe"
+        or report12_kind == "observe"
+        or not report30_freshness["fresh"]
+        or not report12_freshness["fresh"]
     ):
         level = "observe"
 
     issues: list[str] = []
     if startup.get("ready") is False:
         issues.append(f"startup_failures={_safe_int(startup.get('failure_count'))}")
+    if not report30_freshness["fresh"]:
+        issues.append(
+            f"monitor_30m_stale={_safe_int(report30_freshness['age_seconds'])}s>max{_safe_int(report30_freshness['max_age_seconds'])}s"
+        )
+    if not report12_freshness["fresh"]:
+        issues.append(
+            f"monitor_12h_stale={_safe_int(report12_freshness['age_seconds'])}s>max{_safe_int(report12_freshness['max_age_seconds'])}s"
+        )
     for issue in list(reconciliation.get("issues") or []):
         if str(issue).strip():
             issues.append(str(issue))
@@ -283,6 +334,10 @@ def _compute_operational_readiness(
         "reconciliation_status": str(reconciliation.get("status") or "unknown").lower(),
         "monitor_30m_recommendation": str(report30.get("final_recommendation") or ""),
         "monitor_12h_recommendation": str(report12.get("final_recommendation") or ""),
+        "monitor_30m_fresh": bool(report30_freshness["fresh"]),
+        "monitor_12h_fresh": bool(report12_freshness["fresh"]),
+        "monitor_30m_age_seconds": _safe_int(report30_freshness["age_seconds"]),
+        "monitor_12h_age_seconds": _safe_int(report12_freshness["age_seconds"]),
         "eod_status": str(eod.get("status") or "unknown").lower(),
         "issues": issues[:8],
     }
@@ -374,12 +429,16 @@ def run_full_flow_validation(
     runtime_state_path: str = "/tmp/poly_runtime_data/runtime_state.json",
     events_path: str = "/tmp/poly_runtime_data/events.ndjson",
     bot_log_path: str = "/tmp/poly_runtime_data/poly_bot.log",
-    monitor_30m_json_path: str = "/tmp/poly_monitor_30m_report.json",
-    monitor_12h_json_path: str = "/tmp/poly_monitor_12h_report.json",
+    monitor_30m_json_path: str = "/tmp/poly_full_flow_validation/monitor_30m_report.json",
+    monitor_12h_json_path: str = "/tmp/poly_full_flow_validation/monitor_12h_report.json",
+    monitor_30m_state_path: str = "/tmp/poly_full_flow_validation/monitor_30m_inconclusive_state",
+    monitor_12h_state_path: str = "/tmp/poly_full_flow_validation/monitor_12h_inconclusive_state",
     reconciliation_eod_json_path: str = "/tmp/poly_reconciliation_eod_report.json",
     reconciliation_eod_text_path: str = "/tmp/poly_reconciliation_eod_report.txt",
     bootstrap_stack: bool = False,
-    monitor_window_seconds: int = 0,
+    monitor_window_seconds: int | None = None,
+    monitor_30m_window_seconds: int | None = None,
+    monitor_12h_window_seconds: int | None = None,
     timeout_seconds: int = 180,
     http_client: Callable[..., dict[str, object]] = http_json,
     command_runner: Callable[..., dict[str, object]] = run_command,
@@ -393,6 +452,20 @@ def run_full_flow_validation(
     monitor_12h_payload: dict[str, Any] = {}
     reconciliation_payload: dict[str, Any] = {}
     stage_lookup: dict[str, dict[str, object]] = {}
+    effective_monitor_30m_window = int(
+        monitor_30m_window_seconds
+        if monitor_30m_window_seconds is not None
+        else monitor_window_seconds
+        if monitor_window_seconds is not None
+        else 0
+    )
+    effective_monitor_12h_window = int(
+        monitor_12h_window_seconds
+        if monitor_12h_window_seconds is not None
+        else monitor_window_seconds
+        if monitor_window_seconds is not None
+        else 0
+    )
 
     def add_stage(stage: dict[str, object]) -> None:
         stages.append(stage)
@@ -440,26 +513,31 @@ def run_full_flow_validation(
     if not state_payload:
         state_payload = _load_json_dict(state_path)
 
-    for name, script_name, json_path, api_url in (
-        ("monitor_30m", "monitor_thresholds_30m.sh", monitor_30m_json_path, monitor_30m_url),
-        ("monitor_12h", "monitor_thresholds_12h.sh", monitor_12h_json_path, monitor_12h_url),
+    for name, script_name, json_path, api_url, state_cache_path, window_seconds in (
+        ("monitor_30m", "monitor_thresholds_30m.sh", monitor_30m_json_path, monitor_30m_url, monitor_30m_state_path, effective_monitor_30m_window),
+        ("monitor_12h", "monitor_thresholds_12h.sh", monitor_12h_json_path, monitor_12h_url, monitor_12h_state_path, effective_monitor_12h_window),
     ):
-        txt_path = Path(str(json_path)).with_suffix(".txt")
+        json_path_obj = Path(str(json_path)).expanduser()
+        txt_path = json_path_obj.with_suffix(".txt")
+        state_cache_obj = Path(str(state_cache_path)).expanduser()
+        json_path_obj.parent.mkdir(parents=True, exist_ok=True)
+        txt_path.parent.mkdir(parents=True, exist_ok=True)
+        state_cache_obj.parent.mkdir(parents=True, exist_ok=True)
         result = command_runner(
             [
                 "/bin/bash",
                 str(scripts_dir / script_name),
                 str(txt_path),
                 str(bot_log_path),
-                str(int(monitor_window_seconds)),
-                f"/tmp/poly_{name}_inconclusive_state",
+                str(int(window_seconds)),
+                str(state_cache_obj),
                 str(state_path),
-                str(json_path),
+                str(json_path_obj),
             ],
             cwd=root,
             timeout=max(60, timeout_seconds),
         )
-        payload = _load_json_dict(json_path)
+        payload = _load_json_dict(json_path_obj)
         if result.get("ok") and payload:
             summary = _summarize_monitor_payload(payload)
             add_stage(
@@ -467,8 +545,10 @@ def run_full_flow_validation(
                     f"{name}_generation",
                     "pass",
                     f"{name} report generated",
-                    json_path=str(json_path),
+                    json_path=str(json_path_obj),
                     text_path=str(txt_path),
+                    state_path=str(state_cache_obj),
+                    window_seconds=int(window_seconds),
                     **summary,
                 )
             )
@@ -478,8 +558,10 @@ def run_full_flow_validation(
                     f"{name}_generation",
                     "fail",
                     f"{name} report generation failed",
-                    json_path=str(json_path),
+                    json_path=str(json_path_obj),
                     text_path=str(txt_path),
+                    state_path=str(state_cache_obj),
+                    window_seconds=int(window_seconds),
                     returncode=result.get("returncode"),
                     stdout=_tail(result.get("stdout")),
                     stderr=_tail(result.get("stderr")),
@@ -704,6 +786,8 @@ def run_full_flow_validation(
             "events_path": events_path,
             "monitor_30m_json_path": monitor_30m_json_path,
             "monitor_12h_json_path": monitor_12h_json_path,
+            "monitor_30m_state_path": monitor_30m_state_path,
+            "monitor_12h_state_path": monitor_12h_state_path,
             "reconciliation_eod_json_path": reconciliation_eod_json_path,
             "reconciliation_eod_text_path": reconciliation_eod_text_path,
         },

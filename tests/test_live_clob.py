@@ -217,7 +217,7 @@ class LiveClobTests(unittest.TestCase):
         broker = LiveClobBroker.__new__(LiveClobBroker)
         broker.client = _FakeClient()
 
-        broker.heartbeat(["oid-a", "", "oid-b"])
+        result = broker.heartbeat(["oid-a", "", "oid-b"])
 
         self.assertEqual(broker.client.heartbeat_payloads, [["oid-a", "oid-b"]])
 
@@ -273,6 +273,7 @@ class LiveClobTests(unittest.TestCase):
 
         self.assertIsNotNone(fills)
         assert fills is not None
+        self.assertTrue(result)
         self.assertEqual(len(fills), 1)
         self.assertEqual(fills[0].order_id, "oid-maker")
         self.assertAlmostEqual(fills[0].notional, 3.64, places=6)

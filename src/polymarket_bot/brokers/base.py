@@ -22,8 +22,8 @@ class Broker(ABC):
     def get_order_status(self, order_id: str) -> OrderStatusSnapshot | None:
         return None
 
-    def heartbeat(self, order_ids: list[str]) -> None:
-        return None
+    def heartbeat(self, order_ids: list[str]) -> bool:
+        return False
 
     def list_open_orders(self) -> list[OpenOrderSnapshot] | None:
         return None

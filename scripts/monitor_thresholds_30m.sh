@@ -21,18 +21,47 @@ json_number_or_null() {
   printf '%s' "$value"
 }
 
-start_ts="$(date '+%Y-%m-%d %H:%M:%S')"
-start_size=0
-if [[ -f "$log" ]]; then
-  start_size="$(wc -c < "$log")"
-fi
+window_bounds="$(
+  python3 - "$window_sec" <<'PY'
+from datetime import datetime, timedelta
+import sys
 
-sleep "$window_sec"
-
-end_ts="$(date '+%Y-%m-%d %H:%M:%S')"
+window_sec = int(sys.argv[1])
+end = datetime.now()
+start = end - timedelta(seconds=window_sec)
+print(start.strftime("%Y-%m-%d %H:%M:%S"))
+print(end.strftime("%Y-%m-%d %H:%M:%S"))
+PY
+)"
+start_ts="$(printf '%s\n' "$window_bounds" | sed -n '1p')"
+end_ts="$(printf '%s\n' "$window_bounds" | sed -n '2p')"
 seg=""
 if [[ -f "$log" ]]; then
-  seg="$(tail -c +$((start_size + 1)) "$log" 2>/dev/null || true)"
+  seg="$(
+    python3 - "$log" "$window_sec" <<'PY'
+from datetime import datetime, timedelta
+import re
+import sys
+
+path = sys.argv[1]
+window_sec = int(sys.argv[2])
+end = datetime.now()
+start = end - timedelta(seconds=window_sec)
+line_re = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})(?:,\d+)?\b")
+
+with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+    for raw in fh:
+        match = line_re.match(raw)
+        if not match:
+            continue
+        try:
+            ts = datetime.strptime(match.group(1), "%Y-%m-%d %H:%M:%S")
+        except ValueError:
+            continue
+        if start <= ts <= end:
+            sys.stdout.write(raw)
+PY
+  )"
 fi
 
 exec_cnt="$(printf "%s" "$seg" | rg -c ' EXEC ' || true)"
@@ -64,9 +93,9 @@ if [[ "$exec_cnt" -eq 0 ]]; then
   inconclusive_count=$((prev_inconclusive + 1))
   printf '%s' "$inconclusive_count" > "$state_file"
   if (( inconclusive_count >= 2 )); then
-    recommendation="CONSECUTIVE_INCONCLUSIVE: last 2+ windows had EXEC=0. Keep observing for 1 full 30m window before parameter changes."
+    recommendation="CONSECUTIVE_INCONCLUSIVE: last 2+ 30m windows had EXEC=0. Keep observing for 1 full 30m window before parameter changes."
   else
-    recommendation="Observation started. Need 2 consecutive INCONCLUSIVE windows to trigger escalation."
+    recommendation="Observation started. Need 2 consecutive 30m INCONCLUSIVE windows to trigger escalation."
   fi
 else
   sample_status="CONCLUSIVE"
@@ -107,9 +136,17 @@ final_recommendation="$recommendation"
 if [[ "$startup_ready" != "true" && "$startup_ready" != "unknown" ]]; then
   final_recommendation="BLOCK: startup self-check is not ready. Fix env / network smoke / broker prerequisites before tuning."
 elif [[ "$recon_status" == "fail" ]]; then
-  final_recommendation="ESCALATE: reconciliation failed. Investigate ledger drift or stale broker sync before strategy changes."
+  recon_focus="$recon_issues"
+  if [[ -z "$recon_focus" || "$recon_focus" == "(none)" ]]; then
+    recon_focus="review ledger drift and broker sync facts"
+  fi
+  final_recommendation="ESCALATE: reconciliation failed (${recon_focus}). Monitor: ${recommendation}"
 elif [[ "$recon_status" == "warn" ]]; then
-  final_recommendation="OBSERVE: reconciliation has warnings. Review pending orders and sync freshness before parameter changes."
+  recon_focus="$recon_issues"
+  if [[ -z "$recon_focus" || "$recon_focus" == "(none)" ]]; then
+    recon_focus="review pending orders and sync freshness"
+  fi
+  final_recommendation="OBSERVE: reconciliation has warnings (${recon_focus}). Monitor: ${recommendation}"
 fi
 
 cat >"$out" <<EOF
@@ -216,3 +253,4 @@ jq -n \
   }' > "$json_out"
 
 echo "$out"
+sleep "$window_sec"

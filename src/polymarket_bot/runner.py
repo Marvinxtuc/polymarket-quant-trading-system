@@ -2614,10 +2614,11 @@ class Trader:
             for order in self.pending_orders.values()
             if str(order.get("order_id") or "").strip()
         ]
-        self.broker.heartbeat(heartbeat_ids)
-        for order in self.pending_orders.values():
-            if str(order.get("order_id") or "").strip():
-                order["last_heartbeat_ts"] = now
+        heartbeat_ok = bool(self.broker.heartbeat(heartbeat_ids))
+        if heartbeat_ok:
+            for order in self.pending_orders.values():
+                if str(order.get("order_id") or "").strip():
+                    order["last_heartbeat_ts"] = now
 
         recent_fill_aggs: dict[str, dict[str, float | str]] = dict(stream_fill_aggs)
         if heartbeat_ids and not stream_available:

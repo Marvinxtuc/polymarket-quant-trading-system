@@ -669,21 +669,22 @@ class LiveClobBroker(Broker):
                         return self._parse_order_status(normalized, row)
         return None
 
-    def heartbeat(self, order_ids: list[str]) -> None:
+    def heartbeat(self, order_ids: list[str]) -> bool:
         active_ids = [str(order_id).strip() for order_id in order_ids if str(order_id).strip()]
         if not active_ids:
-            return
+            return False
 
         heartbeat = getattr(self.client, "heartbeat", None)
         if callable(heartbeat):
             for args in ((active_ids,), tuple()):
                 try:
                     heartbeat(*args)
-                    return
+                    return False
+        return False
                 except TypeError:
                     continue
                 except Exception:
-                    return
+                    return True
 
     @staticmethod
     def _clean_order_ids(order_ids: list[str]) -> list[str]:
