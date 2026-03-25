@@ -10,6 +10,9 @@ class Broker(ABC):
     def execute(self, signal: Signal, notional_usd: float) -> ExecutionResult:
         raise NotImplementedError
 
+    def supports_dry_run_pending_reconcile(self) -> bool:
+        return False
+
     def cancel_order(self, order_id: str) -> dict[str, object] | None:
         return None
 

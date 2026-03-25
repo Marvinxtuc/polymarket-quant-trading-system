@@ -3,7 +3,12 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE="$(cd "$SCRIPT_DIR/.." && pwd)"
+PY_BIN="$BASE/.venv/bin/python"
 LOG="/tmp/poly_launch.log"
+
+if [[ -x "$PY_BIN" ]]; then
+  LOG="$("$PY_BIN" "$BASE/scripts/runtime_paths.py" runtime_dir 2>/dev/null | awk 'NR==1{print $0"/launch.log"}')"
+fi
 
 printf '【%s】一键 poly 启动（GUI 入口）\n' "$(date '+%Y-%m-%d %H:%M:%S')"
 

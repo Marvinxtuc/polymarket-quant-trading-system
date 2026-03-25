@@ -332,6 +332,7 @@ h1 { margin: 0; font-size: 17px; }
   gap: 10px;
 }
 .card-alerts,
+.card-catalysts,
 .card-notifier,
 .card-wallet-detail,
 .card-sources {
@@ -1559,11 +1560,65 @@ progress::-webkit-progress-value { background: linear-gradient(90deg, #45dcb1, #
   background: rgba(11, 18, 26, 0.35);
 }
 .card-notifier .component-grid,
+.catalyst-summary,
+.catalyst-columns,
 .archive-grid,
 .archive-snapshots,
 .archive-actions {
   display: grid;
   gap: 8px;
+}
+.catalyst-summary {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+}
+.catalyst-columns {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+}
+.catalyst-column {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+}
+.catalyst-list {
+  max-height: 340px;
+  overflow: auto;
+}
+.catalyst-list li {
+  gap: 8px;
+}
+.catalyst-headline {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.catalyst-link {
+  color: var(--text);
+  text-decoration: none;
+}
+.catalyst-link:hover {
+  color: var(--cyan);
+  text-decoration: underline;
+}
+.catalyst-link.muted {
+  color: var(--sub);
+}
+.catalyst-detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  align-items: center;
+}
+.catalyst-copy {
+  color: var(--sub);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.catalyst-source {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
 }
 .card-notifier .component-grid {
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -1699,6 +1754,8 @@ progress::-webkit-progress-value { background: linear-gradient(90deg, #45dcb1, #
   .candidate-detail-grid,
   .candidate-summary-grid,
   .candidate-factor-grid,
+  .catalyst-summary,
+  .catalyst-columns,
   .card-notifier .component-grid {
     grid-template-columns: 1fr;
   }
@@ -1793,6 +1850,8 @@ progress::-webkit-progress-value { background: linear-gradient(90deg, #45dcb1, #
     gap: 4px;
   }
   .candidate-focus-snapshot,
+  .catalyst-summary,
+  .catalyst-columns,
   .card-notifier .component-grid,
   .archive-actions,
   .archive-grid,
@@ -1810,6 +1869,9 @@ progress::-webkit-progress-value { background: linear-gradient(90deg, #45dcb1, #
   }
   .candidate-factor-grid {
     grid-template-columns: 1fr;
+  }
+  .catalyst-list {
+    max-height: none;
   }
   .monitor-breakdown-grid { grid-template-columns: 1fr; }
   .signal-review-grid { grid-template-columns: 1fr; }

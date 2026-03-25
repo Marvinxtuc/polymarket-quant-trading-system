@@ -3,20 +3,62 @@ set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY_BIN="$BASE/.venv/bin/python"
-RUNTIME_DATA="/tmp/poly_runtime_data"
+RUNTIME_DATA=""
 STATE_URL="http://127.0.0.1:8787/api/state"
 CONTROL_URL="http://127.0.0.1:8787/api/control"
-OUT_FILE="${1:-/tmp/poly_10h_paper_rehearsal.txt}"
+OUT_FILE="${1:-}"
 WINDOWS="${2:-10}"
 INTERVAL="${3:-3600}"
 START_TS="$(date -u '+%Y-%m-%d %H:%M:%S UTC')"
 START_EPOCH="$(date +%s)"
-DAEMON_LOG="$RUNTIME_DATA/poly_bot.log"
+DAEMON_LOG=""
+STATE_API_CHECK_PATH=""
+CONTROL_API_CHECK_PATH=""
 
 if [[ ! -x "$PY_BIN" ]]; then
   echo ".venv/bin/python not found, please create venv first" >&2
   exit 1
 fi
+
+eval "$("$PY_BIN" "$BASE/scripts/runtime_paths.py" --format shell runtime_dir bot_log_path rehearsal_10h_out_path state_api_check_path control_api_check_path)"
+RUNTIME_DATA="$RUNTIME_DIR"
+DAEMON_LOG="$BOT_LOG_PATH"
+if [[ -z "${OUT_FILE:-}" ]]; then
+  OUT_FILE="$REHEARSAL_10H_OUT_PATH"
+fi
+
+read_dotenv_var() {
+  local key="$1"
+  local dotenv="$BASE/.env"
+  [[ -f "$dotenv" ]] || return 0
+  awk -F= -v key="$key" '
+    $0 ~ "^[[:space:]]*" key "=" {
+      sub(/^[[:space:]]*[^=]+=/, "", $0)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+      gsub(/^"|"$/, "", $0)
+      gsub(/^'\''|'\''$/, "", $0)
+      print $0
+      exit
+    }
+  ' "$dotenv"
+}
+
+append_control_token() {
+  local url="$1"
+  local token="${POLY_CONTROL_TOKEN:-$(read_dotenv_var POLY_CONTROL_TOKEN)}"
+  if [[ -z "${token:-}" ]] || [[ "$url" == *"token="* ]]; then
+    printf '%s\n' "$url"
+    return 0
+  fi
+  if [[ "$url" == *"?"* ]]; then
+    printf '%s&token=%s\n' "$url" "$token"
+  else
+    printf '%s?token=%s\n' "$url" "$token"
+  fi
+}
+
+STATE_URL="$(append_control_token "$STATE_URL")"
+CONTROL_URL="$(append_control_token "$CONTROL_URL")"
 
 mkdir -p "$(dirname "$OUT_FILE")"
 
@@ -39,8 +81,8 @@ else
 fi
 
 parse_state() {
-  local state_file="/tmp/poly_runtime_data/state_api_check.json"
-  local control_file="/tmp/poly_runtime_data/control_api_check.json"
+  local state_file="$STATE_API_CHECK_PATH"
+  local control_file="$CONTROL_API_CHECK_PATH"
   local local_state_file="$RUNTIME_DATA/state.json"
 
   if ! curl -fsS "$STATE_URL" > "$state_file"; then

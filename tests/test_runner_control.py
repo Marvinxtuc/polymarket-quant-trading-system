@@ -6,12 +6,14 @@ import tempfile
 import time
 import unittest
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
-from polymarket_bot.clients.data_api import AccountingSnapshot, ClosedPosition
+from polymarket_bot.clients.data_api import AccountingPosition, AccountingSnapshot, ClosedPosition, MarketMetadata
 from polymarket_bot.config import Settings
+from polymarket_bot.reconciliation_report import load_ledger_rows
 from polymarket_bot.risk import RiskManager, RiskState
 from polymarket_bot.runner import Trader
 from polymarket_bot.types import BrokerOrderEvent, ExecutionResult, OpenOrderSnapshot, OrderFillSnapshot, OrderStatusSnapshot, RiskDecision, Signal
@@ -26,6 +28,7 @@ class _DummyDataClient:
         self.order_book = SimpleNamespace(best_bid=0.48, best_ask=0.52)
         self.midpoint_price = 0.5
         self.price_history: list[dict[str, object]] = []
+        self.market_metadata: dict[str, MarketMetadata] = {}
 
     def discover_wallet_activity(self, paths, limit):
         return {}
@@ -47,6 +50,15 @@ class _DummyDataClient:
 
     def get_price_history(self, _token_id: str, **_kwargs):
         return list(self.price_history)
+
+    def get_market_metadata(self, condition_id: str = "", *, slug: str | None = None):
+        normalized_condition = str(condition_id or "").strip()
+        if normalized_condition and normalized_condition in self.market_metadata:
+            return self.market_metadata[normalized_condition]
+        normalized_slug = str(slug or "").strip()
+        if normalized_slug and normalized_slug in self.market_metadata:
+            return self.market_metadata[normalized_slug]
+        return None
 
     def close(self):
         return None
@@ -208,6 +220,35 @@ class _FakeHistoryStore:
         return metrics, refreshed, {}, {wallet: list(self.topic_profiles.get(wallet, [])) for wallet in selected if wallet in self.topic_profiles}
 
 
+class _RecordingNotifier:
+    def __init__(self, *, local_available: bool = True, webhook_enabled: bool = True, telegram_enabled: bool = False):
+        self.calls: list[dict[str, object]] = []
+        self._local_available = bool(local_available)
+        self._webhook_enabled = bool(webhook_enabled)
+        self._telegram_enabled = bool(telegram_enabled)
+
+    def local_available(self) -> bool:
+        return self._local_available
+
+    def webhook_targets(self) -> list[str]:
+        if not self._webhook_enabled:
+            return []
+        return ["https://hooks.example.local/polymarket"]
+
+    def telegram_available(self) -> bool:
+        return self._telegram_enabled
+
+    def notify_all(self, *, title: str, body: str, extra=None, channels=None) -> dict[str, object]:
+        payload = {
+            "title": str(title or ""),
+            "body": str(body or ""),
+            "extra": dict(extra or {}),
+            "channels": list(channels or []),
+        }
+        self.calls.append(payload)
+        return payload
+
+
 def _signal(
     side: str = "BUY",
     wallet_score: float = 80.0,
@@ -290,6 +331,13 @@ class TraderControlTests(unittest.TestCase):
             pending_order_timeout_seconds=int(kwargs.get("pending_order_timeout_seconds", 1800)),
             portfolio_netting_enabled=bool(kwargs.get("portfolio_netting_enabled", True)),
             max_condition_exposure_pct=float(kwargs.get("max_condition_exposure_pct", 0.015)),
+            notify_local_enabled=bool(kwargs.get("notify_local_enabled", True)),
+            notify_webhook_url=str(kwargs.get("notify_webhook_url", "")),
+            notify_webhook_urls=str(kwargs.get("notify_webhook_urls", "")),
+            notify_telegram_bot_token=str(kwargs.get("notify_telegram_bot_token", "")),
+            notify_telegram_chat_id=str(kwargs.get("notify_telegram_chat_id", "")),
+            critical_notification_enabled=bool(kwargs.get("critical_notification_enabled", False)),
+            critical_notification_cooldown_seconds=int(kwargs.get("critical_notification_cooldown_seconds", 900)),
             min_wallet_score=float(kwargs.get("min_wallet_score", 50.0)),
             wallet_score_watch_multiplier=float(kwargs.get("wallet_score_watch_multiplier", 0.4)),
             wallet_score_trade_multiplier=float(kwargs.get("wallet_score_trade_multiplier", 0.75)),
@@ -315,6 +363,63 @@ class TraderControlTests(unittest.TestCase):
             live_account_ready=bool(kwargs.get("live_account_ready", False)),
             funder_address=str(kwargs.get("funder_address", "")),
         )
+
+    def _arm_live_trader(self, trader: Trader, *, account_snapshot_ts: int | None = None) -> None:
+        snapshot_ts = int(account_snapshot_ts or time.time())
+        trader.startup_ready = True
+        trader.startup_warning_count = 0
+        trader.startup_failure_count = 0
+        trader.startup_checks = []
+        trader.state.account_snapshot_ts = snapshot_ts
+        trader.state.cash_balance_usd = max(100.0, float(trader.state.cash_balance_usd or 0.0))
+        trader.state.equity_usd = max(trader.state.cash_balance_usd, float(trader.state.equity_usd or 0.0))
+        trader._update_trading_mode(trader.control_state, now=snapshot_ts)
+        trader._refresh_risk_state()
+
+    def _restore_pending_order(
+        self,
+        trader: Trader,
+        *,
+        key: str,
+        order_id: str,
+        side: str,
+        token_id: str = "token-demo",
+        requested_notional: float = 30.0,
+        requested_price: float = 0.6,
+        ts: int = 1700000000,
+    ) -> dict[str, object]:
+        restored = trader._restore_pending_order(
+            {
+                "key": key,
+                "ts": ts,
+                "cycle_id": "cycle-demo",
+                "order_id": order_id,
+                "broker_status": "live",
+                "signal_id": f"signal:{order_id}",
+                "trace_id": f"trace:{order_id}",
+                "token_id": token_id,
+                "condition_id": "condition-demo",
+                "market_slug": "demo-market",
+                "outcome": "YES",
+                "side": side,
+                "wallet": "0x1111111111111111111111111111111111111111",
+                "wallet_score": 80.0,
+                "wallet_tier": "CORE",
+                "requested_notional": requested_notional,
+                "requested_price": requested_price,
+                "matched_notional_hint": 0.0,
+                "matched_size_hint": 0.0,
+                "matched_price_hint": requested_price,
+                "reconciled_notional_hint": 0.0,
+                "reconciled_size_hint": 0.0,
+                "last_fill_ts_hint": 0,
+                "last_fill_tx_hash": "",
+                "message": "restored for test",
+                "reason": "restored for test",
+            }
+        )
+        self.assertIsNotNone(restored)
+        return dict(restored or {})
 
     def test_pause_opening_blocks_buy_signal(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
@@ -379,6 +484,85 @@ class TraderControlTests(unittest.TestCase):
         self.assertEqual(len(broker.calls), 1)
         self.assertEqual(broker.calls[0][0].side, "SELL")
         self.assertEqual(trader.state.open_positions, 0)
+        self.assertNotIn("token-demo", trader.positions_book)
+
+    def test_startup_gate_blocks_new_buy_when_startup_ready_false(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 3,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(control_path, dry_run=False, funder_address="0xabc"),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([_signal("BUY")]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        trader.startup_ready = False
+        trader.startup_failure_count = 1
+        trader.startup_checks = [{"name": "startup", "status": "FAIL", "message": "startup failed"}]
+        trader.state.account_snapshot_ts = int(time.time())
+        trader.state.cash_balance_usd = 100.0
+
+        trader.step()
+
+        self.assertEqual(len(broker.calls), 0)
+        self.assertEqual(trader.trading_mode, "REDUCE_ONLY")
+        self.assertIn("startup_not_ready", trader.trading_mode_reasons)
+
+    def test_startup_gate_allows_reduce_only_sell_when_startup_ready_false(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 4,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(control_path),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([_signal("SELL")]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        trader.startup_ready = False
+        trader.startup_failure_count = 1
+        trader.startup_checks = [{"name": "startup", "status": "FAIL", "message": "startup failed"}]
+        trader.state.account_snapshot_ts = int(time.time())
+        trader.positions_book["token-demo"] = {
+            "token_id": "token-demo",
+            "market_slug": "demo-market",
+            "outcome": "YES",
+            "quantity": 100.0,
+            "price": 0.6,
+            "notional": 60.0,
+            "opened_ts": 0,
+            "last_buy_ts": 0,
+            "entry_wallet": "0x1111111111111111111111111111111111111111",
+            "entry_wallet_score": 80.0,
+            "entry_wallet_tier": "CORE",
+        }
+        trader.state.open_positions = 1
+
+        trader.step()
+
+        self.assertEqual(len(broker.calls), 1)
+        self.assertEqual(broker.calls[0][0].side, "SELL")
         self.assertNotIn("token-demo", trader.positions_book)
 
     def test_pending_buy_does_not_create_position_before_reconcile(self):
@@ -485,6 +669,7 @@ class TraderControlTests(unittest.TestCase):
             risk=_DummyRisk(),
             broker=broker,
         )
+        self._arm_live_trader(trader)
 
         trader.step()
         self.assertEqual(len(trader.pending_orders), 1)
@@ -533,6 +718,7 @@ class TraderControlTests(unittest.TestCase):
             risk=_DummyRisk(),
             broker=broker,
         )
+        self._arm_live_trader(trader)
 
         trader.step()
         self.assertEqual(len(trader.pending_orders), 1)
@@ -575,6 +761,7 @@ class TraderControlTests(unittest.TestCase):
             risk=_DummyRisk(),
             broker=broker,
         )
+        self._arm_live_trader(trader)
 
         trader.step()
         self.assertEqual(len(trader.pending_orders), 1)
@@ -611,6 +798,7 @@ class TraderControlTests(unittest.TestCase):
             risk=_DummyRisk(),
             broker=broker,
         )
+        self._arm_live_trader(trader)
 
         trader.step()
         self.assertEqual(len(trader.pending_orders), 1)
@@ -680,6 +868,7 @@ class TraderControlTests(unittest.TestCase):
             risk=_DummyRisk(),
             broker=broker,
         )
+        self._arm_live_trader(trader)
 
         trader.step()
         self.assertEqual(len(trader.pending_orders), 1)
@@ -702,6 +891,43 @@ class TraderControlTests(unittest.TestCase):
         self.assertEqual(broker.cancel_requests, ["live-token-demo"])
         self.assertEqual(trader.recent_orders[0]["status"], "CANCELED")
         self.assertIn("reduce_only_cancel_pending_entry", trader.recent_orders[0]["reason"])
+
+    def test_system_reduce_only_cancels_pending_buy_orders(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 34,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _PendingBroker()
+        trader = Trader(
+            settings=self._make_settings(control_path, dry_run=False, funder_address="0xabc"),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([_signal("BUY")]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        self._arm_live_trader(trader)
+
+        trader.step()
+        self.assertEqual(len(trader.pending_orders), 1)
+
+        trader.strategy = _DummyStrategy([])
+        trader.startup_ready = False
+        trader.startup_failure_count = 1
+        trader.startup_checks = [{"name": "startup", "status": "FAIL", "message": "startup failed"}]
+        trader.step()
+
+        self.assertEqual(len(trader.pending_orders), 0)
+        self.assertEqual(broker.cancel_requests, ["live-token-demo"])
+        self.assertEqual(trader.recent_orders[0]["status"], "CANCELED")
+        self.assertIn("trading_mode_cancel_pending_entry", trader.recent_orders[0]["reason"])
 
     def test_pending_timeout_requests_cancel_and_keeps_order_when_cancel_not_terminal(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
@@ -730,6 +956,7 @@ class TraderControlTests(unittest.TestCase):
             risk=_DummyRisk(),
             broker=broker,
         )
+        self._arm_live_trader(trader)
 
         trader.step()
         order_key = next(iter(trader.pending_orders.keys()))
@@ -1127,7 +1354,7 @@ class TraderControlTests(unittest.TestCase):
         queued = trader.list_candidates(limit=4)
         self.assertEqual(len(broker.calls), 0)
         self.assertEqual(len(queued), 1)
-        self.assertEqual(queued[0]["status"], "pending")
+        self.assertEqual(queued[0]["status"], "watched")
         self.assertEqual(queued[0]["suggested_action"], "watch")
         self.assertIsNone(queued[0].get("result_tag"))
 
@@ -1222,6 +1449,7 @@ class TraderControlTests(unittest.TestCase):
                 risk=RiskManager(settings),
                 broker=broker,
             )
+            self._arm_live_trader(trader)
 
             trader.step()
         finally:
@@ -1264,6 +1492,99 @@ class TraderControlTests(unittest.TestCase):
         )
         trader.step()
         self.assertEqual(len(broker.calls), 1)
+
+    def test_pending_buy_blocks_duplicate_even_after_ttl_expires(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 41,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _PendingBroker()
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                dry_run=False,
+                funder_address="0xabc",
+                order_dedup_ttl_seconds=1,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([_signal("BUY")]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        self._arm_live_trader(trader)
+
+        trader.step()
+        self.assertEqual(len(broker.calls), 1)
+        self.assertEqual(len(trader.pending_orders), 1)
+
+        for key in list(trader._recent_order_keys.keys()):
+            trader._recent_order_keys[key] = time.time() - 1
+        trader.strategy = _DummyStrategy([_signal("BUY")])
+
+        trader.step()
+
+        self.assertEqual(len(broker.calls), 1)
+        self.assertEqual(len(trader.pending_orders), 1)
+
+    def test_runtime_snapshot_restores_recent_order_keys_and_blocks_duplicate_buy(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 42,
+                },
+                f,
+            )
+            control_path = f.name
+
+        probe_signal = _signal("BUY")
+        probe_broker = _DummyBroker()
+        probe_trader = Trader(
+            settings=self._make_settings(control_path, order_dedup_ttl_seconds=120),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=probe_broker,
+        )
+        order_key = probe_trader._build_order_key(probe_signal, 50.0)
+        runtime_state_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump(
+            {
+                "recent_order_keys": {
+                    order_key: time.time() + 120,
+                }
+            },
+            runtime_state_file,
+        )
+        runtime_state_file.flush()
+        runtime_state_file.close()
+
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                runtime_state_path=runtime_state_file.name,
+                order_dedup_ttl_seconds=120,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([_signal("BUY")]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+
+        trader.step()
+
+        self.assertEqual(len(broker.calls), 0)
 
     def test_wallet_score_trade_tier_reduces_order_size(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
@@ -1945,6 +2266,319 @@ class TraderControlTests(unittest.TestCase):
         self.assertEqual(trader.positions_book, {})
         self.assertEqual(trader.state.open_positions, 0)
 
+    def test_broker_dust_positions_are_ignored_at_startup(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as control_file:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 1,
+                },
+                control_file,
+            )
+            control_path = control_file.name
+
+        data_client = _DummyDataClient()
+        data_client.active_positions = [
+            _ActivePosition(
+                wallet="0xabc",
+                token_id="dust-token",
+                market_slug="dust-market",
+                outcome="YES",
+                avg_price=0.24,
+                size=0.001817,
+                notional=0.00043608,
+                timestamp=1,
+            )
+        ]
+        data_client.accounting_snapshot = AccountingSnapshot(
+            wallet="0xabc",
+            cash_balance=87.236801,
+            positions_value=0.00043608,
+            equity=87.23723708,
+            valuation_time="2026-03-25T04:47:00Z",
+            positions=(
+                AccountingPosition(
+                    token_id="dust-token",
+                    condition_id="",
+                    size=0.001817,
+                    price=0.24,
+                    value=0.00043608,
+                    valuation_time="2026-03-25T04:47:00Z",
+                ),
+            ),
+        )
+
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                dry_run=False,
+                funder_address="0xabc",
+            ),
+            data_client=data_client,
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+
+        self.assertEqual(trader.positions_book, {})
+        self.assertEqual(trader.state.open_positions, 0)
+
+    def test_startup_merges_snapshot_position_metadata_into_broker_position(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as control_file:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 1,
+                },
+                control_file,
+            )
+            control_path = control_file.name
+
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as runtime_state_file:
+            json.dump(
+                {
+                    "positions": [
+                        {
+                            "token_id": "token-demo",
+                            "condition_id": "condition-demo",
+                            "market_slug": "demo-market",
+                            "outcome": "YES",
+                            "quantity": 10.0,
+                            "price": 0.5,
+                            "notional": 5.0,
+                            "cost_basis_notional": 4.8,
+                            "opened_ts": 1700000001,
+                            "last_buy_ts": 1700000002,
+                            "last_trim_ts": 1700000003,
+                            "entry_wallet": "0xold",
+                            "entry_wallet_score": 75.0,
+                            "entry_wallet_tier": "CORE",
+                            "entry_reason": "snapshot",
+                            "trace_id": "trc-demo",
+                            "origin_signal_id": "sig-origin",
+                            "last_signal_id": "sig-last",
+                            "last_exit_kind": "trim",
+                            "last_exit_label": "Trimmed",
+                            "last_exit_summary": "trimmed after target",
+                            "last_exit_ts": 1700000004,
+                        }
+                    ]
+                },
+                runtime_state_file,
+            )
+            runtime_state_path = runtime_state_file.name
+
+        data_client = _DummyDataClient()
+        data_client.active_positions = [
+            _ActivePosition(
+                wallet="0xabc",
+                token_id="token-demo",
+                condition_id="condition-demo",
+                market_slug="demo-market",
+                outcome="YES",
+                avg_price=0.6,
+                size=10.0,
+                notional=6.0,
+                timestamp=1700001000,
+            )
+        ]
+
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                dry_run=False,
+                funder_address="0xabc",
+                runtime_state_path=runtime_state_path,
+            ),
+            data_client=data_client,
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+
+        self.assertIn("token-demo", trader.positions_book)
+        recovered = trader.positions_book["token-demo"]
+        self.assertAlmostEqual(recovered["quantity"], 10.0, places=4)
+        self.assertAlmostEqual(recovered["notional"], 6.0, places=4)
+        self.assertAlmostEqual(recovered["price"], 0.6, places=4)
+        self.assertAlmostEqual(recovered["cost_basis_notional"], 4.8, places=4)
+        self.assertEqual(recovered["entry_wallet"], "0xold")
+        self.assertEqual(recovered["entry_wallet_tier"], "CORE")
+        self.assertEqual(recovered["trace_id"], "trc-demo")
+        self.assertEqual(recovered["origin_signal_id"], "sig-origin")
+        self.assertEqual(recovered["last_signal_id"], "sig-last")
+        self.assertEqual(recovered["last_exit_label"], "Trimmed")
+        self.assertEqual(recovered["opened_ts"], 1700000001)
+        self.assertEqual(recovered["last_trim_ts"], 1700000003)
+
+    def test_startup_scales_snapshot_cost_basis_when_broker_quantity_differs(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as control_file:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 1,
+                },
+                control_file,
+            )
+            control_path = control_file.name
+
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as runtime_state_file:
+            json.dump(
+                {
+                    "positions": [
+                        {
+                            "token_id": "token-demo",
+                            "market_slug": "demo-market",
+                            "outcome": "YES",
+                            "quantity": 10.0,
+                            "price": 0.5,
+                            "notional": 5.0,
+                            "cost_basis_notional": 5.0,
+                            "opened_ts": 1700000001,
+                            "last_buy_ts": 1700000002,
+                            "entry_wallet": "0xold",
+                            "trace_id": "trc-demo",
+                            "origin_signal_id": "sig-origin",
+                        }
+                    ]
+                },
+                runtime_state_file,
+            )
+            runtime_state_path = runtime_state_file.name
+
+        data_client = _DummyDataClient()
+        data_client.active_positions = [
+            _ActivePosition(
+                wallet="0xabc",
+                token_id="token-demo",
+                market_slug="demo-market",
+                outcome="YES",
+                avg_price=0.6,
+                size=6.0,
+                notional=3.6,
+                timestamp=1700001000,
+            )
+        ]
+
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                dry_run=False,
+                funder_address="0xabc",
+                runtime_state_path=runtime_state_path,
+            ),
+            data_client=data_client,
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+
+        recovered = trader.positions_book["token-demo"]
+        self.assertAlmostEqual(recovered["quantity"], 6.0, places=4)
+        self.assertAlmostEqual(recovered["notional"], 3.6, places=4)
+        self.assertAlmostEqual(recovered["cost_basis_notional"], 3.0, places=4)
+        self.assertEqual(recovered["trace_id"], "trc-demo")
+        self.assertEqual(recovered["entry_wallet"], "0xold")
+
+    def test_startup_broker_position_seeds_metadata_from_restored_pending_order(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as control_file:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 1,
+                },
+                control_file,
+            )
+            control_path = control_file.name
+
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as runtime_state_file:
+            json.dump(
+                {
+                    "pending_orders": [
+                        {
+                            "key": "sig-demo:BUY:token-demo",
+                            "ts": 1700000001,
+                            "signal_id": "sig-demo",
+                            "order_id": "oid-demo",
+                            "broker_status": "posted",
+                            "trace_id": "trc-demo",
+                            "token_id": "token-demo",
+                            "condition_id": "condition-demo",
+                            "market_slug": "demo-market",
+                            "outcome": "YES",
+                            "side": "BUY",
+                            "wallet": "0xwallet",
+                            "wallet_score": 88.0,
+                            "wallet_tier": "CORE",
+                            "requested_notional": 10.0,
+                            "requested_price": 0.5,
+                            "entry_wallet": "0xwallet",
+                            "entry_wallet_score": 88.0,
+                            "entry_wallet_tier": "CORE",
+                            "entry_topic_label": "Politics",
+                            "entry_topic_bias": "neutral",
+                            "entry_topic_multiplier": 1.0,
+                            "entry_topic_summary": "followed wallet",
+                            "entry_reason": "restored pending buy",
+                            "origin_signal_id": "sig-origin",
+                            "last_signal_id": "sig-demo",
+                        }
+                    ]
+                },
+                runtime_state_file,
+            )
+            runtime_state_path = runtime_state_file.name
+
+        data_client = _DummyDataClient()
+        data_client.active_positions = [
+            _ActivePosition(
+                wallet="0xabc",
+                token_id="token-demo",
+                condition_id="condition-demo",
+                market_slug="demo-market",
+                outcome="YES",
+                avg_price=0.6,
+                size=20.0,
+                notional=12.0,
+                timestamp=1700001000,
+            )
+        ]
+
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                dry_run=False,
+                funder_address="0xabc",
+                runtime_state_path=runtime_state_path,
+            ),
+            data_client=data_client,
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+
+        self.assertIn("token-demo", trader.positions_book)
+        recovered = trader.positions_book["token-demo"]
+        self.assertAlmostEqual(recovered["quantity"], 20.0, places=4)
+        self.assertAlmostEqual(recovered["notional"], 12.0, places=4)
+        self.assertAlmostEqual(recovered["cost_basis_notional"], 10.0, places=4)
+        self.assertEqual(recovered["opened_ts"], 1700000001)
+        self.assertEqual(recovered["last_buy_ts"], 1700000001)
+        self.assertEqual(recovered["entry_wallet"], "0xwallet")
+        self.assertAlmostEqual(recovered["entry_wallet_score"], 88.0, places=4)
+        self.assertEqual(recovered["entry_topic_label"], "Politics")
+        self.assertEqual(recovered["trace_id"], "trc-demo")
+        self.assertEqual(recovered["origin_signal_id"], "sig-origin")
+        self.assertEqual(recovered["last_signal_id"], "sig-demo")
+
     def test_startup_restores_pending_open_orders_from_broker(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
             json.dump(
@@ -1990,7 +2624,7 @@ class TraderControlTests(unittest.TestCase):
         self.assertAlmostEqual(float(restored["requested_notional"]), 10.0, places=4)
         self.assertAlmostEqual(float(restored["matched_notional_hint"]), 2.5, places=4)
 
-    def test_startup_drops_snapshot_pending_orders_when_broker_reports_none_open(self):
+    def test_startup_keeps_snapshot_pending_orders_when_broker_reports_empty_open_orders(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
             json.dump(
                 {
@@ -2045,7 +2679,71 @@ class TraderControlTests(unittest.TestCase):
             broker=broker,
         )
 
-        self.assertEqual(len(trader.pending_orders), 0)
+        self.assertEqual(len(trader.pending_orders), 1)
+        restored = next(iter(trader.pending_orders.values()))
+        self.assertEqual(restored["order_id"], "oid-stale")
+        self.assertEqual(restored["recovery_status"], "uncertain_empty_broker_open_orders")
+        self.assertEqual(restored["recovery_source"], "snapshot")
+
+    def test_restored_uncertain_pending_order_blocks_duplicate_buy_after_restart(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 43,
+                },
+                f,
+            )
+            control_path = f.name
+        runtime_state_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump(
+            {
+                "pending_orders": [
+                    {
+                        "key": "sig-1:BUY:token-demo",
+                        "ts": 1700000000,
+                        "cycle_id": "",
+                        "order_id": "oid-stale",
+                        "broker_status": "live",
+                        "signal_id": "sig-1",
+                        "trace_id": "",
+                        "token_id": "token-demo",
+                        "condition_id": "condition-demo",
+                        "market_slug": "demo-market",
+                        "outcome": "YES",
+                        "side": "BUY",
+                        "wallet": "",
+                        "requested_notional": 12.0,
+                        "requested_price": 0.6,
+                    }
+                ]
+            },
+            runtime_state_file,
+        )
+        runtime_state_file.flush()
+        runtime_state_file.close()
+
+        broker = _PendingBroker()
+        broker.open_orders = []
+
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                dry_run=True,
+                runtime_state_path=runtime_state_file.name,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([_signal("BUY")]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+
+        trader.step()
+
+        self.assertEqual(len(broker.calls), 0)
+        self.assertEqual(len(trader.pending_orders), 1)
 
     def test_runtime_snapshot_restores_broker_event_sync_cursor(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
@@ -2085,7 +2783,7 @@ class TraderControlTests(unittest.TestCase):
         self.assertEqual(trader._last_broker_event_sync_ts, 1700000123)
         dumped = trader._dump_runtime_state()
         self.assertEqual(dumped["broker_event_sync_ts"], 1700000123)
-        self.assertEqual(dumped["runtime_version"], 6)
+        self.assertEqual(dumped["runtime_version"], 7)
 
     def test_live_startup_checks_fail_when_network_smoke_reports_block(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
@@ -2273,6 +2971,108 @@ class TraderControlTests(unittest.TestCase):
         self.assertEqual(smoke_check["status"], "FAIL")
         self.assertIn("stale", str(smoke_check["message"]))
 
+    def test_account_state_stale_blocks_new_buy_but_allows_sell(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 35,
+                },
+                f,
+            )
+            control_path = f.name
+
+        stale_ts = int(time.time()) - 7200
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(control_path, dry_run=False, funder_address="0xabc", account_sync_refresh_seconds=300),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([_signal("BUY")]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        trader.startup_ready = True
+        trader.startup_failure_count = 0
+        trader.startup_checks = []
+        trader.state.account_snapshot_ts = stale_ts
+        trader.state.cash_balance_usd = 100.0
+
+        trader.step()
+
+        self.assertEqual(len(broker.calls), 0)
+        self.assertEqual(trader.trading_mode, "REDUCE_ONLY")
+        self.assertIn("account_state_stale", trader.trading_mode_reasons)
+
+        trader.strategy = _DummyStrategy([_signal("SELL")])
+        trader.positions_book["token-demo"] = {
+            "token_id": "token-demo",
+            "market_slug": "demo-market",
+            "outcome": "YES",
+            "quantity": 100.0,
+            "price": 0.6,
+            "notional": 60.0,
+            "opened_ts": 0,
+            "last_buy_ts": 0,
+            "entry_wallet": "0x1111111111111111111111111111111111111111",
+            "entry_wallet_score": 80.0,
+            "entry_wallet_tier": "CORE",
+        }
+        trader.state.open_positions = 1
+
+        trader.step()
+
+        self.assertEqual(len(broker.calls), 1)
+        self.assertEqual(broker.calls[0][0].side, "SELL")
+
+    def test_reconciliation_warn_blocks_new_buy(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 36,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(control_path),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([_signal("BUY")]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        trader.pending_orders["stale-live-token-demo"] = {
+            "key": "stale-live-token-demo",
+            "order_id": "live-token-demo",
+            "token_id": "token-demo",
+            "condition_id": "condition-demo",
+            "market_slug": "demo-market",
+            "outcome": "YES",
+            "side": "BUY",
+            "wallet": "0x1111111111111111111111111111111111111111",
+            "requested_notional": 25.0,
+            "requested_price": 0.6,
+            "matched_notional_hint": 0.0,
+            "matched_size_hint": 0.0,
+            "matched_price_hint": 0.0,
+            "ts": int(time.time()) - 7200,
+            "status": "PENDING",
+            "broker_status": "live",
+        }
+        trader._refresh_risk_state()
+
+        trader.step()
+
+        self.assertEqual(len(broker.calls), 0)
+        self.assertEqual(trader.trading_mode, "REDUCE_ONLY")
+        self.assertIn("reconciliation_warn", trader.trading_mode_reasons)
+
     def test_reconciliation_summary_matches_ledger_after_sell_fill(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
             json.dump(
@@ -2349,6 +3149,7 @@ class TraderControlTests(unittest.TestCase):
             risk=_DummyRisk(),
             broker=broker,
         )
+        self._arm_live_trader(trader)
 
         trader.step()
         broker.recent_fills = [
@@ -2395,6 +3196,7 @@ class TraderControlTests(unittest.TestCase):
             risk=_DummyRisk(),
             broker=broker,
         )
+        self._arm_live_trader(trader)
 
         trader.step()
         broker.order_statuses = {}
@@ -2435,6 +3237,175 @@ class TraderControlTests(unittest.TestCase):
         self.assertEqual(restored["broker_status"], "partially_filled")
         self.assertAlmostEqual(float(restored["matched_notional_hint"]), 12.0, places=4)
         self.assertEqual(trader.recent_orders[0]["status"], "PARTIAL")
+
+    def test_order_event_stream_targets_matching_order_when_multiple_pending_share_token(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 29,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _PendingBroker()
+        data_client = _DummyDataClient()
+        data_client.active_positions = [
+            _ActivePosition(
+                wallet="0xabc",
+                token_id="token-demo",
+                market_slug="demo-market",
+                outcome="YES",
+                avg_price=0.6,
+                size=20.0,
+                notional=12.0,
+                timestamp=1700000010,
+            )
+        ]
+        trader = Trader(
+            settings=self._make_settings(control_path, dry_run=False, funder_address="0xabc"),
+            data_client=data_client,
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        self._arm_live_trader(trader, account_snapshot_ts=1700000020)
+        trader.positions_book = {}
+        trader.state.open_positions = 0
+        now_ts = int(time.time())
+        trader.pending_orders = {
+            "first": self._restore_pending_order(
+                trader,
+                key="first",
+                order_id="order-1",
+                side="BUY",
+                ts=now_ts - 10,
+            ),
+            "second": self._restore_pending_order(
+                trader,
+                key="second",
+                order_id="order-2",
+                side="BUY",
+                ts=now_ts - 9,
+            ),
+        }
+        trader._refresh_risk_state()
+        broker.order_events = [
+            BrokerOrderEvent(
+                event_type="fill",
+                order_id="order-1",
+                token_id="token-demo",
+                side="BUY",
+                timestamp=1700000010,
+                matched_notional=12.0,
+                matched_size=20.0,
+                avg_fill_price=0.6,
+                market_slug="demo-market",
+                outcome="YES",
+                tx_hash="0xfill-1",
+            ),
+            BrokerOrderEvent(
+                event_type="status",
+                order_id="order-1",
+                token_id="token-demo",
+                side="BUY",
+                timestamp=1700000011,
+                status="partially_filled",
+                matched_notional=12.0,
+                matched_size=20.0,
+                avg_fill_price=0.6,
+            ),
+        ]
+
+        trader._reconcile_runtime_with_broker()
+
+        self.assertEqual(len(trader.pending_orders), 2)
+        first = trader.pending_orders["first"]
+        second = trader.pending_orders["second"]
+        self.assertAlmostEqual(float(first["matched_notional_hint"]), 12.0, places=4)
+        self.assertAlmostEqual(float(first["reconciled_notional_hint"]), 12.0, places=4)
+        self.assertEqual(str(first["broker_status"]), "partially_filled")
+        self.assertAlmostEqual(float(second["matched_notional_hint"]), 0.0, places=4)
+        self.assertAlmostEqual(float(second["reconciled_notional_hint"]), 0.0, places=4)
+        self.assertEqual(int(second["reconcile_ambiguous_ts"]), 0)
+        self.assertAlmostEqual(float(trader.positions_book["token-demo"]["notional"]), 12.0, places=4)
+        self.assertEqual(str(trader.recent_orders[0]["order_id"]), "order-1")
+        self.assertEqual(str(trader.recent_orders[0]["status"]), "PARTIAL")
+
+    def test_multiple_pending_same_token_without_order_fill_marks_ambiguous(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 30,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _PendingBroker()
+        broker.order_events = []
+        data_client = _DummyDataClient()
+        data_client.active_positions = [
+            _ActivePosition(
+                wallet="0xabc",
+                token_id="token-demo",
+                market_slug="demo-market",
+                outcome="YES",
+                avg_price=0.6,
+                size=20.0,
+                notional=12.0,
+                timestamp=1700000010,
+            )
+        ]
+        trader = Trader(
+            settings=self._make_settings(control_path, dry_run=False, funder_address="0xabc"),
+            data_client=data_client,
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        self._arm_live_trader(trader, account_snapshot_ts=1700000020)
+        trader.positions_book = {}
+        trader.state.open_positions = 0
+        now_ts = int(time.time())
+        trader.pending_orders = {
+            "first": self._restore_pending_order(
+                trader,
+                key="first",
+                order_id="order-1",
+                side="BUY",
+                ts=now_ts - 10,
+            ),
+            "second": self._restore_pending_order(
+                trader,
+                key="second",
+                order_id="order-2",
+                side="BUY",
+                ts=now_ts - 9,
+            ),
+        }
+        trader._refresh_risk_state()
+
+        trader._reconcile_runtime_with_broker()
+
+        self.assertEqual(len(trader.pending_orders), 2)
+        self.assertEqual(len(trader.recent_orders), 0)
+        first = trader.pending_orders["first"]
+        second = trader.pending_orders["second"]
+        self.assertGreater(int(first["reconcile_ambiguous_ts"]), 0)
+        self.assertGreater(int(second["reconcile_ambiguous_ts"]), 0)
+        self.assertIn("multiple_pending_orders_for_token=token-demo:BUY", str(first["reconcile_ambiguous_reason"]))
+        self.assertIn("multiple_pending_orders_for_token=token-demo:BUY", str(second["reconcile_ambiguous_reason"]))
+        summary = trader.reconciliation_summary(now=1700000200)
+        self.assertEqual(summary["status"], "warn")
+        self.assertIn("ambiguous_pending_orders=2", summary["issues"])
+        self.assertEqual(int(summary["ambiguous_pending_orders"]), 2)
 
     def test_recent_fill_sell_reconcile_updates_realized_pnl_without_position_delta(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
@@ -2495,6 +3466,7 @@ class TraderControlTests(unittest.TestCase):
 
         trader.step()
         data_client.active_positions = []
+        fill_ts = int(time.time())
         broker.recent_fills = [
             OrderFillSnapshot(
                 order_id="live-token-demo",
@@ -2502,7 +3474,7 @@ class TraderControlTests(unittest.TestCase):
                 side="SELL",
                 price=0.6,
                 size=50.0,
-                timestamp=1700000020,
+                timestamp=fill_ts,
                 market_slug="demo-market",
                 outcome="YES",
             )
@@ -2516,6 +3488,493 @@ class TraderControlTests(unittest.TestCase):
         self.assertAlmostEqual(trader.positions_book["token-demo"]["cost_basis_notional"], 25.0, places=4)
         self.assertAlmostEqual(trader.state.daily_realized_pnl, 5.0, places=4)
         self.assertEqual(trader.recent_orders[0]["status"], "RECONCILED")
+
+    def test_cross_day_sell_fill_uses_fill_timestamp_for_ledger_and_recent_orders(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 31,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _PendingBroker()
+        data_client = _DummyDataClient()
+        prev_fill_ts = int(datetime(2026, 3, 19, 23, 59, 50, tzinfo=timezone.utc).timestamp())
+        reconcile_now_ts = int(datetime(2026, 3, 20, 0, 5, 0, tzinfo=timezone.utc).timestamp())
+        trader = Trader(
+            settings=self._make_settings(control_path, dry_run=False, funder_address="0xabc"),
+            data_client=data_client,
+            strategy=_DummyStrategy(
+                [
+                    _signal(
+                        "SELL",
+                        wallet="0x9999999999999999999999999999999999999999",
+                        observed_notional=30.0,
+                        exit_fraction=0.5,
+                    )
+                ]
+            ),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        trader.positions_book["token-demo"] = {
+            "token_id": "token-demo",
+            "market_slug": "demo-market",
+            "outcome": "YES",
+            "quantity": 100.0,
+            "price": 0.6,
+            "notional": 60.0,
+            "cost_basis_notional": 50.0,
+            "opened_ts": 0,
+            "last_buy_ts": 0,
+            "entry_wallet": "0x9999999999999999999999999999999999999999",
+            "entry_wallet_score": 82.0,
+            "entry_wallet_tier": "CORE",
+        }
+        trader.state.open_positions = 1
+        self._arm_live_trader(trader, account_snapshot_ts=reconcile_now_ts)
+        data_client.active_positions = [
+            _ActivePosition(
+                wallet="0xabc",
+                token_id="token-demo",
+                market_slug="demo-market",
+                outcome="YES",
+                avg_price=0.6,
+                size=100.0,
+                notional=60.0,
+                timestamp=prev_fill_ts - 60,
+            )
+        ]
+
+        trader.step()
+        data_client.active_positions = [
+            _ActivePosition(
+                wallet="0xabc",
+                token_id="token-demo",
+                market_slug="demo-market",
+                outcome="YES",
+                avg_price=0.6,
+                size=50.0,
+                notional=30.0,
+                timestamp=prev_fill_ts,
+            )
+        ]
+        broker.order_events = [
+            BrokerOrderEvent(
+                event_type="fill",
+                order_id="live-token-demo",
+                token_id="token-demo",
+                side="SELL",
+                timestamp=prev_fill_ts,
+                matched_notional=30.0,
+                matched_size=50.0,
+                avg_fill_price=0.6,
+                market_slug="demo-market",
+                outcome="YES",
+                tx_hash="0xlate-fill",
+            ),
+            BrokerOrderEvent(
+                event_type="status",
+                order_id="live-token-demo",
+                token_id="token-demo",
+                side="SELL",
+                timestamp=prev_fill_ts + 1,
+                status="filled",
+                matched_notional=30.0,
+                matched_size=50.0,
+                avg_fill_price=0.6,
+            ),
+        ]
+
+        with patch("polymarket_bot.runner.time.time", return_value=reconcile_now_ts):
+            trader._reconcile_runtime_with_broker()
+
+        prev_day_key = datetime.fromtimestamp(prev_fill_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        now_day_key = datetime.fromtimestamp(reconcile_now_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+        prev_day_summary = trader._ledger_day_summary(prev_day_key)
+        now_day_summary = trader._ledger_day_summary(now_day_key)
+
+        self.assertEqual(len(trader.pending_orders), 0)
+        self.assertEqual(int(trader.recent_orders[0]["ts"]), prev_fill_ts)
+        self.assertEqual(str(trader.recent_orders[0]["status"]), "RECONCILED")
+        self.assertAlmostEqual(float(trader.state.daily_realized_pnl), 0.0, places=4)
+        self.assertAlmostEqual(float(trader.positions_book["token-demo"]["notional"]), 30.0, places=4)
+        self.assertAlmostEqual(float(trader.positions_book["token-demo"]["cost_basis_notional"]), 25.0, places=4)
+        self.assertEqual(int(trader.positions_book["token-demo"]["last_trim_ts"]), prev_fill_ts)
+        self.assertEqual(int(prev_day_summary["fill_count"]), 1)
+        self.assertAlmostEqual(float(prev_day_summary["realized_pnl"]), 5.0, places=4)
+        self.assertEqual(int(prev_day_summary["last_fill_ts"]), prev_fill_ts)
+        self.assertEqual(int(now_day_summary["fill_count"]), 0)
+        self.assertAlmostEqual(float(now_day_summary["realized_pnl"]), 0.0, places=4)
+        summary = trader.reconciliation_summary(now=reconcile_now_ts)
+        self.assertEqual(summary["status"], "ok")
+        self.assertAlmostEqual(float(summary["internal_vs_ledger_diff"]), 0.0, places=4)
+
+    def test_periodic_reconcile_scales_existing_cost_basis_when_broker_quantity_changes(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 1,
+                },
+                f,
+            )
+            control_path = f.name
+
+        data_client = _DummyDataClient()
+        data_client.active_positions = [
+            _ActivePosition(
+                wallet="0xabc",
+                token_id="token-demo",
+                market_slug="demo-market",
+                outcome="YES",
+                avg_price=0.6,
+                size=6.0,
+                notional=3.6,
+                timestamp=1700001000,
+            )
+        ]
+        data_client.accounting_snapshot = AccountingSnapshot(
+            wallet="0xabc",
+            cash_balance=10.0,
+            positions_value=3.6,
+            equity=13.6,
+            valuation_time="2026-03-20T06:47:12Z",
+            positions=({"token_id": "token-demo"},),
+        )
+
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                dry_run=False,
+                funder_address="0xabc",
+                account_sync_refresh_seconds=60,
+            ),
+            data_client=data_client,
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+        trader.positions_book["token-demo"] = {
+            "token_id": "token-demo",
+            "condition_id": "condition-demo",
+            "market_slug": "demo-market",
+            "outcome": "YES",
+            "quantity": 10.0,
+            "price": 0.5,
+            "notional": 5.0,
+            "cost_basis_notional": 5.0,
+            "opened_ts": 1700000000,
+            "last_buy_ts": 1700000000,
+            "last_trim_ts": 0,
+            "entry_wallet": "0xold",
+            "entry_wallet_score": 75.0,
+            "entry_wallet_tier": "CORE",
+            "entry_topic_label": "",
+            "entry_topic_bias": "neutral",
+            "entry_topic_multiplier": 1.0,
+            "entry_topic_summary": "",
+            "entry_reason": "demo",
+            "trace_id": "trc-demo",
+            "origin_signal_id": "sig-demo",
+            "last_signal_id": "sig-demo",
+            "last_exit_kind": "",
+            "last_exit_label": "",
+            "last_exit_summary": "",
+            "last_exit_ts": 0,
+        }
+        trader._refresh_risk_state()
+
+        trader._reconcile_runtime_with_broker()
+
+        self.assertIn("token-demo", trader.positions_book)
+        recovered = trader.positions_book["token-demo"]
+        self.assertAlmostEqual(recovered["quantity"], 6.0, places=4)
+        self.assertAlmostEqual(recovered["notional"], 3.6, places=4)
+        self.assertAlmostEqual(recovered["cost_basis_notional"], 3.0, places=4)
+        self.assertEqual(recovered["trace_id"], "trc-demo")
+        self.assertEqual(recovered["entry_wallet"], "0xold")
+
+    def test_ledger_append_failure_marks_persistence_fault_and_halts_opening(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 1,
+                },
+                f,
+            )
+            control_path = f.name
+
+        trader = Trader(
+            settings=self._make_settings(control_path, dry_run=False, funder_address="0xabc"),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+        self._arm_live_trader(trader)
+
+        with patch("polymarket_bot.runner.append_ledger_entry", side_effect=OSError("disk full")):
+            trader._append_ledger_entry(
+                "fill",
+                {
+                    "ts": int(time.time()),
+                    "side": "SELL",
+                    "notional": 12.5,
+                    "realized_pnl": 1.25,
+                },
+            )
+
+        persistence = trader.persistence_state()
+        self.assertEqual(trader.trading_mode, "HALTED")
+        self.assertIn("persistence_fault", trader.trading_mode_reasons)
+        self.assertEqual(persistence["status"], "fault")
+        self.assertEqual(persistence["failure_count"], 1)
+        self.assertEqual(persistence["last_failure"]["kind"], "ledger_append")
+
+    def test_runtime_state_persist_failure_marks_persistence_fault_and_raises(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 1,
+                },
+                f,
+            )
+            control_path = f.name
+
+        runtime_state_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        runtime_state_file.write("{}")
+        runtime_state_file.flush()
+        runtime_state_file.close()
+
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                dry_run=False,
+                funder_address="0xabc",
+                runtime_state_path=runtime_state_file.name,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+        self._arm_live_trader(trader)
+
+        with patch("polymarket_bot.runner.os.replace", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                trader.persist_runtime_state(runtime_state_file.name)
+
+        persistence = trader.persistence_state()
+        self.assertEqual(trader.trading_mode, "HALTED")
+        self.assertIn("persistence_fault", trader.trading_mode_reasons)
+        self.assertEqual(persistence["status"], "fault")
+        self.assertEqual(persistence["last_failure"]["kind"], "runtime_state_write")
+
+    def test_persistence_fault_cancels_pending_buy_orders(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 24,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _PendingBroker()
+        trader = Trader(
+            settings=self._make_settings(control_path, dry_run=False, funder_address="0xabc"),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([_signal("BUY")]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        self._arm_live_trader(trader)
+
+        trader.step()
+        self.assertEqual(len(trader.pending_orders), 1)
+        trader.record_external_persistence_fault("daemon_state_write", "/tmp/state.json", OSError("disk full"))
+        trader.strategy = _DummyStrategy([])
+
+        trader.step()
+
+        self.assertEqual(len(trader.pending_orders), 0)
+        self.assertEqual(trader.trading_mode, "HALTED")
+        self.assertIn("persistence_fault", trader.trading_mode_reasons)
+        self.assertEqual(trader.recent_orders[0]["status"], "CANCELED")
+        self.assertIn("trading_mode_cancel_pending_entry", str(trader.recent_orders[0]["reason"]))
+
+    def test_startup_gate_critical_notification_is_deduped_by_cooldown(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 1,
+                },
+                f,
+            )
+            control_path = f.name
+
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                dry_run=True,
+                critical_notification_enabled=True,
+                critical_notification_cooldown_seconds=300,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+        trader.notifier = _RecordingNotifier()
+
+        trader.startup_ready = False
+        trader.startup_failure_count = 2
+        trader._update_trading_mode(
+            trader.control_state,
+            now=1700000100,
+            reconciliation={"status": "ok", "issues": [], "ambiguous_pending_orders": 0},
+        )
+        self.assertEqual(len(trader.notifier.calls), 1)
+        self.assertIn("startup gate blocked", trader.notifier.calls[0]["title"].lower())
+
+        trader.startup_ready = True
+        trader.startup_failure_count = 0
+        trader._update_trading_mode(
+            trader.control_state,
+            now=1700000200,
+            reconciliation={"status": "ok", "issues": [], "ambiguous_pending_orders": 0},
+        )
+        self.assertEqual(trader.trading_mode, "NORMAL")
+
+        trader.startup_ready = False
+        trader.startup_failure_count = 1
+        trader._update_trading_mode(
+            trader.control_state,
+            now=1700000250,
+            reconciliation={"status": "ok", "issues": [], "ambiguous_pending_orders": 0},
+        )
+        self.assertEqual(len(trader.notifier.calls), 1)
+
+        trader._update_trading_mode(
+            trader.control_state,
+            now=1700000505,
+            reconciliation={"status": "ok", "issues": [], "ambiguous_pending_orders": 0},
+        )
+        self.assertEqual(len(trader.notifier.calls), 1)
+
+        trader.startup_ready = True
+        trader.startup_failure_count = 0
+        trader._update_trading_mode(
+            trader.control_state,
+            now=1700000510,
+            reconciliation={"status": "ok", "issues": [], "ambiguous_pending_orders": 0},
+        )
+        trader.startup_ready = False
+        trader.startup_failure_count = 3
+        trader._update_trading_mode(
+            trader.control_state,
+            now=1700000900,
+            reconciliation={"status": "ok", "issues": [], "ambiguous_pending_orders": 0},
+        )
+        self.assertEqual(len(trader.notifier.calls), 2)
+
+    def test_persistence_fault_emits_critical_notification(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 1,
+                },
+                f,
+            )
+            control_path = f.name
+
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                dry_run=False,
+                funder_address="0xabc",
+                critical_notification_enabled=True,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+        self._arm_live_trader(trader)
+        trader.notifier = _RecordingNotifier()
+
+        trader.record_external_persistence_fault("daemon_state_write", "/tmp/state.json", OSError("disk full"))
+
+        self.assertEqual(len(trader.notifier.calls), 1)
+        self.assertIn("halted", trader.notifier.calls[0]["title"].lower())
+        self.assertIn("disk full", trader.notifier.calls[0]["body"].lower())
+        self.assertEqual(trader.notifier.calls[0]["extra"]["persistence"]["status"], "fault")
+
+    def test_reconciliation_ambiguity_emits_protection_notification(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 1,
+                },
+                f,
+            )
+            control_path = f.name
+
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                dry_run=False,
+                funder_address="0xabc",
+                critical_notification_enabled=True,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+        self._arm_live_trader(trader)
+        trader.notifier = _RecordingNotifier()
+        pending = self._restore_pending_order(
+            trader,
+            key="pending-demo",
+            order_id="order-demo",
+            side="BUY",
+        )
+        pending["reconcile_ambiguous_ts"] = 1700000400
+        trader.pending_orders[pending["key"]] = pending
+
+        reconciliation = trader.reconciliation_summary(now=1700000500)
+        trader._update_trading_mode(trader.control_state, now=1700000500, reconciliation=reconciliation)
+
+        self.assertEqual(len(trader.notifier.calls), 1)
+        self.assertIn("reconciliation protect", trader.notifier.calls[0]["title"].lower())
+        self.assertIn("ambiguous_pending_orders=1", trader.notifier.calls[0]["body"])
 
     def test_account_sync_populates_equity_and_closed_pnl(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
@@ -2710,6 +4169,7 @@ class TraderControlTests(unittest.TestCase):
             settings=self._make_settings(
                 control_path,
                 dry_run=False,
+                funder_address="0xabc",
                 max_signals_per_cycle=2,
                 bankroll_usd=5000.0,
                 max_condition_exposure_pct=0.015,
@@ -2719,6 +4179,7 @@ class TraderControlTests(unittest.TestCase):
             risk=_DummyRisk(),
             broker=broker,
         )
+        self._arm_live_trader(trader)
 
         trader.step()
 
@@ -3112,6 +4573,277 @@ class TraderControlTests(unittest.TestCase):
         candidate = trader._candidate_from_signal(signal, now=now_ts)
 
         self.assertEqual(candidate.expires_ts, market_start + 300)
+        self.assertEqual(candidate.market_time_source, "slug_legacy")
+        self.assertFalse(candidate.market_metadata_hit)
+
+    def test_candidate_marks_market_not_accepting_orders(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "manual",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 39,
+                },
+                f,
+            )
+            control_path = f.name
+
+        now_ts = int(time.time())
+        signal = _signal(
+            "BUY",
+            token_id="token-no-orders",
+            condition_id="condition-no-orders",
+            market_slug="metadata-market",
+        )
+        data_client = _DummyDataClient()
+        data_client.market_metadata["condition-no-orders"] = MarketMetadata(
+            condition_id="condition-no-orders",
+            market_slug="metadata-market",
+            end_ts=now_ts + 3600,
+            end_date="2026-03-22T12:00:00Z",
+            closed=False,
+            active=True,
+            accepting_orders=False,
+        )
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="manual",
+                max_signals_per_cycle=1,
+            ),
+            data_client=data_client,
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+
+        candidate = trader._candidate_from_signal(signal, now=now_ts)
+
+        self.assertEqual(candidate.skip_reason, "market_not_accepting_orders")
+        self.assertEqual(candidate.suggested_action, "watch")
+        self.assertEqual(candidate.status, "watched")
+        self.assertEqual(candidate.market_time_source, "metadata")
+        self.assertTrue(candidate.market_metadata_hit)
+        self.assertIn("acceptingOrders=false", " ".join(candidate.explanation))
+        factor_keys = [factor.key for factor in candidate.reason_factors]
+        self.assertIn("market_state", factor_keys)
+
+    def test_precheck_skipped_buy_signal_is_recorded_in_recent_signal_cycles(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "manual",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 40,
+                },
+                f,
+            )
+            control_path = f.name
+
+        now_ts = int(time.time())
+        data_client = _DummyDataClient()
+        data_client.market_metadata["condition-no-orders"] = MarketMetadata(
+            condition_id="condition-no-orders",
+            market_slug="metadata-market",
+            end_ts=now_ts + 3600,
+            end_date="2026-03-22T12:00:00Z",
+            closed=False,
+            active=True,
+            accepting_orders=False,
+        )
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="manual",
+                max_signals_per_cycle=1,
+            ),
+            data_client=data_client,
+            strategy=_DummyStrategy(
+                [
+                    _signal(
+                        "BUY",
+                        token_id="token-no-orders",
+                        condition_id="condition-no-orders",
+                        market_slug="metadata-market",
+                    )
+                ]
+            ),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+
+        trader.step()
+
+        self.assertEqual(len(broker.calls), 0)
+        self.assertEqual(len(trader.recent_signal_cycles), 1)
+        cycle = trader.recent_signal_cycles[0]
+        self.assertEqual(len(cycle["candidates"]), 1)
+        record = cycle["candidates"][0]
+        self.assertEqual(record["final_status"], "precheck_skipped")
+        self.assertEqual(record["decision_snapshot"]["skip_reason"], "market_not_accepting_orders")
+        self.assertEqual(record["decision_snapshot"]["market_time_source"], "metadata")
+        self.assertTrue(record["decision_snapshot"]["market_metadata_hit"])
+        self.assertFalse(record["decision_snapshot"]["market_closed"])
+        self.assertTrue(record["decision_snapshot"]["market_active"])
+        self.assertFalse(record["decision_snapshot"]["market_accepting_orders"])
+
+    def test_candidate_uses_metadata_end_ts_for_elapsed_market(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "manual",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 39,
+                },
+                f,
+            )
+            control_path = f.name
+
+        now_ts = int(time.time())
+        signal = _signal(
+            "BUY",
+            token_id="token-ended-market",
+            condition_id="condition-ended-market",
+            market_slug="metadata-ended-market",
+        )
+        data_client = _DummyDataClient()
+        data_client.market_metadata["condition-ended-market"] = MarketMetadata(
+            condition_id="condition-ended-market",
+            market_slug="metadata-ended-market",
+            end_ts=now_ts - 5,
+            end_date="2026-03-20T23:59:00Z",
+            closed=False,
+            active=True,
+            accepting_orders=True,
+        )
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="manual",
+                max_signals_per_cycle=1,
+            ),
+            data_client=data_client,
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+
+        candidate = trader._candidate_from_signal(signal, now=now_ts)
+
+        self.assertEqual(candidate.skip_reason, "market_window_elapsed")
+        self.assertEqual(candidate.suggested_action, "watch")
+        self.assertEqual(candidate.expires_ts, now_ts - 5)
+        self.assertEqual(candidate.market_time_source, "metadata")
+        self.assertTrue(candidate.market_metadata_hit)
+        self.assertIn("time=metadata", " ".join(candidate.explanation))
+
+    def test_auto_mode_skips_closed_market_buy_candidates(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "auto",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 40,
+                },
+                f,
+            )
+            control_path = f.name
+
+        now_ts = int(time.time())
+        signal = _signal(
+            "BUY",
+            token_id="token-closed-market",
+            condition_id="condition-closed-market",
+            market_slug="metadata-closed-market",
+            observed_notional=250.0,
+        )
+        broker = _DummyBroker()
+        data_client = _DummyDataClient()
+        data_client.market_metadata["condition-closed-market"] = MarketMetadata(
+            condition_id="condition-closed-market",
+            market_slug="metadata-closed-market",
+            end_ts=now_ts + 600,
+            end_date="2026-03-22T12:00:00Z",
+            closed=True,
+            active=False,
+            accepting_orders=False,
+        )
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="auto",
+                max_signals_per_cycle=1,
+            ),
+            data_client=data_client,
+            strategy=_DummyStrategy([signal]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+
+        trader.step()
+
+        queued = trader.list_candidates(limit=4)
+        self.assertEqual(len(broker.calls), 0)
+        self.assertEqual(len(queued), 0)
+
+    def test_manual_mode_moves_extreme_wide_buy_candidate_to_watched(self):
+        class _ExtremeWideBookDataClient(_DummyDataClient):
+            def __init__(self):
+                super().__init__()
+                self.order_book = SimpleNamespace(best_bid=0.001, best_ask=0.999)
+                self.midpoint_price = 0.998
+
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "manual",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 39,
+                },
+                f,
+            )
+            control_path = f.name
+
+        signal = _signal(
+            "BUY",
+            token_id="token-extreme-book",
+            market_slug="extreme-book-market",
+            observed_notional=250.0,
+        )
+        signal.price_hint = 0.998
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="manual",
+                max_signals_per_cycle=1,
+            ),
+            data_client=_ExtremeWideBookDataClient(),
+            strategy=_DummyStrategy([signal]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+
+        trader.step()
+
+        pending = trader.list_candidates(statuses=["pending"], limit=4)
+        watched = trader.list_candidates(statuses=["watched"], limit=4)
+
+        self.assertEqual(pending, [])
+        self.assertEqual(len(watched), 1)
+        self.assertEqual(watched[0]["skip_reason"], "spread_too_wide")
+        self.assertEqual(watched[0]["suggested_action"], "watch")
+        self.assertEqual(watched[0]["status"], "watched")
 
     def test_auto_mode_skips_buy_candidates_near_market_close(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
@@ -3287,7 +5019,7 @@ class RiskManagerTests(unittest.TestCase):
         decision = RiskManager(settings).evaluate(_signal("BUY", observed_notional=100.0), state)
 
         self.assertFalse(decision.allowed)
-        self.assertEqual(decision.reason, "daily loss limit reached")
+        self.assertEqual(decision.reason, "daily_loss_limit_reached")
 
     def test_pending_entry_notional_caps_new_buy(self):
         settings = Settings(
@@ -3311,7 +5043,7 @@ class RiskManagerTests(unittest.TestCase):
         decision = RiskManager(settings).evaluate(_signal("BUY", observed_notional=100.0), state)
 
         self.assertFalse(decision.allowed)
-        self.assertEqual(decision.reason, "remaining bankroll capacity too small")
+        self.assertEqual(decision.reason, "remaining_bankroll_capacity_too_small")
 
     def test_pending_entry_orders_count_toward_position_cap(self):
         settings = Settings(
@@ -3335,7 +5067,36 @@ class RiskManagerTests(unittest.TestCase):
         decision = RiskManager(settings).evaluate(_signal("BUY", observed_notional=200.0), state)
 
         self.assertFalse(decision.allowed)
-        self.assertEqual(decision.reason, "max open positions reached")
+        self.assertEqual(decision.reason, "max_open_positions_reached")
+
+    def test_trading_mode_blocks_buy_but_not_sell(self):
+        settings = Settings(
+            _env_file=None,
+            bankroll_usd=1000.0,
+            risk_per_trade_pct=0.05,
+            daily_max_loss_pct=0.1,
+            max_open_positions=4,
+            min_price=0.08,
+            max_price=0.92,
+        )
+        state = RiskState(
+            daily_realized_pnl=0.0,
+            open_positions=1,
+            tracked_notional_usd=100.0,
+            pending_entry_notional_usd=0.0,
+            pending_exit_notional_usd=0.0,
+            pending_entry_orders=0,
+            trading_mode="REDUCE_ONLY",
+            trading_mode_reasons=("startup_not_ready",),
+        )
+
+        buy_decision = RiskManager(settings).evaluate(_signal("BUY", observed_notional=200.0), state)
+        sell_decision = RiskManager(settings).evaluate(_signal("SELL", observed_notional=200.0), state)
+
+        self.assertFalse(buy_decision.allowed)
+        self.assertEqual(buy_decision.reason, "system_reduce_only")
+        self.assertTrue(sell_decision.allowed)
+        self.assertEqual(sell_decision.reason, "ok")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,34 @@ from polymarket_bot.clients.data_api import PolymarketDataClient
 from polymarket_bot.types import BrokerOrderEvent, ExecutionResult, OpenOrderSnapshot, OrderFillSnapshot, OrderStatusSnapshot, Signal
 
 
+def _configure_sdk_http_timeout(timeout_seconds: float | None = None) -> None:
+    try:
+        import httpx
+        from py_clob_client.http_helpers import helpers as sdk_helpers
+    except Exception:
+        return
+
+    timeout = max(1.0, float(timeout_seconds or os.getenv("POLY_CLOB_HTTP_TIMEOUT_SECONDS", "15") or 15.0))
+    current = getattr(sdk_helpers, "_http_client", None)
+    current_timeout = getattr(current, "timeout", None)
+    if isinstance(current_timeout, httpx.Timeout):
+        if all(
+            value is not None and float(value) <= timeout
+            for value in (
+                current_timeout.connect,
+                current_timeout.read,
+                current_timeout.write,
+                current_timeout.pool,
+            )
+        ):
+            return
+    try:
+        current.close()
+    except Exception:
+        pass
+    sdk_helpers._http_client = httpx.Client(http2=True, timeout=timeout)
+
+
 class _BufferedUserOrderStream:
     def __init__(
         self,
@@ -234,6 +262,8 @@ class LiveClobBroker(Broker):
             raise RuntimeError(
                 "py-clob-client not installed. Install with: pip install '.[live]'"
             ) from exc
+
+        _configure_sdk_http_timeout()
 
         self._OrderArgs = OrderArgs
         self._OrderType = OrderType
@@ -605,6 +635,7 @@ class LiveClobBroker(Broker):
         matched_size = self._safe_float(
             payload.get("sizeMatched")
             or payload.get("matchedSize")
+            or payload.get("size_matched")
             or payload.get("matched_amount")
             or payload.get("matchedAmount")
             or payload.get("filledSize")
@@ -1106,6 +1137,7 @@ class LiveClobBroker(Broker):
         matched_size = self._safe_float(
             payload.get("sizeMatched")
             or payload.get("matchedSize")
+            or payload.get("size_matched")
             or payload.get("filledSize")
             or payload.get("filled_size")
             or payload.get("matched_amount")
@@ -1249,7 +1281,9 @@ class LiveClobBroker(Broker):
         size = self._safe_float(
             payload.get("size")
             or payload.get("filledSize")
+            or payload.get("filled_size")
             or payload.get("matchedSize")
+            or payload.get("size_matched")
             or payload.get("makerAmount")
             or payload.get("takerAmount")
         )
@@ -1409,7 +1443,9 @@ class LiveClobBroker(Broker):
                 payload.get("size")
                 or payload.get("matched_amount")
                 or payload.get("filledSize")
+                or payload.get("filled_size")
                 or payload.get("matchedSize")
+                or payload.get("size_matched")
             )
             notional = self._safe_float(payload.get("usdcSize") or payload.get("matchedAmount") or payload.get("filledNotional"))
             if notional <= 0.0 and size > 0.0 and price > 0.0:
@@ -1606,6 +1642,7 @@ class LiveClobBroker(Broker):
             filled_size = self._safe_float(
                 resp.get("sizeMatched")
                 or resp.get("matchedSize")
+                or resp.get("size_matched")
                 or resp.get("filledSize")
                 or resp.get("filled_size")
             )

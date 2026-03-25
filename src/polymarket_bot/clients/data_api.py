@@ -147,6 +147,19 @@ class ResolvedMarket:
     closed: bool
 
 
+@dataclass(slots=True)
+class MarketMetadata:
+    condition_id: str
+    market_slug: str
+    end_ts: int | None
+    end_date: str
+    closed: bool
+    active: bool | None = None
+    accepting_orders: bool | None = None
+    token_ids: tuple[str, ...] = ()
+    source: str = "gamma_markets"
+
+
 class PolymarketDataClient:
     def __init__(
         self,
@@ -217,6 +230,23 @@ class PolymarketDataClient:
             return default
 
     @staticmethod
+    def _coerce_bool(value: Any, default: bool | None = None) -> bool | None:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        text = str(value).strip().lower()
+        if not text:
+            return default
+        if text in {"true", "1", "yes", "y"}:
+            return True
+        if text in {"false", "0", "no", "n"}:
+            return False
+        return default
+
+    @staticmethod
     def _csv_param(values: Sequence[str | int] | None) -> str | None:
         if not values:
             return None
@@ -239,6 +269,27 @@ class PolymarketDataClient:
         if isinstance(parsed, list):
             return [str(item).strip() for item in parsed if str(item).strip()]
         return []
+
+    @staticmethod
+    def _parse_datetime_to_ts(value: Any) -> int | None:
+        if value in (None, ""):
+            return None
+        if isinstance(value, (int, float)):
+            parsed = int(value)
+            if parsed > 10_000_000_000:
+                parsed //= 1000
+            return parsed if parsed > 0 else None
+        text = str(value).strip()
+        if not text:
+            return None
+        normalized = text.replace("Z", "+00:00")
+        try:
+            parsed = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return int(parsed.timestamp())
 
     def get_active_positions(self, wallet: str, limit: int = 200) -> list[Position]:
         data = self._get_json(
@@ -781,6 +832,76 @@ class PolymarketDataClient:
         if isinstance(data, dict):
             return data
         return {"limit": 0, "count": 0, "next_cursor": "LTE=", "data": []}
+
+    def get_market_metadata(
+        self,
+        condition_id: str = "",
+        *,
+        slug: str | None = None,
+    ) -> MarketMetadata | None:
+        normalized_condition = str(condition_id or "").strip()
+        normalized_slug = str(slug or "").strip()
+        if not normalized_condition and not normalized_slug:
+            return None
+
+        candidates: list[dict[str, Any]] = []
+        if normalized_slug:
+            by_slug = self._get_json_from_base(
+                self.gamma_base_url,
+                "/markets",
+                params={"slug": normalized_slug},
+            )
+            if isinstance(by_slug, list):
+                candidates.extend(row for row in by_slug if isinstance(row, dict))
+
+        if normalized_condition:
+            direct = self._get_json_from_base(
+                self.gamma_base_url,
+                "/markets",
+                params={"conditionId": normalized_condition},
+            )
+            if isinstance(direct, list):
+                candidates.extend(row for row in direct if isinstance(row, dict))
+
+        preferred_slug = normalized_slug.lower()
+        for row in candidates:
+            parsed = self._parse_gamma_market_metadata(row)
+            if parsed is None:
+                continue
+            if normalized_condition and parsed.condition_id == normalized_condition:
+                if not preferred_slug or parsed.market_slug.lower() == preferred_slug:
+                    return parsed
+        for row in candidates:
+            parsed = self._parse_gamma_market_metadata(row)
+            if parsed is None:
+                continue
+            if preferred_slug and parsed.market_slug.lower() == preferred_slug:
+                return parsed
+            if not normalized_condition:
+                return parsed
+        return None
+
+    def _parse_gamma_market_metadata(self, row: dict[str, Any]) -> MarketMetadata | None:
+        condition_id = str(row.get("conditionId") or row.get("condition_id") or "").strip()
+        market_slug = str(row.get("slug") or "").strip()
+        if not condition_id and not market_slug:
+            return None
+        end_date = str(row.get("endDate") or row.get("end_date") or "").strip()
+        end_ts = self._parse_datetime_to_ts(end_date)
+        token_ids = tuple(self._parse_string_list(row.get("clobTokenIds") or row.get("clob_token_ids")))
+        return MarketMetadata(
+            condition_id=condition_id,
+            market_slug=market_slug,
+            end_ts=end_ts,
+            end_date=end_date,
+            closed=bool(row.get("closed")),
+            active=self._coerce_bool(row.get("active"), default=None),
+            accepting_orders=self._coerce_bool(
+                row.get("acceptingOrders") if "acceptingOrders" in row else row.get("accepting_orders"),
+                default=None,
+            ),
+            token_ids=token_ids,
+        )
 
     def get_market_resolution(
         self,

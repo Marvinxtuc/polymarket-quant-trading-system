@@ -11,6 +11,8 @@ from typing import Any
 from urllib import request
 from urllib.parse import urlsplit
 
+from polymarket_bot.i18n import t as i18n_t
+
 
 def _split_targets(raw: str) -> list[str]:
     values: list[str] = []
@@ -46,6 +48,22 @@ def _redact_url(url: str) -> str:
 
 def _default_log_path() -> str:
     return os.getenv("POLY_NOTIFIER_LOG_PATH", "/tmp/poly_runtime_data/notifier_events.jsonl")
+
+
+def _default_notification_title() -> str:
+    return i18n_t("notifier.defaultTitle", fallback="Polymarket")
+
+
+def _delivery_detail(code: str) -> str:
+    return i18n_t(f"notifier.delivery.{code}", fallback=code)
+
+
+def _delivery_failure_detail(exc: Exception) -> str:
+    return i18n_t(
+        "notifier.delivery.deliveryFailed",
+        {"reason": str(exc)},
+        fallback=f"delivery failed: {exc}",
+    )
 
 
 class Notifier:
@@ -142,33 +160,39 @@ class Notifier:
             f.write(json.dumps(record, ensure_ascii=False) + "\n")
         return record
 
-    def notify_local(self, *, title: str, body: str) -> dict[str, Any]:
+    def notify_local(self, *, title: str, body: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
         channel = self.local_channel()
         payload = {
             "channel": "local",
             "backend": channel or "unavailable",
             "title": str(title or ""),
             "body": str(body or ""),
+            "extra": dict(extra or {}),
             "ok": False,
             "delivery_count": 1,
             "deliveries": [{"target": "local", "backend": channel or "unavailable", "ok": False}],
         }
         if not self.local_enabled:
-            payload["detail"] = "local notifications disabled"
+            payload["detail_code"] = "local_disabled"
+            payload["detail"] = _delivery_detail("localDisabled")
             return self._append_event(payload)
         if not channel:
-            payload["detail"] = "no local notification backend available"
+            payload["detail_code"] = "local_backend_unavailable"
+            payload["detail"] = _delivery_detail("localBackendUnavailable")
             return self._append_event(payload)
         try:
             if channel == "terminal-notifier":
                 subprocess.run(
-                    [channel, "-title", str(title or "Polymarket"), "-message", str(body or "")],
+                    [channel, "-title", str(title or _default_notification_title()), "-message", str(body or "")],
                     check=False,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
             elif channel == "osascript":
-                script = f'display notification {json.dumps(str(body or ""))} with title {json.dumps(str(title or "Polymarket"))}'
+                script = (
+                    f"display notification {json.dumps(str(body or ''))} "
+                    f"with title {json.dumps(str(title or _default_notification_title()))}"
+                )
                 subprocess.run(
                     [channel, "-e", script],
                     check=False,
@@ -177,7 +201,7 @@ class Notifier:
                 )
             else:
                 subprocess.run(
-                    [channel, str(title or "Polymarket"), str(body or "")],
+                    [channel, str(title or _default_notification_title()), str(body or "")],
                     check=False,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -185,7 +209,8 @@ class Notifier:
             payload["ok"] = True
             payload["deliveries"] = [{"target": "local", "backend": channel, "ok": True}]
         except Exception as exc:
-            payload["detail"] = str(exc)
+            payload["detail_code"] = "delivery_failed"
+            payload["detail"] = _delivery_failure_detail(exc)
         return self._append_event(payload)
 
     def _notify_single_webhook(
@@ -219,7 +244,8 @@ class Notifier:
                 result["status_code"] = int(getattr(resp, "status", 0) or 0)
                 result["ok"] = 200 <= int(result["status_code"] or 0) < 300
         except Exception as exc:
-            result["detail"] = str(exc)
+            result["detail_code"] = "delivery_failed"
+            result["detail"] = _delivery_failure_detail(exc)
         return result
 
     def notify_webhook(self, *, title: str, body: str, extra: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -234,7 +260,8 @@ class Notifier:
             "targets": [_redact_url(target) for target in targets],
         }
         if not targets:
-            payload["detail"] = "webhook not configured"
+            payload["detail_code"] = "webhook_not_configured"
+            payload["detail"] = _delivery_detail("webhookNotConfigured")
             return self._append_event(payload)
         deliveries: list[dict[str, Any]] = []
         ok_count = 0
@@ -257,6 +284,7 @@ class Notifier:
             "channel": "telegram",
             "title": str(title or ""),
             "body": str(body or ""),
+            "extra": dict(extra or {}),
             "ok": False,
             "delivery_count": 1,
             "deliveries": [],
@@ -264,11 +292,12 @@ class Notifier:
             "api_base": self.telegram_api_base or "https://api.telegram.org",
         }
         if not self.telegram_available():
-            payload["detail"] = "telegram not configured"
+            payload["detail_code"] = "telegram_not_configured"
+            payload["detail"] = _delivery_detail("telegramNotConfigured")
             return self._append_event(payload)
         api_base = (self.telegram_api_base or "https://api.telegram.org").rstrip("/")
         url = f"{api_base}/bot{self.telegram_bot_token}/sendMessage"
-        message = f"{str(title or 'Polymarket')}\n{str(body or '')}".strip()
+        message = f"{str(title or _default_notification_title())}\n{str(body or '')}".strip()
         request_payload: dict[str, Any] = {
             "chat_id": self.telegram_chat_id,
             "text": message,
@@ -303,8 +332,10 @@ class Notifier:
                     pass
                 payload["deliveries"] = [{"target": payload["chat_id"], "ok": payload["ok"], "status_code": payload.get("status_code", 0)}]
         except Exception as exc:
-            payload["detail"] = str(exc)
-            payload["deliveries"] = [{"target": payload["chat_id"], "ok": False, "detail": str(exc)}]
+            localized_detail = _delivery_failure_detail(exc)
+            payload["detail_code"] = "delivery_failed"
+            payload["detail"] = localized_detail
+            payload["deliveries"] = [{"target": payload["chat_id"], "ok": False, "detail_code": "delivery_failed", "detail": localized_detail}]
         return self._append_event(payload)
 
     def notify_all(
@@ -319,7 +350,7 @@ class Notifier:
         results: list[dict[str, Any]] = []
         for channel in requested:
             if channel == "local":
-                results.append(self.notify_local(title=title, body=body))
+                results.append(self.notify_local(title=title, body=body, extra=extra))
             elif channel == "webhook":
                 results.append(self.notify_webhook(title=title, body=body, extra=extra))
             elif channel == "telegram":
@@ -329,6 +360,7 @@ class Notifier:
             "channel": "multi",
             "title": str(title or ""),
             "body": str(body or ""),
+            "extra": dict(extra or {}),
             "ok": ok_count == len(results) if results else False,
             "delivery_count": sum(self._event_delivery_count(row) for row in results),
             "deliveries": results,

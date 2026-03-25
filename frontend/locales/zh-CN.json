@@ -1,0 +1,2955 @@
+{
+  "app": {
+    "title": "Polymarket 自动交易控制台",
+    "systemName": "Polymarket 自动交易系统",
+    "statusLine": "聪明钱包跟单账本 · 状态时间 {{time}} · 策略轮询 {{pollSeconds}}s · 前端刷新 {{refreshSeconds}}s",
+    "guardLine": "{{mode}} · {{broker}} · 基准单笔 {{basePerTrade}}U · 理论上限 {{maxPerTrade}}U",
+    "modeNote": {
+      "live": "{{broker}} · 会发送真实订单",
+      "paper": "{{broker}} · 不会发送真实订单"
+    },
+    "liveStatus": {
+      "online": "在线"
+    },
+    "modeBadge": {
+      "paper": "模拟盘",
+      "live": "实盘"
+    },
+    "control": {
+      "pauseOpening": {
+        "enable": "暂停开仓",
+        "disable": "恢复开仓"
+      },
+      "reduceOnly": {
+        "enable": "只减仓模式",
+        "disable": "取消只减仓"
+      },
+      "emergencyStop": {
+        "enable": "紧急退出",
+        "disable": "解除紧急退出"
+      }
+    }
+  },
+  "nav": {
+    "workspace": {
+      "overview": "总览",
+      "wallets": "钱包",
+      "ops": "监控",
+      "review": "复盘"
+    },
+    "candidateFocus": {
+      "summary": "候选解读",
+      "detail": "完整复盘"
+    }
+  },
+  "workspace": {
+    "meta": {
+      "overview": "当前视图：总览，聚焦当下决策、持仓、订单和最关键告警。",
+      "wallets": "当前视图：钱包，集中看核心钱包池、画像、评分与来源质量。",
+      "ops": "当前视图：监控，集中看启动、自检、对账、风险和运行状态。",
+      "review": "当前视图：复盘，集中看归档、日记、信号回放、归因和退出样本。"
+    }
+  },
+  "common": {
+    "waitingData": "等待数据...",
+    "waiting": "等待中...",
+    "loading": "正在加载...",
+    "unavailable": "不可用",
+    "unknown": "未知",
+    "unknownShort": "--",
+    "none": "暂无",
+    "all": "全部",
+    "noneShort": "0",
+    "notRecorded": "未记录",
+    "notGenerated": "未生成",
+    "updatedAt": "更新时间",
+    "statusLabel": "状态",
+    "dash": "--",
+    "dashTime": "--:--",
+    "ok": "正常",
+    "separator": " · ",
+    "kvInline": "{{label}}={{value}}",
+    "ageLabel": "{{age}}前",
+    "save": "保存",
+    "enabled": "已启用",
+    "disabled": "已停用",
+    "available": "可用",
+    "configured": "已配置",
+    "notConfigured": "未配置",
+    "local": "本地",
+    "secondsAgo": "{{count}} 秒前",
+    "minutesAgo": "{{count}} 分钟前",
+    "hoursAgo": "{{count}} 小时前",
+    "daysAgo": "{{count}} 天前",
+    "time": {
+      "seconds": "{{count}} 秒",
+      "minutes": "{{count}} 分",
+      "hours": "{{count}} 小时",
+      "daysHours": "{{days}} 天 {{hours}} 小时",
+      "hoursMinutes": "{{hours}} 小时 {{minutes}} 分"
+    },
+    "status": {
+      "ok": "正常",
+      "warn": "警告",
+      "fail": "失败",
+      "error": "错误",
+      "disabled": "未启用",
+      "enabled": "已启用",
+      "available": "可用",
+      "configured": "已配置",
+      "notConfigured": "未配置"
+    },
+  "actionState": {
+    "saving": "保存中...",
+    "saved": "已保存",
+    "saveFailed": "保存失败",
+    "copied": "已复制",
+    "copyFailed": "复制失败",
+    "refreshed": "已刷新",
+    "refreshFailed": "刷新失败",
+    "synced": "已同步",
+    "dirty": "有未保存改动",
+      "submitting": "提交中...",
+      "submitted": "已提交",
+      "submitFailed": "提交失败"
+    },
+    "channel": {
+      "local": "本地",
+      "webhook": "网页回调",
+      "telegram": "电报",
+      "terminal-notifier": "终端通知器",
+      "osascript": "系统脚本通知",
+      "notify-send": "桌面通知",
+      "unavailable": "不可用"
+    },
+    "units": {
+      "shares": "份"
+    },
+    "entity": {
+      "candidate": "候选",
+      "order": "订单",
+      "signal": "信号",
+      "trace": "链路",
+      "topic": "题材",
+      "cycle": "周期",
+      "action": "动作",
+      "event": "事件"
+    }
+  },
+  "metric": {
+    "status": "状态",
+    "issues": "问题",
+    "warnings": "警告",
+    "startup_failures": "启动失败",
+    "ambiguous_pending_orders": "待确认挂单",
+    "account_state": "账户状态",
+    "primary_reason": "主原因",
+    "reason": "原因",
+    "reasons": "原因列表",
+    "mode": "模式",
+    "kind": "类型",
+    "path": "路径",
+    "error": "错误",
+    "err": "错误",
+    "backend": "后端",
+    "target": "目标",
+    "targets": "目标数",
+    "delivery_count": "投递次数",
+    "deliveries": "投递次数",
+    "status_code": "状态码",
+    "broker": "券商",
+    "account_state_status": "账户状态",
+    "reconciliation_status": "对账状态",
+    "persistence_status": "持久化状态",
+    "recent_activity_events": "近期事件",
+    "recent_closed_markets": "近期已结算市场",
+    "updated_ts": "更新时间",
+    "created_ts": "创建时间"
+  },
+  "enum": {
+    "workspaceView": {
+      "overview": "总览",
+      "wallets": "钱包",
+      "ops": "监控",
+      "review": "复盘"
+    },
+    "candidateFocusView": {
+      "summary": "候选解读",
+      "detail": "完整复盘"
+    },
+    "mode": {
+      "manual": "手动",
+      "semi_auto": "半自动",
+      "auto": "自动",
+      "paper": "模拟盘",
+      "live": "实盘"
+    },
+    "controlState": {
+      "normal": "正常",
+      "pause_opening": "暂停开仓",
+      "reduce_only": "只减仓",
+      "emergency_stop": "紧急退出"
+    },
+    "trading_mode": {
+      "normal": "正常",
+      "reduce_only": "仅减仓",
+      "halted": "已停机"
+    },
+    "candidateStatus": {
+      "pending": "待处理",
+      "approved": "已批准",
+      "queued": "已排队",
+      "watched": "观察中",
+      "executed": "已执行",
+      "submitted": "已发单",
+      "rejected": "已拒绝",
+      "risk_rejected": "风控拒绝",
+      "ignored": "已忽略",
+      "expired": "已过期"
+    },
+    "candidateAction": {
+      "ignore": "忽略",
+      "watch": "观察",
+      "buy_small": "小仓跟随",
+      "buy_normal": "正常跟随",
+      "follow": "直接跟随",
+      "follow_sell": "立即跟随退出",
+      "close_partial": "减仓",
+      "close_all": "清仓",
+      "default": "处理"
+    },
+    "reportStatus": {
+      "ok": "正常",
+      "ready": "正常",
+      "warn": "警告",
+      "warning": "警告",
+      "fail": "失败",
+      "blocked": "阻断",
+      "error": "错误",
+      "conclusive": "结论充分",
+      "inconclusive": "样本不足",
+      "unknown": "未知"
+    },
+    "startupCheck": {
+      "PASS": "通过",
+      "WARN": "警告",
+      "FAIL": "失败",
+      "UNKNOWN": "未知"
+    },
+    "decision": {
+      "BLOCK": "阻断",
+      "ESCALATE": "升级处理",
+      "OBSERVE": "观察",
+      "OK": "正常",
+      "INCONCLUSIVE": "样本不足"
+    },
+    "blockbeatsSource": {
+      "pro": "专业源",
+      "public_fallback": "公开回退",
+      "disabled": "未启用",
+      "error": "错误"
+    },
+    "exitKind": {
+      "resonance_exit": "共振退出",
+      "smart_wallet_exit": "主钱包减仓",
+      "time_exit": "时间退出",
+      "emergency_exit": "紧急退出",
+      "default": "退出",
+      "entry": "开仓"
+    },
+    "exitResult": {
+      "emergency": "紧急退出",
+      "full_exit": "完全退出",
+      "partial_trim": "部分减仓",
+      "reject": "已拒绝",
+      "unknown": "未标记"
+    },
+    "signalStatus": {
+      "filled": "已成交",
+      "risk_rejected": "风控拒绝",
+      "order_rejected": "下单拒绝",
+      "duplicate_skipped": "重复跳过",
+      "skipped": "已跳过",
+      "candidate": "候选",
+      "unknown": "未知"
+    },
+    "traceStatus": {
+      "pending": "待处理",
+      "approved": "已批准",
+      "executed": "已执行",
+      "closed": "已关闭",
+      "open": "进行中",
+      "unknown": "未知"
+    },
+    "pendingOrderStatus": {
+      "FILLED": "已成交",
+      "PARTIAL": "部分成交",
+      "LIVE": "进行中",
+      "CANCELED": "已取消",
+      "FAILED": "失败",
+      "UNKNOWN": "未知"
+    },
+    "operatorAction": {
+      "REQUESTED": "已请求",
+      "CLEARED": "已清理",
+      "NOOP": "无动作",
+      "IDLE": "空闲"
+    },
+    "actionTag": {
+      "entry": "首次入场",
+      "add": "追加买入",
+      "trim": "部分减仓",
+      "exit": "完全退出",
+      "event": "事件"
+    },
+    "walletTier": {
+      "core": "核心",
+      "trade": "交易",
+      "watch": "观察",
+      "high": "高优先",
+      "low": "低优先",
+      "system": "系统",
+      "unknown": "未知"
+    },
+    "side": {
+      "buy": "买入",
+      "sell": "卖出",
+      "unknown": "未知"
+    },
+    "accountState": {
+      "unknown": "未知",
+      "fresh": "正常",
+      "stale": "陈旧"
+    },
+    "opsGateLevel": {
+      "ready": "已就绪",
+      "observe": "观察",
+      "escalate": "升级",
+      "block": "阻断"
+    },
+    "reason": {
+      "pause_opening": "已暂停开仓",
+      "reduce_only": "当前处于只减仓模式",
+      "unknown": "未知",
+      "operator_emergency_stop": "操作员紧急停止",
+      "operator_pause_opening": "操作员暂停开仓",
+      "operator_reduce_only": "操作员仅减仓",
+      "startup_not_ready": "启动自检未就绪",
+      "account_state_unknown": "账户状态未知",
+      "account_state_stale": "账户状态过旧",
+      "reconciliation_fail": "对账失败",
+      "reconciliation_warn": "对账警告",
+      "persistence_fault": "持久化故障",
+      "system_halted": "系统已停机",
+      "system_reduce_only": "系统仅减仓",
+      "sell_notional_too_small": "卖出金额过小",
+      "daily_loss_limit_reached": "达到日内亏损上限",
+      "max_open_positions_reached": "达到最大开仓数量",
+      "bankroll_fully_committed": "预算已全部占用",
+      "price_outside_allowed_band": "价格超出允许区间",
+      "calculated_notional_too_small": "计算后的下单金额过小",
+      "remaining_bankroll_capacity_too_small": "剩余预算容量过小",
+      "emergency_stop_cancel_pending_entry": "紧急停止，取消待开仓",
+      "reduce_only_cancel_pending_entry": "仅减仓，取消待开仓",
+      "trading_mode_cancel_pending_entry": "交易模式变更，取消待开仓",
+      "token_add_cooldown": "命中加仓冷却",
+      "sell_already_processed_this_cycle": "本轮已处理过卖出",
+      "no_open_position": "当前没有可退出仓位",
+      "entry_wallet_mismatch": "来源钱包与当前仓位不一致",
+      "insufficient_budget": "可用预算不足",
+      "wallet_score_gate": "钱包评分未过跟随阈值",
+      "position_missing_after_execute": "执行后未能确认仓位",
+      "market_data_unavailable": "当前没有可交易盘口",
+      "spread_too_wide": "盘口 spread 过宽",
+      "chase_too_high": "追价成本过高",
+      "price_out_of_band": "价格不在允许区间内",
+      "invalid_notional": "下单金额不满足限制",
+      "duplicate_signal": "同轮重复信号",
+      "risk_rejected": "风控拒绝",
+      "pending_order_exists": "已有进行中的相关订单",
+      "netting_limited": "同条件暴露已接近上限"
+    }
+  },
+  "candidate": {
+    "detail": {
+      "title": "候选详情",
+      "selectHint": "点击任意候选卡片查看完整细节",
+      "summary": "这里会展示单条候选的盘口、钱包、追价和题材富化细节。",
+      "status": "状态",
+      "deepRead": "候选深读",
+      "breakdown": "因子拆解",
+      "breakdownMeta": "0 个因子",
+      "breakdownCard": "评分拆解",
+      "conflict": "风险冲突",
+      "conflictMeta": "0 个冲突",
+      "conflictCard": "风险冲突",
+      "trail": "复盘链路",
+      "trailMeta": "0 个步骤",
+      "factors": "决策摘要",
+      "factorsMeta": "0 个因子",
+      "factorsCard": "因子卡",
+      "explain": "解释 / 快照",
+      "explainMeta": "0 行",
+      "explainLabel": "说明",
+      "records": "补充记录",
+      "enrichment": "富化信息",
+      "enrichmentMeta": "信号 / 题材",
+      "snapshot": "快照",
+      "fullTitle": "完整复盘详情",
+      "page": "详情页",
+      "timeline": "时间轴",
+      "decisionChain": "决策链",
+      "actionLog": "动作记录",
+      "action": "动作",
+      "journal": "交易日记",
+      "runtime": {
+        "metaValue": "{{label}} · 时间轴 {{timelineCount}} / 决策链 {{chainCount}}",
+        "empty": {
+          "meta": "等待候选详情...",
+          "title": "暂无候选详情",
+          "detail": "当前没有可展示的候选深水区内容。",
+          "noDetail": "没有额外详情",
+          "noRecord": "暂无记录"
+        },
+        "loading": {
+          "metaValue": "{{candidateId}} · 正在加载详情",
+          "body": "正在读取单候选复盘链路、动作和日记。",
+          "title": "正在加载候选详情",
+          "detail": "正在读取候选、回放和解释链路。",
+          "overview": "正在加载总览",
+          "timeline": "正在加载时间轴",
+          "chain": "正在加载决策链",
+          "actions": "正在加载动作",
+          "journal": "正在加载日记"
+        },
+        "unavailable": {
+          "metaValue": "{{candidateId}} · 详情不可用",
+          "body": "候选详情暂不可用",
+          "title": "候选详情不可用",
+          "detail": "当前接口暂不可用，请稍后再试。",
+          "noDetail": "详情不可用",
+          "noRecord": "暂无可用记录"
+        },
+        "overview": {
+          "title": "候选总览",
+          "detail": "候选：{{label}} · {{value}}",
+          "summary": "总览：{{count}} 项",
+          "value": "候选 {{label}}",
+          "gateTitle": "执行门禁",
+          "gateDetail": "当前可以进入执行层",
+          "scoreSuffix": "总分 {{score}}",
+          "traceTitle": "链路追踪",
+          "traceOpened": "已开启 {{time}}",
+          "traceOpenedMissing": "未记录追踪开启时间",
+          "statusTitle": "链路状态",
+          "statusDetail": "订单 {{orders}} · 动作 {{actions}}",
+          "chainTitle": "决策链",
+          "chainValue": "{{count}} 个步骤",
+          "chainDetail": "轮次 {{cycles}} · 链路 {{trace}}",
+          "traceFound": "已找到",
+          "traceMissing": "未找到",
+          "latestTitle": "最近事件",
+          "latestDetail": "日记 {{journalCount}} · {{action}}"
+        },
+        "timeline": {
+          "title": "候选时间轴",
+          "detail": "最近 {{count}} 条 · 更新 {{age}}",
+          "empty": "暂无时间轴记录",
+          "noRecord": "暂无时间轴记录",
+          "noDetail": "无额外事件细节"
+        },
+        "chain": {
+          "title": "候选决策链",
+          "detail": "链路：{{label}}",
+          "summary": "决策链：{{count}} 步",
+          "empty": "暂无决策链",
+          "noDetail": "无额外决策细节"
+        },
+        "actions": {
+          "title": "候选动作",
+          "detail": "动作：{{label}} · 值 {{value}}",
+          "summary": "动作：{{count}} 条",
+          "empty": "暂无动作记录",
+          "noNote": "无备注"
+        },
+        "journal": {
+          "title": "候选日记",
+          "detail": "日记：{{label}}",
+          "summary": "日记：{{count}} 条",
+          "empty": "暂无日记",
+          "noNote": "无备注"
+        }
+      }
+    },
+    "focus": {
+      "unavailable": {
+        "meta": "候选详情不可用",
+        "title": "无法加载候选详情",
+        "status": "接口暂不可用"
+      },
+      "replay": {
+        "meta": "最近信号回放",
+        "badge": "最近信号",
+        "title": "当前没有活动候选，展示最近几轮信号回放",
+        "summary": "最近 {{cycles}} 轮共产生 {{signals}} 个信号，但当前活动候选为 0。",
+      "noPrimaryReason": "近期没有明确的忽略原因",
+        "emptyQueue": "当前队列为空",
+        "emptyBreakdown": "活动候选为空",
+        "emptyConflict": "当前无活动冲突",
+        "modeTitle": "最近信号模式",
+        "auditOnly": "最近信号仅供审查，不可直接操作",
+        "statusEmpty": "当前无候选",
+        "noRecentSignals": "暂无最近信号",
+        "metaSignals": "{{count}} 个信号",
+        "snapshotValue": "信号 {{signals}} / 活跃 0",
+        "timeSourceBreakdown": "M{{metadata}} / L{{legacy}} / U{{unknown}}",
+        "primaryReasonCount": "{{reason}} × {{count}}",
+        "walletTier": "钱包 {{tier}}",
+        "values": {
+          "cycles": "{{count}} 轮",
+          "signals": "{{count}} 个",
+          "precheckSkipped": "{{count}} 个",
+          "replaySignals": "{{count}} 条回放"
+        },
+        "list": {
+          "cycles": "最近轮次",
+          "signals": "最近信号",
+          "precheckSkipped": "预检跳过",
+          "timeSource": "时间来源",
+          "primaryReason": "主原因"
+        }
+      },
+      "runtime": {
+        "metaValue": "{{label}} · {{trigger}} · {{id}}",
+        "head": {
+          "gatePassed": "门禁通过",
+          "hasConflict": "已有冲突",
+          "noConflict": "无冲突"
+        },
+        "list": {
+          "oneLine": "一句话",
+          "executionGate": "执行门禁",
+          "sourceWallet": "来源钱包"
+        },
+      "values": {
+        "passed": "通过",
+        "observedNotional": "{{notional}} · {{shares}} 份",
+        "sourcePrice": "{{price}} · 当前买 {{bid}} / 卖 {{ask}} / 中 {{mid}}",
+        "orderbookCost": "点差 {{spread}} · 追价 {{chase}}",
+        "momentum": "5m {{momentum5m}} · 30m {{momentum30m}}",
+        "existingPositionConflict": "冲突 {{notional}}",
+        "suggestedAction": "{{action}} · {{confidence}} 置信度",
+        "expiryFreshness": "{{expiry}} · {{freshness}}",
+        "longLived": "长期有效",
+        "unlabeled": "未标记",
+        "existingPosition": "已有仓位",
+        "clear": "无冲突"
+      },
+        "metrics": {
+          "score": "候选评分",
+          "walletScore": "钱包评分",
+          "walletTier": "钱包分组",
+          "sourceWalletCount": "来源钱包数"
+        },
+      "metaCount": {
+        "factors": "{{count}} 个因子",
+        "conflicts": "{{count}} 个冲突",
+        "steps": "{{count}} 个步骤",
+        "lines": "{{count}} 行",
+        "items": "{{count}} 项",
+        "keys": "{{count}} 个键"
+      },
+        "emptyTrail": "暂无链路",
+        "emptyExplain": "暂无解释",
+        "emptyRecords": "暂无额外记录",
+        "snapshot": {
+          "recommendationReason": "推荐理由",
+          "marketTag": "市场标签",
+          "resolutionBucket": "解析桶",
+          "conflict": "冲突",
+        "signal": "信号快照",
+        "topic": "题材快照",
+          "note": "备注",
+          "selectedAction": "已选动作={{action}}"
+        }
+      },
+      "list": {
+        "conditionToken": "条件 / Token",
+        "observedNotional": "观察金额",
+        "sourcePrice": "来源均价",
+        "orderbookCost": "盘口成本",
+        "momentum": "动量",
+        "existingPosition": "已有仓位",
+        "suggestedAction": "建议动作",
+        "expiryFreshness": "过期 / 新鲜度"
+      },
+    "strip": {
+      "decision": {
+        "label": "决策主张",
+        "detailFallback": "当前候选摘要"
+      },
+      "score": {
+        "detailFallback": "评分拆解"
+      },
+      "momentum": {
+        "detailFallback": "动量"
+      },
+      "orderbook": {
+        "detailFallback": "点差 / 追价"
+      },
+      "risk": {
+        "label": "风险",
+        "detailFallback": "无冲突"
+      }
+    }
+    },
+    "shared": {
+      "walletCount": "{{count}} 个钱包",
+      "walletTierDefault": "观察"
+    },
+    "gate": {
+      "passed": {
+        "label": "已通过门禁",
+        "detail": "当前可以进入执行层"
+      },
+      "blocked": {
+        "label": "当前不可执行"
+      },
+      "blockedHighScore": {
+        "label": "高分但被门禁拦住",
+        "detail": "综合分 {{score}} · {{reason}}"
+      }
+    },
+    "orderbook": {
+      "summary": "买 {{bid}} · 卖 {{ask}} · 中 {{mid}}"
+    },
+    "explain": {
+      "title": {
+        "ignore": "为什么忽略",
+        "watch": "为什么先观察",
+        "recommend": "为什么推荐",
+        "blockedHighScore": "高分但被门禁拦住",
+        "blocked": "当前不可执行"
+      },
+      "labels": {
+        "actionSuggested": "建议处理",
+        "currentAction": "当前动作",
+        "scoreBreakdown": "评分拆解",
+        "skipOrRisk": "忽略 / 风控",
+        "momentumOrderbook": "动量 / 盘口",
+        "resonanceSignal": "共振信号",
+        "riskConflict": "风险冲突",
+        "walletProfile": "钱包画像",
+        "generic": "说明"
+      },
+      "values": {
+        "scoreBreakdown": "总分 {{score}} · 钱包 {{walletScore}} · 置信 {{confidence}} · {{walletCount}}",
+        "spread": "点差 {{spread}}",
+        "chase": "追价 {{chase}}",
+        "chaseShort": "追价 {{chase}}",
+        "resonanceWallets": "{{count}} 个钱包同向",
+        "multiWalletResonance": "多钱包共振"
+      },
+      "conflict": {
+        "existingPosition": "已有仓位",
+        "duplicate": "同轮重复",
+        "nettingLimited": "同条件暴露受限",
+        "budgetLimited": "预算受限",
+        "cooldownRemaining": "冷却剩余 {{age}}"
+      },
+      "fallback": "当前候选没有额外的拦截或共振说明，优先看建议动作与钱包评分。"
+    },
+    "trail": {
+      "discovery": {
+        "label": "发现",
+        "triggerTypeDefault": "钱包事件",
+        "value": "{{wallet}} · {{triggerType}}",
+        "detail": "{{walletCount}} 触发 · {{walletTier}}"
+      },
+      "enrichment": {
+        "label": "富化",
+        "marketDefault": "市场上下文",
+        "bucketDefault": "未分桶",
+        "noCondition": "无条件",
+        "value": "{{marketTag}} · {{bucket}}",
+        "detail": "{{market}} · {{condition}}"
+      },
+      "score": {
+        "label": "评分",
+        "value": "总分 {{score}} · 钱包 {{walletScore}} · 置信 {{confidence}}",
+        "detail": "{{sourcePrice}} · {{action}}",
+        "sourcePrice": "来源均价 {{price}}",
+        "noSourcePrice": "无来源均价"
+      },
+      "orderbook": {
+        "label": "盘口",
+        "detail": "点差 {{spread}} · 追价 {{chase}}"
+      },
+      "decision": {
+        "label": "决策",
+        "waitingReason": "等待解释"
+      },
+      "review": {
+        "label": "复盘",
+        "waiting": "等待中",
+        "detail": "{{status}}{{noteSuffix}}"
+      },
+      "lifecycle": {
+        "label": "生命周期",
+        "value": "{{status}} · {{age}}",
+        "detail": "{{created}}{{updatedSuffix}}{{signalSuffix}}",
+        "createdAt": "创建 {{time}}",
+        "createdUnknown": "创建时间未知",
+        "updatedAt": "更新 {{time}}",
+        "signalAt": "信号 {{time}}"
+      }
+    },
+    "card": {
+      "priority": {
+        "score": "综合分",
+        "size": "规模",
+        "scoreValue": "总分 {{score}}",
+        "walletValue": "钱包 {{walletScore}}",
+        "sizeShares": "{{shares}} 份"
+      },
+      "reasonFallback": "{{action}} · {{walletCount}} 触发",
+      "summary": {
+        "full": "{{prefix}}：{{reason}}{{tail}}",
+        "prefix": {
+          "ignore": "不看",
+          "watch": "先看",
+          "recommend": "看",
+          "blockedHighScore": "高分但被门禁拦住",
+          "blocked": "当前不可执行"
+        }
+      },
+      "metric": {
+        "score": "总分 {{score}}",
+        "wallet": "钱包 {{walletScore}}",
+        "confidence": "置信 {{confidence}}"
+      },
+      "gateChip": "门禁 · {{reason}}",
+      "actionStatus": "状态 {{status}}",
+      "noAction": "暂无可执行动作",
+      "hover": {
+        "gatePassed": "门禁通过",
+        "scoreLine": "总分 {{score}} · 钱包 {{walletScore}} · 置信 {{confidence}}",
+        "orderbookLine": "买 {{bid}} · 卖 {{ask}} · 中 {{mid}} · 点差 {{spread}} · 追价 {{chase}}",
+        "labelValue": "{{label}}：{{value}}"
+      }
+    },
+    "factor": {
+      "pill": {
+        "positive": "偏正",
+        "negative": "偏负",
+        "warn": "注意",
+        "neutral": "中性"
+      },
+      "card": {
+        "defaultLabel": "因子",
+        "weight": "权重 {{weight}}",
+        "empty": "暂无可展示的因子"
+      },
+      "breakdown": {
+        "gate": {
+          "label": "执行门禁"
+        },
+        "score": {
+          "label": "综合评分"
+        },
+        "walletScore": {
+          "label": "钱包评分",
+          "detailFallback": "钱包质量"
+        },
+        "confidence": {
+          "label": "置信度",
+          "detailFallback": "决策置信度"
+        },
+        "resonanceWallets": {
+          "label": "共振钱包",
+          "multi": "多钱包确认",
+          "single": "单钱包触发"
+        },
+        "momentum": {
+          "label": "动量",
+          "pullback": "30m 回撤",
+          "tailwind": "顺风动量"
+        },
+        "orderbook": {
+          "label": "盘口成本",
+          "detail": "买 {{bid}} · 卖 {{ask}} · 中 {{mid}}"
+        },
+        "triggerType": {
+          "label": "触发类型",
+          "detailFallback": "市场上下文"
+        }
+      },
+      "conflict": {
+        "existingPosition": {
+          "label": "已有仓位",
+          "valueFallback": "仓位冲突",
+          "detail": "同 token / 同条件已有暴露"
+        },
+        "duplicate": {
+          "label": "重复信号",
+          "value": "同轮已去重",
+          "detail": "避免同一候选重复执行"
+        },
+        "netting": {
+          "label": "净额上限",
+          "value": "净额受限",
+          "detail": "同条件暴露已接近上限"
+        },
+        "budget": {
+          "label": "预算受限",
+          "value": "预算受限",
+          "detail": "当前可用名义金额不足"
+        },
+        "cooldown": {
+          "label": "冷却中",
+          "detail": "加仓 / 跟随冷却仍未结束"
+        },
+        "riskReason": {
+          "label": "风控原因",
+          "detailFallback": "风控门禁"
+        },
+        "skipReason": {
+          "label": "忽略原因",
+          "detail": "忽略 / 门禁 / 冷却"
+        },
+        "none": {
+          "label": "风险冲突",
+          "value": "无",
+          "detail": "没有显著的已有仓位 / 重复 / 冷却 / 预算冲突"
+        }
+      }
+    },
+    "summary": {
+      "card": {
+        "title": "决策摘要",
+        "empty": "暂无可展示的摘要因子"
+      }
+    },
+    "modeSwitch": {
+      "pending": "正在切换到 {{mode}} 模式...",
+      "success": "已切换到 {{mode}} 模式",
+      "fail": "切换到 {{mode}} 模式失败"
+    },
+    "panel": {
+      "title": "待决策机会队列",
+      "meta": "{{mode}} · {{count}} 个候选 · {{visible}} 个可见 · {{sort}}{{updatedAt}}",
+      "statusError": "机会队列接口异常：{{details}}",
+      "statusReady": "当前为 {{mode}} 模式，优先处理建议动作和解释区。",
+      "statusEmpty": "当前没有新机会，继续观察下方操作、监控和对账面板。",
+      "metaVisible": "{{visible}}/{{total}} 可见 · {{focusView}}",
+      "summary": {
+        "pending": "待处理 {{count}}",
+        "approved": "已批准 {{count}}",
+        "watched": "观察中 {{count}}",
+        "executed": "已执行 {{count}}",
+        "visible": "可见 {{visible}}/{{total}}",
+        "metadata": "元数据 {{hits}}/{{total}}",
+        "timeSource": "时间源 M{{metadata}} / L{{legacy}} / U{{unknown}}",
+        "recentSignals": "近 {{cycles}} 轮 {{signals}} 个信号",
+        "recentTopSkip": "{{reason}} · 近轮 {{count}}"
+      },
+      "searchLabel": "快速搜索",
+      "searchPlaceholder": "搜索钱包 / 市场 / 题材 / 因子 / 备注",
+      "sortLabel": "排序",
+      "toggleFiltersExpand": "展开筛选",
+      "toggleFiltersCollapse": "收起筛选",
+      "clearFilters": "清除筛选",
+      "queueTitle": "机会卡片",
+      "queueNote": "只保留关键字段，次要指标都收进 hover 和右侧详情。",
+      "emptyTitle": {
+        "noMatch": "没有匹配的候选",
+        "noOpportunity": "当前没有新机会"
+      },
+      "emptyBody": {
+        "noMatch": "换个关键词、状态或排序再看一次。",
+        "noOpportunity": "没有候选信号时，页面会继续保留现有的执行/对账/监控面板。"
+      },
+      "apiUnavailableTitle": "候选接口暂时不可用",
+      "apiUnavailableBody": "无法加载 /api/candidates",
+      "replay": {
+        "status": {
+          "filled": "已成交",
+          "precheckSkipped": "预检跳过",
+          "rejected": "已拒绝",
+          "recentSignal": "最近信号"
+        },
+        "reason": {
+          "skip": "最近信号 · {{reason}}",
+          "action": "最近信号 · {{action}}",
+          "default": "最近一轮触发，但未进入活动候选队列"
+        },
+        "gate": "最近信号回放 · 当前未进入活动候选队列",
+        "reviewOnly": "仅供回放审查，不可直接操作",
+        "strip": {
+          "walletScore": "钱包评分",
+          "walletTier": "钱包分组",
+          "source": "来源",
+          "cycleTime": "时间"
+        },
+        "source": {
+          "metadata": "元数据"
+        }
+      }
+    },
+    "sort": {
+      "score_desc": "综合评分",
+      "freshness_desc": "新鲜度",
+      "confidence_desc": "置信度",
+      "wallet_score_desc": "钱包分",
+      "observed_notional_desc": "观察金额"
+    },
+    "filter": {
+      "status": "状态",
+      "action": "动作",
+      "side": "侧别",
+      "all": "全部"
+    },
+    "status": {
+      "loading": "正在加载候选...",
+      "pending": "待处理",
+      "approved": "已批准",
+      "queued": "已排队",
+      "watched": "观察中",
+      "executed": "已执行",
+      "submitted": "已发单",
+      "rejected": "已拒绝",
+      "risk_rejected": "风控拒绝",
+      "ignored": "已忽略",
+      "expired": "已过期"
+    },
+    "action": {
+      "ignore": "忽略",
+      "watch": "观察",
+      "buy_small": "小仓跟随",
+      "buy_normal": "正常跟随",
+      "follow": "直接跟随",
+      "follow_sell": "立即跟随退出",
+      "close_partial": "减仓",
+      "close_all": "清仓"
+    },
+    "side": {
+      "buy": "买入",
+      "sell": "卖出"
+    },
+    "request": {
+      "pending": "{{action}} 提交中...",
+      "success": "{{action}} 已提交",
+      "fail": "{{action}} 提交失败"
+    }
+  },
+  "blockbeats": {
+    "meta": "预测 {{predictionCount}} · 重要 {{importantCount}}",
+    "summary": {
+      "overallStatus": "总状态",
+      "status": "总状态",
+      "updatedAt": "更新时间",
+      "predictionSource": "预测源",
+      "importantSource": "重要源",
+      "errors": "异常"
+    },
+    "status": {
+      "line": "状态 {{status}} · {{updatedAt}}{{issues}}",
+      "issuesSuffix": " · {{count}} 个问题",
+      "apiUnavailable": "/api/blockbeats 暂不可用"
+    },
+    "panel": {
+      "title": "市场催化 / 新闻上下文",
+      "meta": "预测 {{predictionCount}} · 重要 {{importantCount}}",
+      "status": "状态 {{status}} · {{updatedAt}}{{issues}}",
+      "statusIssues": " · {{count}} 个问题",
+      "waiting": "等待 BlockBeats 新闻催化数据..."
+    },
+    "feed": {
+      "empty": "{{label}} 暂无数据",
+      "untitled": "未命名快讯",
+      "prediction": {
+        "title": "预测市场快讯",
+        "subtitle": "事件驱动",
+        "empty": "预测新闻暂无数据"
+      },
+      "important": {
+        "title": "重要快讯",
+        "subtitle": "更广泛的加密上下文",
+        "empty": "重点新闻暂无数据"
+      },
+      "noItems": "当前没有可展示的新闻项"
+    },
+    "message": {
+      "proPredictionFallback": "BlockBeats 预测源不可用，已切换到公开快讯回退。",
+      "apiKeyMissingFallback": "未配置 BlockBeats API 密钥，已切换到公开快讯回退。",
+      "importantRequiresApiKey": "重点新闻源需要 BlockBeats API 密钥",
+      "apiKeyMissing": "未配置 BlockBeats API 密钥",
+      "feedUnavailable": "{{feed}} 不可用：{{reason}}",
+      "dashboardUnavailable": "仪表盘数据不可用：{{reason}}"
+    }
+  },
+  "notifier": {
+    "defaultTitle": "Polymarket",
+    "empty": {
+      "title": "通知"
+    },
+    "panel": {
+      "title": "通知与告警",
+      "meta": "最近 {{count}} 条",
+      "statusConfigured": "{{channels}} · {{updatedAt}}",
+      "statusNone": "未配置通知后端",
+      "waiting": "等待通知数据..."
+    },
+    "summary": {
+      "local": "本地通知",
+      "webhook": "网页回调",
+      "telegram": "电报",
+      "deliveryStats": "投递统计",
+      "updatedAt": "更新时间",
+      "available": "可用",
+      "unavailable": "不可用",
+      "configured": "已配置",
+      "notConfigured": "未配置",
+      "targets": "已配置 · {{count}} 个目标",
+      "okEvents": "{{ok}} / {{total}} 正常",
+      "deliveryOk": "{{ok}} / {{total}} 正常"
+    },
+    "list": {
+      "recentEvents": "最近通知事件",
+      "detail": "通知详情",
+      "channelScope": "local / webhook",
+      "recentCount": "最近 5 条",
+      "recentNone": "暂无事件",
+      "noBody": "无正文",
+      "deliveries": "投递 {{count}} 次"
+    },
+    "channel": {
+      "telegramMeta": "{{chat}} · {{mode}}"
+    },
+    "parseMode": {
+      "plain": "纯文本",
+      "html": "HTML 格式",
+      "markdown": "Markdown 格式"
+    },
+    "event": {
+      "ok": "正常",
+      "fail": "失败"
+    },
+    "delivery": {
+      "localDisabled": "本地通知已停用",
+      "localBackendUnavailable": "没有可用的本地通知后端",
+      "webhookNotConfigured": "未配置 Webhook",
+      "telegramNotConfigured": "未配置 Telegram",
+      "deliveryFailed": "投递失败：{{reason}}"
+    },
+    "phrase": {
+      "reconciliationProtect": "对账保护",
+      "startupGateBlocked": "启动门禁阻断",
+      "isBlockingNewBuy": "正在阻止新的 BUY",
+      "noBody": "无正文",
+      "chatUnavailable": "聊天目标不可用"
+    }
+  },
+  "decision": {
+    "apiUnavailableCandidates": "候选接口",
+    "apiUnavailableMode": "模式接口",
+    "apiError": "机会队列接口异常：{{parts}}",
+    "updatedAtSuffix": " · {{updatedAt}}",
+    "meta": "{{mode}} · {{count}} 个候选{{updatedAt}}",
+    "gridMeta": "{{visible}}/{{total}} 可见 · {{focusView}}",
+    "hasOpportunities": "{{mode}} 模式下有可处理机会",
+    "noOpportunities": "当前没有可处理机会"
+  },
+  "walletProfiles": {
+    "panel": {
+      "title": "核心钱包池"
+    },
+    "meta": "{{count}} 个钱包 · 已启用 {{enabled}}",
+    "status": {
+      "error": "钱包池接口异常：{{error}}",
+      "ready": "支持直接修改标签、备注和启用状态，保存后会写回钱包画像库。",
+      "apiError": "钱包池接口异常：{{reason}}",
+      "loading": "正在加载钱包池..."
+    },
+    "empty": {
+      "apiUnavailable": "钱包画像接口暂不可用",
+      "none": "暂无钱包画像"
+    },
+    "fallback": {
+      "apiUnavailable": "钱包画像接口暂不可用",
+      "empty": "暂无钱包画像"
+    },
+    "category": {
+      "unknown": "未分组"
+    },
+    "enabled": {
+      "on": "启用",
+      "off": "停用"
+    },
+    "inputs": {
+      "tag": "标签",
+      "notes": "备注",
+      "save": "保存"
+    },
+    "field": {
+      "followability": "跟随 {{score}}",
+      "tagPlaceholder": "输入标签",
+      "notesPlaceholder": "输入备注",
+      "unclassified": "未分组"
+    },
+    "table": {
+      "wallet": "钱包",
+      "enabled": "启用",
+      "tag": "标签",
+      "followability": "信任 / 跟随",
+      "notes": "备注",
+      "actions": "操作",
+      "market": "市场",
+      "side": "方向",
+      "result": "结果",
+      "roi": "收益率",
+      "pnl": "盈亏"
+    },
+    "detail": {
+      "title": "聪明钱包画像",
+      "selectHint": "点击钱包行查看详情",
+      "summary": "这里会展示单个钱包的评分逻辑、历史样本和真实表现。",
+      "status": "状态",
+      "scoreBreakdown": "评分拆解",
+      "topicProfile": "题材偏好画像",
+      "topicCount": "0 个题材",
+      "topicCard": "题材偏好",
+      "recentSamples": "最近已结算样本",
+      "sampleCount": "0 个样本"
+    },
+    "rowState": {
+      "dirty": "有未保存改动",
+      "noChange": "无改动",
+      "error": "保存失败",
+      "saved": "已保存",
+      "saving": "保存中...",
+      "synced": "已同步"
+    }
+  },
+  "journal": {
+    "meta": "最近 {{count}} 条",
+    "status": {
+      "apiError": "交易日记接口异常：{{reason}}",
+      "loading": "等待日记数据...",
+      "ready": "最近 {{count}} 条记录，支持快速写一句理由。"
+    },
+    "note": {
+      "help": "支持快速写一句理由",
+      "missing": "无备注"
+    },
+    "panel": {
+      "title": "交易日记",
+      "meta": "最近 {{count}} 条",
+      "statusError": "交易日记接口异常：{{error}}",
+      "statusReady": "最近 {{count}} 条记录，支持快速写一句理由。",
+      "waiting": "等待日记数据..."
+    },
+    "composer": {
+      "placeholder": "快速写一句理由，例如：盘口过宽，先观察不追价",
+      "save": "写入日记",
+      "ready": "支持快速写一句理由",
+      "empty": "请输入一句理由后再提交",
+      "saving": "日记提交中...",
+      "saved": "已写入交易日记",
+      "saveFailed": "写入日记失败"
+    },
+    "card": {
+      "title": "交易日记",
+      "apiUnavailable": "接口暂不可用",
+      "emptyTitle": "还没有动作记录",
+      "emptyBody": "可以直接在上方写一句观察理由，后端会写入 /api/journal/note。",
+      "noNote": "无备注"
+    },
+    "empty": {
+      "apiUnavailableReason": "无法加载 /api/journal",
+      "apiUnavailableTitle": "交易日记接口暂不可用",
+      "apiUnavailableBody": "当前无法读取交易日记数据，请稍后再试。",
+      "noneTitle": "还没有日记记录",
+      "noneBody": "当前还没有可展示的日记内容。",
+      "noneHelp": "可以直接在上方写一句观察理由。"
+    }
+  },
+  "control": {
+    "pauseOpening": "暂停开仓",
+    "resumeOpening": "恢复开仓",
+    "reduceOnly": "只减仓模式",
+    "clearReduceOnly": "取消只减仓",
+    "emergencyStop": "紧急退出",
+    "clearEmergencyStop": "解除紧急退出"
+  },
+  "alerts": {
+    "emptyTag": "正常",
+    "emptyMessage": "暂无异常告警",
+    "panel": {
+      "title": "通知与告警",
+      "subtitle": "最近 5 条"
+    }
+  },
+  "archive": {
+    "meta": "状态 {{stateAge}} · 30m {{monitor30Age}} · 12h {{monitor12Age}} · EOD {{eodAge}}",
+    "panel": {
+      "title": "归档与导出",
+      "meta": "状态概览"
+    },
+    "journalTagsEmpty": "暂无日记标签",
+    "tags": {
+      "defaultLabel": "标签"
+    },
+    "summary": {
+      "candidates": "候选",
+      "pending": "待处理",
+      "journal": "日记",
+      "notifications": "通知",
+      "positions": "持仓",
+      "slots": "槽位",
+      "wallets": "钱包"
+    },
+    "action": {
+      "title": "导出归档",
+      "detail": "将当前状态、监控、候选和日记打包导出。",
+      "tag": "导出",
+      "stateBundleTitle": "导出状态包 JSON",
+      "stateBundleDetail": "状态 / 监控 / 对账 / 候选 / 日记 / 通知",
+      "candidatesCsvTitle": "导出候选 CSV",
+      "candidatesCsvDetail": "用于离线筛选和复盘候选机会",
+      "journalJsonTitle": "导出日记 JSON",
+      "journalJsonDetail": "包含最近笔记、标签和动作摘要",
+      "monitorBundleTitle": "导出监控包 JSON",
+      "monitorBundleDetail": "包含 30m / 12h / EOD 对账结果"
+    },
+    "export": {
+      "title": "导出归档",
+      "detail": "将当前状态、监控、候选和日记打包导出。",
+      "tag": "导出",
+      "stateBundle": {
+        "title": "导出状态包 JSON",
+        "detail": "状态 / 监控 / 对账 / 候选 / 日记 / 通知"
+      },
+      "candidatesCsv": {
+        "title": "导出候选 CSV",
+        "detail": "用于离线筛选和复盘候选机会"
+      },
+      "journalJson": {
+        "title": "导出日记 JSON",
+        "detail": "包含最近笔记、标签和动作摘要"
+      },
+      "monitorBundle": {
+        "title": "导出监控包 JSON",
+        "detail": "包含 30m / 12h / EOD 对账结果"
+      }
+    },
+    "cards": {
+      "topJournalTags": "高频日记标签",
+      "recentSnapshots": "最近快照",
+      "recentEod": "最近 EOD",
+      "stats": "统计"
+    },
+    "columns": {
+      "recentNotificationsJournal": "最近通知 / 日记",
+      "candidatesWalletsPool": "候选 / 钱包池"
+    },
+    "stats": {
+      "monitor": "监控",
+      "eod": "EOD 对账",
+      "internalVsLedger": "账本差异",
+      "fills": "成交 {{count}} 笔",
+      "walletPool": "钱包池",
+      "profiles": "{{count}} 个画像",
+      "enabled": "已启用 {{count}} 个",
+      "walletPoolDetail": "{{enabled}} · {{localNotifier}}",
+      "localNotifier": "本地通知 {{status}}",
+      "recentNotifications": "最近通知",
+      "events": "{{count}} 条事件",
+      "channelStatus": "{{channel}} {{status}}",
+      "recentNotificationsDetail": "{{webhook}} · {{telegram}} · {{latest}}",
+      "latest": "最近 {{title}}",
+      "none": "暂无"
+    },
+    "snapshot": {
+      "eod": {
+        "title": "最近 EOD",
+        "meta": "{{time}}{{ageSuffix}} · {{status}}"
+      },
+      "monitor30": {
+        "title": "30m 监控"
+      },
+      "monitor12": {
+        "title": "12h 监控"
+      },
+      "journal": {
+        "title": "日记最近",
+        "empty": "暂无日记"
+      }
+    },
+    "recentNotifications": {
+      "itemTitleFallback": "通知",
+      "emptyTitle": "最近通知",
+      "emptyBody": "暂无事件"
+    }
+  },
+  "budget": {
+    "overview": {
+      "title": "资金概览",
+      "meta": "权益 / 现金 / 已用 / 可用",
+      "accountSyncWaiting": "等待账户同步",
+      "metaValue": "权益 {{equity}}U · 现金 {{cash}}U · 已用 {{tracked}}U / 可用 {{available}}U"
+    }
+  },
+  "kpi": {
+    "executionMode": {
+      "title": "执行模式",
+      "value": "模拟盘",
+      "note": "模拟经纪通道 · 不会发送真实订单"
+    },
+    "equity": {
+      "title": "账户权益",
+      "value": "--",
+      "note": "现金 -- · 仓位 --",
+      "noteValue": "现金 {{cash}} · 仓位 {{positions}}"
+    },
+    "cash": {
+      "title": "现金余额",
+      "value": "--",
+      "note": "可用预算 -- · 等待账户同步",
+      "noteValue": "可用预算 {{available}}U · {{snapshot}}"
+    },
+    "positions": {
+      "title": "仓位 / 槽位",
+      "value": "-- / --",
+      "note": "槽位利用率 --",
+      "noteValue": "槽位利用率 {{utilization}}"
+    },
+    "notional": {
+      "title": "跟单名义金额",
+      "value": "--",
+      "note": "每轮信号 -- · 账本快照 --",
+      "noteValue": "每轮信号 {{signals}} · 账本快照 {{snapshot}}"
+    },
+    "risk": {
+      "title": "风控状态",
+      "value": "常规风控",
+      "note": "拥堵阈值 -- / 拥堵减仓 --",
+      "noteValue": "拥堵阈值 {{threshold}} / 拥堵减仓 {{trim}}",
+      "modeAdaptive": "拥堵自适应",
+      "modeNormal": "常规风控"
+    }
+  },
+  "positions": {
+    "table": {
+      "title": "持仓概览",
+      "subtitle": "当前仓位与退出规则",
+      "market": "市场",
+      "side": "方向",
+      "size": "数量",
+      "notional": "名义金额",
+      "entryPrice": "入场价",
+      "holdTime": "持有时长",
+      "reason": "原因",
+      "exitRule": "退出规则",
+      "empty": "暂无持仓"
+    }
+  },
+  "orders": {
+    "panel": {
+      "title": "订单概览",
+      "subtitle": "最近下单状态"
+    },
+    "status": {
+      "pending": "待成交",
+      "filled": "已成交",
+      "partiallyFilled": "部分成交",
+      "canceled": "已取消",
+      "rejected": "已拒绝",
+      "failed": "失败",
+      "cleared": "已清理",
+      "pendingCount": "待成交 {{count}}",
+      "filledCount": "已成交 {{count}}",
+      "canceledCount": "已取消 {{count}}",
+      "rejectedCount": "已拒绝 {{count}}"
+    },
+    "table": {
+      "time": "时间",
+      "market": "市场",
+      "action": "动作",
+      "status": "状态",
+      "reason": "原因",
+      "empty": "暂无订单"
+    }
+  },
+  "wallets": {
+    "monitor": {
+      "title": "钱包监控",
+      "subtitle": "核心钱包池、样本和表现",
+      "row": {
+        "detail": "{{positions}} 个仓位 · {{markets}} 个市场 · {{notional}}U"
+      },
+      "empty": "暂无钱包数据",
+      "table": {
+        "wallet": "钱包",
+        "score": "评分",
+        "samples": "样本",
+        "roi": "回报率",
+        "winRate": "胜率",
+        "parsed": "解析命中",
+        "concentration": "集中度"
+      }
+    }
+  },
+  "strategy": {
+    "params": {
+      "title": "策略参数",
+      "walletPool": "钱包池规模",
+      "minIncrease": "最小加仓金额",
+      "maxSignals": "每轮最大信号数",
+      "minWalletScore": "最低钱包分",
+      "scoreMultipliers": "钱包分倍率",
+      "historyWindow": "历史窗口",
+      "topicBias": "题材偏置",
+      "discoveryBias": "发现偏置",
+      "walletExit": "钱包退出",
+      "riskTrade": "单笔风险",
+      "riskDay": "日损上限",
+      "priceBand": "价格区间",
+      "addCooldown": "加仓冷却",
+      "value": {
+        "walletPool": "钱包池={{count}}",
+        "minIncrease": "{{amount}} USD",
+        "scoreMultipliers": "W {{watch}} / T {{trade}} / C {{core}}",
+        "historyWindow": "{{window}} / min {{minClosed}} / strong {{strongClosed}}c {{strongResolved}}r",
+        "disabled": "关闭",
+        "topicBias": "min {{minSamples}} / +{{boost}} / -{{penalty}}",
+        "discoveryBias": "top {{topN}} / hist +{{historyBonus}} / topic +{{topicBonus}}",
+        "walletExitSingle": "单仓 / 最少 {{amount}} USD",
+        "walletExitResonance": "单仓 {{amount}} / 共振 {{wallets}} 钱包 / {{trim}} -> {{coreExit}}",
+        "addCooldown": "{{seconds}}s"
+      }
+    }
+  },
+  "sources": {
+    "availability": {
+      "title": "来源可用性",
+      "subtitle": "来源钱包、评分和历史状态",
+      "empty": "暂无来源数据",
+      "sourceDetail": "{{positions}} 个仓位 · {{markets}} 个市场",
+      "historyValue": "胜率 {{winRate}} / 收益率 {{roi}}",
+      "historyResolved": "{{history}} · 已解析 {{resolved}}",
+      "historyEmpty": "暂无结算历史",
+      "discoveryPool": "池 #{{rank}} · {{score}}",
+      "discoveryEmpty": "池 --",
+      "updatedDetail": "历史 {{historyAge}} · {{discovery}}",
+      "table": {
+        "source": "来源",
+        "score": "评分",
+        "weight": "权重",
+        "history": "历史",
+        "updated": "更新时间"
+      }
+    }
+  },
+  "runtime": {
+    "panel": {
+      "title": "运行概况",
+      "meta": "等待状态"
+    },
+    "health": {
+      "stateAge": "状态年龄",
+      "broker": "执行代理",
+      "walletPool": "钱包池规模",
+      "discovery": "发现模式",
+      "control": "控制状态"
+    }
+  },
+  "risk": {
+    "panel": {
+      "title": "风险监控",
+      "subtitle": "回撤 / 暴露"
+    },
+    "meters": {
+      "drawdown": "已实现损失使用",
+      "drawdownText": "0.0% / 日损上限",
+      "drawdownValue": "{{used}} / 日损上限 {{limit}}",
+      "exposure": "槽位利用率",
+      "exposureText": "0 / 0",
+      "exposureValue": "{{open}} / {{max}}",
+      "cooldown": "加仓冷却命中",
+      "cooldownText": "0 / 0",
+      "cooldownValue": "{{skips}} / {{orders}}",
+      "staleness": "状态时效",
+      "stalenessText": "0s / 0s",
+      "stalenessValue": "{{stateAge}}s / {{poll}}s"
+    }
+  },
+  "diagnostics": {
+    "panel": {
+      "title": "诊断与告警",
+      "meta": "系统诊断",
+      "metaValue": "启动 {{startupAge}} · 30m {{monitor30Age}} · 12h {{monitor12Age}} · EOD {{eodAge}}"
+    },
+    "columns": {
+      "startupChecks": "启动自检",
+      "reconciliationFacts": "对账事实",
+      "issuesAndAdvice": "问题与建议"
+    },
+    "startup": {
+      "defaultName": "启动自检",
+      "messageFallback": "暂无说明",
+      "empty": "暂无启动检查",
+      "names": {
+        "networkSmoke": "网络探测",
+        "apiCredentials": "API 凭证",
+        "funderAddress": "资助地址",
+        "signatureType": "签名类型",
+        "marketPreflight": "市场预检",
+        "orderStatusSupport": "订单状态能力",
+        "heartbeatSupport": "心跳能力",
+        "userStream": "用户流",
+        "clobHost": "CLOB 主机"
+      }
+    },
+    "facts": {
+      "internalLedgerLabel": "内部 / 账本",
+      "internalLedgerSub": "券商底账差额 {{brokerGap}}",
+      "pendingStaleLabel": "待处理 / 陈旧",
+      "pendingStaleSub": "入场 {{entry}} · 退出 {{exit}}",
+      "snapshotAgeLabel": "快照年龄",
+      "snapshotAgeSub": "对账 {{reconcileAge}} · 事件 {{eventAge}}",
+      "fillsTodayLabel": "今日成交",
+      "fillsTodaySub": "名义金额 {{notional}} · 账户同步 {{syncCount}}",
+      "startupChecksTodayLabel": "今日启动检查",
+      "startupChecksTodaySub": "最近成交 {{lastFill}}",
+      "openTrackedLabel": "开放仓位 / 跟踪名义",
+      "openTrackedSub": "状态 {{status}}",
+      "operatorCleanupLabel": "人工清理",
+      "operatorCleanupSub": "{{processed}} · 请求 {{requested}}{{remainingSuffix}}",
+      "operatorCleanupProcessed": "已处理 {{time}}",
+      "operatorCleanupQueued": "请求已排队",
+      "operatorCleanupRemaining": " · 剩余 {{count}}",
+      "operatorCleanupWaiting": "尚未请求清理陈旧待处理单"
+    },
+    "issues": {
+      "stateReconciliationTitle": "状态对账",
+      "monitor30Title": "30m 监控",
+      "monitor12Title": "12h 监控",
+      "eodIssueTitle": "EOD 问题",
+      "eodRecommendationTitle": "EOD 建议",
+      "operatorActionTitle": "人工动作",
+      "operatorRequestedDetail": "清理陈旧待处理单请求已发出，等待下一轮运行周期处理。",
+      "currentDiagnosisTitle": "当前诊断",
+      "currentDiagnosisDetail": "当前启动、自检、监控和对账没有突出异常，继续观察下一轮报告。"
+    },
+    "pending": {
+      "title": "待处理订单",
+      "meta": "0 单",
+      "metaValue": "{{orders}} 单",
+      "metaValueWithStale": "{{orders}} 单 · 陈旧 {{stale}}",
+      "flowExit": "退出",
+      "flowEntry": "入场",
+      "empty": "当前没有活跃的待处理或陈旧订单",
+      "table": {
+        "time": "时间",
+        "market": "市场",
+        "status": "状态",
+        "requestMatched": "请求 / 已匹配",
+        "reason": "原因"
+      }
+    },
+    "focus": {
+      "title": "诊断焦点",
+      "meta": "未选择",
+      "hint": "点击启动检查或待处理订单查看详情",
+      "summary": "这里会展示启动自检或待处理订单的结构化细节，帮助操作员快速判断下一步。",
+      "notSelected": "未选择",
+      "waitingTag": "等待",
+      "waitingHint": "点击启动检查或待处理订单查看详情",
+      "waitingSummary": "这里会展示启动自检或待处理订单的结构化细节，帮助操作员快速判断下一步。",
+      "checkLabel": "检查项",
+      "statusLabel": "状态",
+      "messageLabel": "提示",
+      "startupMeta": "启动 · {{name}}",
+      "startupSummaryEmpty": "当前启动检查没有额外说明",
+      "pendingExitTag": "退出待处理",
+      "pendingEntryTag": "入场待处理",
+      "pendingMeta": "待处理 · {{label}}",
+      "pendingSummaryEmpty": "当前待处理订单没有额外说明",
+      "labels": {
+        "marketDirection": "市场 / 方向",
+        "orderTrace": "订单 / 链路追踪",
+        "requestedNotional": "请求金额",
+        "matchedHint": "已匹配提示",
+        "sourceWallet": "来源钱包",
+        "entryWallet": "入场钱包",
+        "cycleSignal": "轮次 / 信号",
+        "timeHeartbeat": "时间 / 心跳",
+        "topic": "题材",
+        "conditionToken": "条件 / 代币"
+      },
+      "values": {
+        "matchedHintEmpty": "暂无匹配提示",
+        "sourceWalletEmpty": "未标记来源",
+        "entryWalletEmpty": "未标记入场钱包",
+        "timeHeartbeat": "{{time}} · {{age}}{{heartbeatSuffix}}",
+        "heartbeatSuffix": " / 心跳 {{age}}"
+      },
+      "list": {
+        "status": "状态"
+      }
+    },
+    "runtime": {
+      "empty": {
+        "title": "暂无诊断数据",
+        "detail": "当前窗口没有可用的诊断明细。"
+      },
+      "meta": {
+        "title": "诊断元数据",
+        "detail": "最近 {{count}} 项 · 更新 {{age}}"
+      },
+      "detail": {
+        "title": "诊断运行态",
+        "summary": "当前诊断项：{{label}}",
+        "hint": "状态 {{label}} · 值 {{value}}"
+      },
+      "summary": {
+        "title": "诊断概览",
+        "value": "{{count}} 个问题"
+      },
+      "list": {
+        "status": "状态",
+        "label": "{{label}}",
+        "value": "{{label}}：{{value}}"
+      },
+      "table": {
+        "title": "诊断表",
+        "label": "{{label}}"
+      },
+      "rank": {
+        "topWallets": "优先项",
+        "bottomWallets": "次要项"
+      },
+      "value": {
+        "label": "{{label}}",
+        "detail": "{{label}}：{{value}}",
+        "empty": "暂无值"
+      },
+      "operatorAction": {
+        "clearedCount": "已清理 {{count}}"
+      }
+    }
+  },
+  "exitReview": {
+    "panel": {
+      "title": "退出样本回放",
+      "meta": "最近 0 条",
+      "metaValue": "最近 {{count}} 条退出 · {{topics}} 个题材 · {{sources}} 个来源"
+    },
+    "summary": {
+      "recentExit": "最近退出",
+      "filled": "已成交",
+      "rejected": "已拒绝",
+      "amount": "金额",
+      "avgHold": "平均持有",
+      "maxHold": "最长持有"
+    },
+    "columns": {
+      "byKind": "按退出类型",
+      "byTopic": "按题材",
+      "bySource": "按来源"
+    },
+    "filter": {
+      "state": "筛选状态",
+      "reset": "重置筛选",
+      "summary": "筛选：{{labels}}",
+      "summaryEmpty": "全部退出样本"
+    },
+    "samples": {
+      "title": "退出样本",
+      "meta": "最近 0 条",
+      "metaValue": "{{visible}} / {{total}} 个样本",
+      "table": {
+        "time": "时间",
+        "market": "市场",
+        "exit": "退出",
+        "sourceTopic": "来源 / 题材",
+        "amountSummary": "金额摘要"
+      }
+    },
+    "detail": {
+      "title": "退出样本详情",
+      "meta": "未选择",
+      "hint": "点击退出样本查看详情",
+      "summary": "这里会展示单条退出样本的来源钱包、题材、当前持仓上下文和最近一次退出记录。",
+      "list": {
+        "status": "状态"
+      },
+      "chain": {
+        "title": "同 Token 事件链",
+        "meta": "0 个事件"
+      }
+    },
+    "runtime": {
+      "defaults": {
+        "kind": "退出类型",
+        "exit": "退出"
+      },
+      "fillReject": "{{filled}} 成交 / {{rejected}} 拒绝",
+      "reviewList": {
+        "detail": "{{notional}} · {{count}} 次 · 平均 {{avgHold}} · {{latest}}"
+      },
+      "empty": {
+        "title": "暂无退出样本",
+        "detail": "当前窗口还没有可回放的退出记录。",
+        "byKind": "暂无退出类型统计",
+        "byTopic": "暂无题材统计",
+        "bySource": "暂无来源统计",
+        "filteredSamples": "当前筛选下暂无退出样本"
+      },
+      "sample": {
+        "statusDetail": "{{kind}} · 持有 {{hold}}",
+        "summaryEmpty": "暂无摘要"
+      },
+      "detail": {
+        "title": "退出样本运行态",
+        "summary": "当前样本：{{label}}",
+        "hint": "来源钱包 {{label}} · 结果 {{value}}",
+        "metaValue": "{{time}} · {{tag}}",
+        "summaryEmpty": "暂无退出摘要",
+        "currentOpen": "仍有持仓",
+        "currentClosed": "已无持仓",
+        "currentPositionClosed": "当前无持仓，可能已退出完成",
+        "entryWalletEmpty": "暂无入场钱包",
+        "entryReasonEmpty": "暂无入场说明",
+        "latestExitEmpty": "暂无记录",
+        "chainMetaValue": "{{count}} 个事件",
+        "chainEmpty": "暂无同一 Token 事件链",
+        "list": {
+          "marketDirection": "市场 / 方向",
+          "sourceWallet": "来源钱包",
+          "entryContext": "入场上下文",
+          "entryReason": "入场原因",
+          "trace": "回放链路",
+          "holdMinutes": "持有时长",
+          "currentPosition": "当前仓位",
+          "latestExit": "最近退出记录"
+        }
+      },
+      "event": {
+        "buy": "买入",
+        "entry": "入场",
+        "hold": "持有 {{hold}}",
+        "reasonEmpty": "暂无说明"
+      }
+    }
+  },
+  "traceReview": {
+    "panel": {
+      "title": "信号快照回放",
+      "meta": "最近 0 轮",
+      "metaValue": "最近 {{cycles}} 轮 · {{traces}} 条链路"
+    },
+    "summary": {
+      "recentCycles": "最近轮次",
+      "candidates": "候选信号",
+      "filled": "已成交",
+      "rejected": "已拒绝",
+      "activeTraces": "活跃链路",
+      "closedTraces": "已关闭链路"
+    },
+    "columns": {
+      "recentCycles": "最近信号轮次",
+      "cycleCandidates": "轮次候选信号",
+      "cycleCandidatesMeta": "0 个候选",
+      "cycleCandidatesMetaValue": "{{count}} 个候选"
+    },
+    "table": {
+      "market": "市场",
+      "wallet": "钱包",
+      "action": "动作",
+      "decision": "决策",
+      "order": "订单"
+    },
+    "detail": {
+      "title": "链路决策链",
+      "meta": "未选择",
+      "hint": "点击持仓、退出样本或候选信号查看完整链路",
+      "summary": "这里会展示同一条链路从首次入场到追加、减仓、退出的完整决策链。",
+      "list": {
+        "status": "状态"
+      },
+      "chain": {
+        "title": "决策链",
+        "meta": "0 个事件"
+      }
+    },
+    "runtime": {
+      "cycles": {
+        "previewEmpty": "钱包池快照",
+        "countValue": "{{count}} 条信号",
+        "detail": "成交 {{filled}} / 拒绝 {{rejected}} / 跳过 {{skipped}} · {{preview}}"
+      },
+      "candidates": {
+        "previewEmpty": "无钱包池快照",
+        "topicBiasNeutral": "中性",
+        "decisionPass": "通过",
+        "noOrder": "未下单",
+        "candidateState": "候选"
+      },
+      "empty": {
+        "title": "暂无链路",
+        "detail": "当前窗口没有可回放的信号链路。",
+        "cycles": "暂无信号轮次",
+        "cycleCandidates": "当前轮次暂无候选信号"
+      },
+      "detail": {
+        "title": "链路运行态",
+        "summary": "当前链路：{{label}}",
+        "hint": "决策 {{label}} · 结果 {{value}}",
+        "metaValue": "{{traceId}} · {{market}}",
+        "noOrder": "无订单",
+        "entryReasonEmpty": "暂无入场说明",
+        "entryWalletEmpty": "暂无入场钱包",
+        "currentPositionEmpty": "当前无持仓",
+        "closedAt": "关闭",
+        "chainMetaValue": "{{count}} 个事件",
+        "chainReasonEmpty": "暂无说明",
+        "poolPreview": "池 {{preview}}",
+        "chainEmpty": "暂无决策链",
+        "list": {
+          "marketDirection": "市场 / 方向",
+          "firstEntry": "首次入场",
+          "currentPosition": "当前仓位",
+          "latestAction": "最近动作",
+          "openedTime": "开仓时间",
+          "currentStatus": "当前状态"
+        }
+      }
+    }
+  },
+  "attributionReview": {
+    "panel": {
+      "title": "联合归因报表",
+      "meta": "最近 0 单",
+      "metaValue": "账本 {{orders}} 单 · 退出 {{exits}} 单"
+    },
+    "windows": {
+      "24h": "24h",
+      "7d": "7d",
+      "30d": "30d",
+      "all": "全部"
+    },
+    "window": {
+      "meta": "24h",
+      "metaValue": "{{label}} · {{orders}} 单"
+    },
+    "summary": {
+      "orders": "订单数",
+      "filled": "已成交",
+      "rejected": "已拒绝",
+      "exits": "退出数",
+      "highScoreRejects": "高分拒单",
+      "topics": "题材数"
+    },
+    "columns": {
+      "byWallet": "按钱包",
+      "byTopic": "按题材",
+      "byExitKind": "按退出类型",
+      "rejectReasons": "拒单归因",
+      "holdBuckets": "持有时长",
+      "topBottom": "头部 / 尾部"
+    },
+    "tables": {
+      "walletTopic": {
+        "title": "钱包 x 题材",
+        "meta": "0 行",
+        "wallet": "钱包",
+        "topic": "题材",
+        "fillReject": "成交 / 拒单",
+        "amount": "金额",
+        "hold": "持有"
+      },
+      "topicExit": {
+        "title": "题材 x 退出类型",
+        "meta": "0 行",
+        "topic": "题材",
+        "exitKind": "退出类型",
+        "fillReject": "成交 / 拒单",
+        "amount": "金额",
+        "hold": "持有"
+      },
+      "sourceResult": {
+        "title": "来源 x 结果",
+        "meta": "0 行",
+        "source": "来源",
+        "result": "结果",
+        "count": "次数",
+        "amount": "金额",
+        "rejectRate": "拒单率"
+      }
+    },
+    "rank": {
+      "topWallets": "头部钱包",
+      "bottomWallets": "尾部钱包",
+      "topTopics": "头部题材",
+      "bottomTopics": "尾部题材"
+    },
+    "runtime": {
+      "defaults": {
+        "topic": "未标记题材",
+        "exit": "退出",
+        "reject": "拒单",
+        "holdBucket": "持有区间"
+      },
+      "empty": {
+        "title": "暂无归因样本",
+        "detail": "当前窗口没有可展示的归因结果。",
+        "byWallet": "暂无钱包归因",
+        "byTopic": "暂无题材归因",
+        "byExitKind": "暂无退出归因",
+        "rejectReasons": "暂无拒单归因",
+        "holdBuckets": "暂无持有时长归因",
+        "rankings": "暂无排名"
+      },
+      "meta": {
+        "title": "归因元数据",
+        "detail": "最近 {{count}} 单 · 更新 {{age}}"
+      },
+      "detail": {
+        "title": "归因运行态",
+        "summary": "当前归因维度：{{label}}",
+        "hint": "数值 {{value}} · 标签 {{label}}"
+      },
+      "summary": {
+        "title": "归因概览",
+        "value": "{{count}} 项归因"
+      },
+      "list": {
+        "status": "状态",
+        "label": "{{label}}",
+        "value": "{{label}}：{{value}}",
+        "fillRejectShort": "{{filled}} 成交 / {{rejected}} 拒绝",
+        "walletDetail": "{{entryCount}} 入 / {{exitCount}} 出 · {{notional}} · 拒单 {{rejectRate}}",
+        "topicDetail": "{{entryCount}} 入 / {{exitCount}} 出 · {{notional}} · 平均 {{hold}}",
+        "exitDetail": "{{filled}} 成交 / {{rejected}} 拒绝 · {{notional}} · 平均 {{hold}}",
+        "rejectDetail": "{{rejected}} 次 · 高分钱包 {{highScoreRejected}} 次 · 平均 {{walletScore}}",
+        "holdBucketDetail": "{{count}} 次 · 平均 {{avgHold}} · 最长 {{maxHold}}",
+        "rankTopDetail": "{{filled}} 笔成交 · {{notional}}",
+        "rankBottomDetail": "{{rejected}} 笔拒绝 · 拒单 {{rejectRate}}"
+      },
+      "table": {
+        "title": "归因表",
+        "label": "{{label}}",
+        "metaRows": "{{count}} 行",
+        "walletTopicEmpty": "暂无钱包 x 题材归因",
+        "topicExitEmpty": "暂无题材 x 退出归因",
+        "sourceResultEmpty": "暂无来源 x 结果归因"
+      },
+      "rank": {
+        "topWallets": "头部钱包",
+        "bottomWallets": "尾部钱包"
+      },
+      "value": {
+        "label": "{{label}}",
+        "detail": "{{label}}：{{value}}",
+        "empty": "暂无值"
+      }
+    }
+  },
+  "health": {
+    "runtime": "状态 {{age}} · 轮询 {{poll}} 秒",
+    "discovery": "{{mode}} / {{enabled}}"
+  },
+  "monitor": {
+  "meta": "30m {{monitor30Age}} · 12h {{monitor12Age}} · EOD {{eodAge}}",
+    "report": {
+      "title": "监控报告",
+      "meta": "30m / 12h / EOD",
+      "summary": {
+        "ready": "监控就绪",
+        "window30m": "30m",
+        "window12h": "12h",
+        "windowEod": "EOD",
+        "ledgerDiff": "账本差异",
+        "fillsToday": "当日成交"
+      },
+      "callout": {
+        "title": "执行与监控对齐",
+        "detail": "执行与监控链路已接通"
+      },
+      "columns": {
+        "window30m": "30m 窗口",
+        "window12h": "12h 窗口",
+        "eod": "EOD"
+      },
+      "breakdown": {
+        "title": "成交分解",
+        "meta": "来源 / 方向",
+        "card": "成交分解"
+      },
+      "runtime": {
+        "empty": {
+          "title": "暂无监控报告",
+          "detail": "当前窗口还没有生成监控运行态。"
+        },
+        "meta": {
+          "title": "监控运行元数据",
+          "detail": "最近 {{count}} 份 · 更新 {{age}}"
+        },
+        "detail": {
+          "title": "监控运行态",
+          "summary": "当前窗口：{{label}}",
+          "hint": "状态 {{label}} · 值 {{value}}"
+        },
+        "summary": {
+          "title": "监控概览",
+          "value": "{{count}} 份报告"
+        },
+        "list": {
+          "status": "状态",
+          "label": "{{label}}",
+          "value": "{{label}}：{{value}}"
+        },
+        "table": {
+          "title": "监控表",
+          "label": "{{label}}"
+        },
+        "rank": {
+          "topWallets": "优先窗口",
+          "bottomWallets": "次要窗口"
+        },
+        "value": {
+          "label": "{{label}}",
+          "detail": "{{label}}：{{value}}",
+          "empty": "暂无值"
+        }
+      }
+    },
+  "window": {
+    "stale": "过期",
+    "staleAgeTag": "过期 · {{age}}",
+    "inconclusiveCount": "样本不足 x{{count}}",
+    "label": "{{label}} 窗口",
+    "summaryWithFreshness": "{{summary}} · {{freshness}}",
+    "generatedValue": "{{time}} · {{age}}",
+    "notGenerated": "尚未生成报告",
+    "samplesTitle": "样本与计数",
+    "execValue": "{{count}} 次执行",
+    "samplesDetail": "达到上限跳过 {{skipMax}} · 冷却 {{cooldown}} · 时间退出 {{timeExit}}{{rejectSuffix}}",
+    "samplesRejectSuffix": " · 拒绝 {{reject}}",
+    "syncTitle": "比例与同步",
+    "syncDetail": "跳过 {{skipRatio}} · 退出 {{exitRatio}}{{rejectSuffix}} · 对账 {{reconcileAge}} · 事件 {{eventAge}}",
+    "syncRejectSuffix": " · 拒绝 {{rejectRatio}}",
+    "recommendationDiff": "{{final}} · 原始监控: {{raw}}",
+    "finalAdviceTitle": "最终建议",
+    "noAdvice": "暂无建议"
+  },
+    "summary": {
+      "startupReady": "启动就绪",
+      "monitor30": "30m",
+      "monitor12": "12h",
+      "eod": "EOD",
+      "ledgerGap": "账本差异",
+      "todayFills": "当日成交",
+      "fills": "{{count}} 笔 / {{notional}}"
+    },
+  "callout": {
+    "alignedTag": "对齐",
+    "alignedTitle": "执行与监控链路已接通",
+    "alignedBody": "30m {{monitor30Age}}，12h {{monitor12Age}}，EOD {{eodAge}}。",
+    "startupBlockedTag": "阻断",
+    "startupBlockedTitle": "启动自检未就绪",
+    "startupBlockedBody": "先修复连通性检查、账户或券商前置条件，再讨论参数或策略表现。",
+    "reconciliationFailedTag": "对账失败",
+    "reconciliationFailedTitle": "执行事实层存在漂移",
+    "reconciliationFailedBodyFallback": "请优先检查账本漂移、券商同步和陈旧待处理单。",
+    "observeTag": "观察",
+    "observeTitle": "执行层有警告，暂不适合调参数",
+    "observeBodyStale": "监控报告存在过期窗口：30m {{monitor30Age}}，12h {{monitor12Age}}。",
+    "observeBodyFallback": "先处理陈旧待处理单、快照年龄和对账年龄。"
+  },
+  "eod": {
+    "noRecommendation": "暂无 EOD 建议",
+    "statusTitle": "日终状态",
+    "statusDetail": "{{dayKey}} · {{generated}} · 最近成交 {{latestFill}}",
+    "pnlTitle": "盈亏与差异",
+    "pnlDetail": "内部账本差额 {{internalDiff}} · 券商底账差额 {{brokerGap}}",
+    "startupPendingTitle": "启动与待处理",
+    "startupPendingValue": "{{failures}} 次失败 / {{warnings}} 次警告",
+    "startupPendingDetail": "陈旧待处理 {{stalePending}} · 开放 {{openCount}} · 跟踪 {{tracked}}",
+    "actionsTitle": "推荐动作",
+    "actionsDetail": "{{issuesPrefix}}{{recommendations}}",
+    "actionsIssuesPrefix": "{{issues}} · "
+  },
+  "breakdown": {
+    "sourceCard": "来源 {{source}}",
+    "sideCard": "方向 {{side}}",
+    "fills": "{{count}} 笔成交",
+    "amount": "金额",
+    "realized": "已实现",
+    "metaValue": "{{sources}} 个来源 / {{sides}} 个方向",
+    "emptyLabel": "成交分解",
+    "emptyValue": "当日暂无成交"
+  }
+  },
+  "opsGate": {
+    "banner": {
+      "title": "运行门禁",
+      "detail": "这里会把启动、自检、监控和对账的综合结论顶到最上层。",
+      "tag": {
+        "wait": "等待"
+      },
+      "checks": {
+        "status": "检查状态"
+      },
+      "actions": {
+        "title": "动作建议",
+        "meta": "0 条动作",
+        "waitingTag": "等待",
+        "waitingTitle": "等待运行门禁建议",
+        "waitingDetail": "这里会根据启动、自检、监控和对账自动给出下一步动作。"
+      }
+    },
+    "titleFallback": "运行门禁等待数据",
+    "detailFallback": "这里会把启动、自检、监控和对账的综合结论顶到最上层。",
+    "pillLabel": "运行门禁 {{label}}",
+    "issuesLabel": "重点问题",
+    "actionsMeta": "{{visible}}/{{total}} 条动作",
+    "actionsMetaSimple": "{{count}} 条动作",
+    "emptyActionTitle": "等待运行门禁建议",
+    "emptyActionDetail": "这里会根据启动、自检、监控和对账自动给出下一步动作。",
+    "levelTag": {
+      "danger": "优先",
+      "ok": "继续",
+      "wait": "观察"
+    },
+    "runtime": {
+      "checks": {
+        "startupLabel": "启动自检",
+        "monitor30Label": "30m",
+        "monitor12Label": "12h",
+        "reconciliationLabel": "对账",
+        "startupCounts": "{{failures}} 失败 / {{warnings}} 警告",
+        "issueLine": "{{name}}：{{message}}"
+      },
+      "state": {
+        "readyTitle": "执行门禁已就绪",
+        "readyDetail": "启动、自检、监控和对账当前没有阻断项，可以继续观察策略与执行质量。",
+        "blockTitle": "运行门禁阻断",
+        "blockDetailFallback": "启动自检未通过，或 live 前置条件缺失。优先修复环境与账户问题。",
+        "escalateTitle": "执行对账需要升级处理",
+        "escalateFailDetail": "对账当前为失败{{summarySuffix}}。先停止参数变更并生成 EOD 对账报告，核对账本漂移。",
+        "escalateFallback": "账本与券商事实层可能已经漂移，建议先停止参数变更。",
+        "observeTitle": "运行中有警告，先观察再调参",
+        "observeWarnDetail": "对账当前为警告{{summarySuffix}}。先核对对账与同步新鲜度，再判断监控是否只是样本不足。",
+        "observeMonitorDetail": "监控当前仍在观察：{{focus}}。先补足样本或刷新过期报告，再决定是否调参数。",
+        "observeStaleDetail": "监控报告已过期：{{windows}}。先刷新 30m / 12h 报告，再判断是否真的需要调参。",
+        "observeFallback": "当前更像执行告警，而不是策略信号结论。",
+        "summarySuffix": "（{{summary}}）"
+      },
+      "controls": {
+        "copyCommand": "复制命令",
+        "openStateJson": "打开状态 JSON",
+        "jumpDiagnostics": "跳到诊断",
+        "jumpMonitor": "跳到监控面板",
+        "refreshEodReport": "刷新 EOD 报告",
+        "openEodJson": "打开 EOD JSON",
+        "clearStalePending": "清理陈旧待处理单",
+        "jumpOrders": "跳到订单",
+        "open30mJson": "打开 30m JSON",
+        "open12hJson": "打开 12h JSON",
+        "copyInstallCommand": "复制安装命令"
+      },
+      "actions": {
+        "networkSmoke": {
+          "title": "重跑网络探测",
+          "detail": "先执行 <code>make network-smoke</code>，确认 geoblock / endpoint 正常；当前提示：{{message}}。",
+          "fallbackMessage": "网络探测需要复核"
+        },
+        "liveCredentials": {
+          "title": "核对 live 账户与签名配置",
+          "detail": "检查 <code>PRIVATE_KEY</code>、<code>FUNDER_ADDRESS</code>、<code>CLOB_SIGNATURE_TYPE</code>，确保 API 凭证可以稳定派生；当前提示：{{message}}。"
+        },
+        "marketPreflight": {
+          "title": "恢复市场预检",
+          "detail": "确认 live broker 已配置 market client，否则 book / midpoint / tick 预检会直接拒单；当前提示：{{message}}。"
+        },
+        "orderStatusSupport": {
+          "title": "修复券商订单查询能力",
+          "detail": "先确认 <code>py-clob-client</code> 版本和适配层，保证 <code>get_order</code> / <code>get_orders</code> 可用；当前提示：{{message}}。"
+        },
+        "heartbeat": {
+          "title": "确认 heartbeat 策略",
+          "detail": "当前有 <code>{{pendingCount}}</code> 个待处理订单，但 SDK 可能缺少 heartbeat 能力，先避免依赖长时间 resting orders；当前提示：{{message}}。"
+        },
+        "userStream": {
+          "title": "检查 user stream 依赖",
+          "detail": "安装 <code>websocket-client</code> 并确认 <code>USER_STREAM_*</code> 配置；否则只会退回 polling reconcile；当前提示：{{message}}。"
+        },
+        "clobHost": {
+          "title": "确认 CLOB 主机",
+          "detail": "检查 live CLOB host 配置与网络连通性；当前提示：{{message}}。"
+        },
+        "ledgerDrift": {
+          "title": "先核对账本漂移",
+          "detail": "当前内部账本差异为 <code>{{diff}}</code>，先生成 <code>make reconciliation-report</code> 并核对当日已实现盈亏。"
+        },
+        "stalePending": {
+          "title": "处理陈旧待处理单",
+          "detail": "当前仍有 <code>{{count}}</code> 个陈旧待处理单，先核对 broker open orders / recent fills，必要时撤单后再继续。"
+        },
+        "syncAge": {
+          "title": "刷新 broker / account sync",
+          "detail": "当前同步时效偏老：account <code>{{accountAge}}</code>、reconcile <code>{{reconcileAge}}</code>、events <code>{{eventAge}}</code>，先确认 daemon 与 user stream 仍在刷新。"
+        },
+        "inconclusive": {
+          "title": "补足样本窗口",
+          "detail": "当前监控仍有 <code>{{windows}}</code> 个样本不足窗口，先继续观察执行样本，不要基于 0 样本调参数。",
+          "windowPart": "{{label}} 连续 {{count}} 个",
+          "unknownCount": "?"
+        },
+        "monitorSummary": {
+          "title": "先处理监控摘要里的执行问题",
+          "detail": "优先阅读 30m / 12h 监控的原始建议，并刷新过期窗口；当前 30m {{monitor30}} / 12h {{monitor12}}。"
+        },
+        "consistency": {
+          "title": "继续观察 shadow / live 一致性",
+          "detail": "当前门禁通过，继续对比 12h monitor 与 EOD reconciliation 是否保持一致，并关注下一次 startup / broker sync 是否仍然稳定。"
+        }
+      }
+    }
+  },
+  "timeline": {
+    "panel": {
+      "title": "自动交易状态时间轴",
+      "subtitle": "系统时间轴"
+    },
+    "empty": "暂无时间轴事件",
+    "notRecorded": "未记录"
+  },
+  "wallet": {
+    "component": {
+      "notional": "仓位规模",
+      "positions": "活跃仓位",
+      "unique_markets": "市场分散",
+      "concentration": "集中度",
+      "activity": "近期活跃",
+      "history_win_rate": "历史胜率",
+      "history_roi": "历史回报率",
+      "history_profit_factor": "盈亏比",
+      "history_resolution": "解析命中"
+    },
+    "detail": {
+      "empty": {
+        "title": "未选择",
+        "subtitle": "点击钱包行查看详情",
+        "summary": "这里会展示单个钱包的评分逻辑、历史样本和真实表现。"
+      },
+      "mode": {
+        "tradeEnabled": "允许交易",
+        "observeOnly": "仅观察"
+      },
+      "summaryEmpty": "暂无评分摘要",
+      "topicCount": "{{count}} 个题材",
+      "values": {
+        "status": "{{score}} 分 · {{mode}}",
+        "positionProfile": "{{positions}} 个仓位 · {{markets}} 个市场 · {{notional}}U",
+        "history": "已平仓 {{closed}} / 已解析 {{resolved}} · {{age}}",
+        "performance": "收益率 {{roi}} · 胜率 {{winRate}}",
+        "resolutionPf": "解析命中 {{resolvedWinRate}} · 盈亏比 {{profitFactor}}",
+        "realizedPnl": "{{realizedPnl}} / 买入 {{totalBought}}",
+        "activity": "{{count}} 条事件",
+        "poolPriority": "#{{rank}} · {{score}}{{topicSuffix}}",
+        "winBreakdown": "{{wins}}/{{closed}} · 已解析 {{resolvedWins}}/{{resolvedMarkets}}",
+        "topicResolved": "已解析 {{resolvedWinRate}}",
+        "sampleResolved": "已解析{{winnerSuffix}}",
+        "sampleResolvedWinner": " / 获胜结果 {{winner}}"
+      },
+      "list": {
+        "status": "当前状态",
+        "positionProfile": "当前仓位画像",
+        "history": "历史样本",
+        "performance": "真实表现",
+        "resolutionPf": "解析命中 / 盈亏比",
+        "realizedPnl": "历史盈亏",
+        "activity": "近期活跃",
+        "poolPriority": "钱包池优先级",
+        "winBreakdown": "胜场拆解"
+      },
+      "history": {
+        "resolvedEmpty": "已解析 --",
+        "sampleCount": "{{count}} 个样本",
+        "unresolved": "未解析",
+        "empty": "暂无已结算样本"
+      }
+    },
+    "historyProfile": {
+      "missing": {
+        "label": "缺失",
+        "detail": "暂无结算历史"
+      },
+      "thin": {
+        "label": "偏薄",
+        "detail": "已平仓 {{closed}} / 最少 {{minClosed}}"
+      },
+      "strong": {
+        "label": "充分",
+        "detail": "已平仓 {{closed}} / 已解析 {{resolved}}"
+      },
+      "usable": {
+        "label": "可用",
+        "detail": "已平仓 {{closed}} / 已解析 {{resolved}}"
+      }
+    },
+    "sampleVerdict": {
+      "resolvedCorrect": "命中",
+      "resolvedWrong": "失手",
+      "profit": "盈利",
+      "loss": "亏损",
+      "flat": "持平"
+    },
+    "source": {
+      "unlabeled": "未标记来源",
+      "systemTimeExit": "系统时间退出",
+      "systemEmergencyStop": "系统紧急退出"
+    }
+  },
+  "runner": {
+    "candidateRecommendation": {
+      "marketDataUnavailable": "当前没有可跟的卖盘，先观察避免撞空簿",
+      "marketWindowElapsed": "该短周期市场已结束，旧信号不再跟",
+      "marketNearClose": "短周期市场接近结束，先不追最后一段",
+      "marketClosed": "市场已关闭，不能继续开新仓",
+      "marketInactive": "市场当前未激活，先不参与",
+      "marketNotAcceptingOrders": "市场暂不接单，先观察",
+      "spreadTooWide": "盘口点差过宽，先观察",
+      "chaseTooHigh": "价格已被推远，追价风险偏高",
+      "momentumTooWeak": "短线动量转弱，先等更好的入场",
+      "existingPositionConflict": "当前同市场已有仓位，先避免重复暴露",
+      "sellCrossWalletExit": "{{count}} 个钱包共振退出，优先减仓",
+      "sellFullExit": "来源钱包基本清仓，优先跟随退出",
+      "sellPartialExit": "来源钱包在减仓，适合先减一部分",
+      "existingPositionPresent": "已有仓位在场，先观察是否需要继续加",
+      "buyMomentumStrong": "5m/30m 动量都在走强，{{action}} 更顺势",
+      "buyMomentumWeak": "5m/30m 动量偏弱，{{action}} 前先小心",
+      "follow": "分数 {{score}}，钱包等级高，可正常跟随",
+      "buyNormal": "分数 {{score}}，机会较强，可常规仓位跟随",
+      "buySmall": "分数 {{score}}，有跟随价值，但更适合小仓试探",
+      "watchDefault": "分数 {{score}}，先观察更多确认"
+    },
+    "candidateFactor": {
+      "wallet": {
+        "label": "钱包强度"
+      },
+      "walletValue": "{{tier}} · {{score}}",
+      "confidence": {
+        "label": "置信度"
+      },
+      "topic": {
+        "label": "题材偏向"
+      },
+      "marketState": {
+        "label": "市场状态",
+        "detail": "优先使用权威市场元数据判断市场是否关闭、是否激活、是否接单和结束时间",
+        "closed": "已关闭",
+        "inactive": "未激活",
+        "acceptingOrdersFalse": "不接单",
+        "metadata": "元数据",
+        "remainSeconds": "剩余 {{seconds}} 秒"
+      },
+      "spread": {
+        "label": "盘口点差",
+        "detail": "点差越大，追价性价比越差"
+      },
+      "chase": {
+        "label": "追价幅度",
+        "detail": "当前买价相对源价格的抬升幅度"
+      },
+      "momentum": {
+        "label": "价格动量",
+        "detail": "动量用于判断是否顺势或逆势追单"
+      },
+      "existingPosition": {
+        "label": "已有仓位",
+        "detailDefault": "已有仓位在场"
+      },
+      "exit": {
+        "label": "退出比例",
+        "detail": "卖出信号主要反映源钱包减仓或清仓"
+      },
+      "resonanceExit": {
+        "label": "共振退出",
+        "value": "{{count}} 个钱包",
+        "detail": "多个钱包同步减仓时，退出优先级更高"
+      },
+      "decision": {
+        "label": "建议动作"
+      },
+      "skipReason": {
+        "label": "忽略原因"
+      }
+    },
+    "candidateExplanation": {
+      "walletSummary": "钱包 {{tier}} · {{walletScore}} 分 · 置信度 {{confidence}}",
+      "topicSummary": "题材 {{topic}} · 偏向 {{bias}} · 倍率 {{multiplier}}",
+      "marketPrefix": "盘口 {{bits}}",
+      "marketStatusPrefix": "市场 {{bits}}",
+      "historyMomentum": "历史 {{points}} 个点 · 5m {{momentum5m}} · 30m {{momentum30m}}",
+      "trendStrong": "趋势 5m/30m 一致偏强",
+      "trendWeak": "趋势 5m/30m 一致偏弱",
+      "existingPosition": "当前已有仓位 {{notional}}{{sourceSuffix}}",
+      "existingSourceSuffix": " · 来源 {{tier}}",
+      "sellCrossWalletExit": "多钱包共振退出 {{count}} 个钱包",
+      "sellExitFraction": "退出比例 {{fraction}}",
+      "buyObservedNotional": "观察金额 {{notional}} · 动作 {{action}}",
+      "skipPrefix": "建议先不追：{{reason}}",
+      "decisionSummary": "建议动作 {{action}} · 综合分 {{score}}",
+      "buyMomentumStrong": "短线动量一致偏强，追价压力相对更低",
+      "buyMomentumWeak": "短线动量一致偏弱，先别急着追",
+      "marketBit": {
+        "mid": "中价 {{value}}",
+        "ask": "卖一 {{value}}",
+        "bid": "买一 {{value}}",
+        "spread": "点差 {{value}}",
+        "chase": "追价 {{value}}"
+      },
+      "marketStatusBit": {
+        "closed": "已关闭",
+        "inactive": "未激活",
+        "acceptingOrdersFalse": "不接单",
+        "timeSource": "时间源 {{value}}",
+        "endDate": "结束 {{value}}",
+        "remainSeconds": "剩余 {{seconds}} 秒"
+      }
+    }
+  },
+  "web": {
+    "field": {
+      "force": "强制刷新",
+      "candidate_id": "候选 ID",
+      "action": "动作",
+      "mode": "模式",
+      "text": "文本",
+      "wallet": "钱包",
+      "trust_score": "信任分",
+      "followability_score": "跟随分",
+      "avg_hold_minutes": "平均持有分钟数",
+      "enabled": "启用状态"
+    },
+    "api": {
+      "unauthorized": "未授权访问",
+      "forceInvalidBool": "强制刷新参数必须为 true 或 false",
+      "candidateIdRequired": "必须提供候选 ID",
+      "candidateNotFound": "未找到候选 {{candidateId}}",
+      "csvRequiresSingleScope": "CSV 导出必须指定单一作用域",
+      "exportUnsupportedFormat": "不支持的导出格式",
+      "notFound": "接口不存在",
+      "candidateActionRequired": "必须同时提供候选 ID 和动作",
+      "invalidMode": "无效的模式",
+      "textRequired": "必须提供文本内容",
+      "walletRequired": "必须提供钱包地址",
+      "walletProfileFieldsUnsupported": "钱包画像字段不受支持",
+      "invalidCommand": "无效的命令",
+      "stalePendingQueued": "已提交陈旧挂单清理请求",
+      "validationFailed": "请求校验失败",
+      "reportGenerationFailed": "生成对账报告失败",
+      "fieldMustBeNumber": "{{field}}必须为数字",
+      "fieldMustBeBoolean": "{{field}}必须为布尔值"
+    },
+    "auth": {
+      "title": "Polymarket 控制台访问",
+      "heading": "访问受保护",
+      "description": "这个控制台需要访问令牌。你可以直接打开带 {{tokenQuery}} 的分享链接，或者在这里输入访问令牌。",
+      "placeholder": "输入访问令牌",
+      "submit": "打开控制台"
+    }
+  },
+  "cli": {
+    "main": {
+      "description": "Polymarket 自动交易主程序",
+      "once": "只运行一个周期后退出",
+      "runtime": {
+        "liveRequiresSecrets": "实盘模式必须配置 PRIVATE_KEY 和 FUNDER_ADDRESS"
+      }
+    }
+  },
+  "script": {
+    "checkEnv": {
+      "cli": {
+        "description": "校验 .env 与 .env.example 配置是否一致",
+        "warnOnly": "发现问题时仅打印警告，不返回非零退出码"
+      },
+      "problem": {
+        "missingRequiredKey": ".env 缺少必填项：{{key}}",
+        "dryRunRequiresKey": "当 DRY_RUN=false 时，必须设置 {{key}}",
+        "dryRunRequiresTrue": "当 DRY_RUN=false 时，必须设置 {{key}}=true",
+        "missingExample": "缺少 .env.example，无法校验预期配置",
+        "missingEnv": "缺少 .env，请基于 .env.example 创建"
+      },
+      "warning": {
+        "missingOptionalKeys": ".env 缺少可选项：{{keys}}",
+        "blockbeatsUnavailable": "未设置 BLOCKBEATS_API_KEY，共享 BlockBeats skill 与 scripts/blockbeats_query.sh 将不可用",
+        "remoteAlertMissing": "当 DRY_RUN=false 时，未配置远程告警通道（webhook 或 telegram）"
+      },
+      "output": {
+        "prefix": {
+          "warn": "警告: ",
+          "error": "错误: "
+        },
+        "ok": "正常: .env 配置通过检查"
+      }
+    }
+  },
+  "report": {
+    "liveSmokePreflight": {
+      "status": {
+        "ready": "就绪",
+        "blocked": "阻断"
+      },
+      "cli": {
+        "description": "安全检查实盘连通性 smoke 的前置条件，不会实际下单",
+        "reportPath": "可选的 JSON 报告输出路径"
+      },
+      "check": {
+        "dryRunDisabled": "实盘 smoke 预检要求 DRY_RUN=false",
+        "liveSecrets": "必须同时配置 PRIVATE_KEY 与 FUNDER_ADDRESS",
+        "liveAdmissionFlags": "LIVE_ALLOWANCE_READY、LIVE_GEOBLOCK_READY、LIVE_ACCOUNT_READY 必须全部为 true",
+        "remoteAlertConfigured": "实盘 smoke 前必须先配置远程告警通道",
+        "stateFilePresent": "实盘状态文件必须存在且可读取",
+        "stateFresh": "实盘状态年龄必须小于等于 {{maxAge}} 秒",
+        "decisionModeManual": "实盘 smoke 前 decision_mode 必须为 manual",
+        "pauseOpeningEnabled": "实盘 smoke 前必须保持 pause_opening=true",
+        "startupReady": "startup_ready 必须为 true",
+        "reconciliationOk": "reconciliation.status 必须为 ok",
+        "persistenceOk": "persistence.status 必须为 ok",
+        "openPositionsZero": "实盘 smoke 前 open_positions 必须为 0",
+        "trackedNotionalZero": "实盘 smoke 前 tracked_notional_usd 必须为 0"
+      },
+      "blocker": {
+        "dryRunTrue": "当前 DRY_RUN=true",
+        "liveSecretsMissing": "实盘凭证未完整配置",
+        "liveAdmissionFlagsMissing": "实盘准入确认项未全部完成",
+        "remoteAlertNotConfigured": "未配置远程告警通道",
+        "stateFileMissing": "实盘状态文件缺失或不可读",
+        "stateStale": "实盘状态已过期",
+        "decisionModeNotManual": "decision_mode 当前不是 manual",
+        "pauseOpeningDisabled": "pause_opening 当前未启用",
+        "startupNotReady": "startup_ready 当前为 false",
+        "reconciliationNotOk": "reconciliation.status 当前不是 ok",
+        "persistenceNotOk": "persistence.status 当前不是 ok",
+        "openPositionsNonZero": "open_positions 当前不为 0",
+        "trackedNotionalNonZero": "tracked_notional_usd 当前不为 0"
+      }
+    },
+    "rehearsalFinalize": {
+      "title": "Polymarket 彩排收尾报告",
+      "common": {
+        "na": "无"
+      },
+      "status": {
+        "missing": "缺失",
+        "pending": "待完成",
+        "failed": "失败",
+        "completed": "完成"
+      },
+      "nextAction": {
+        "waitForRehearsalCompletion": "等待彩排完成",
+        "configureRealRemoteAlerts": "配置真实远程告警",
+        "executeRealLiveSmoke": "执行真实实盘 smoke"
+      },
+      "field": {
+        "status": "状态：{{value}}",
+        "checkpointCount": "检查点：{{count}} / {{expected}}",
+        "lastCheckpoint": "最近检查点：{{value}}"
+      },
+      "section": {
+        "checks": "附加检查："
+      },
+      "row": {
+        "check": "- {{name}}：{{status}}"
+      },
+      "checkStatus": {
+        "pass": "通过",
+        "fail": "失败"
+      },
+      "cli": {
+        "description": "在 24 小时彩排完成后生成收尾报告",
+        "rehearsalPath": "可选的彩排文件路径",
+        "outputPath": "可选的 JSON 报告输出路径",
+        "runChecks": "彩排完成后，同时运行收尾后的附加检查",
+        "json": "输出 JSON，而不是文本摘要"
+      }
+    },
+    "replayRuntime": {
+      "cli": {
+        "description": "回放并汇总 Polymarket 运行时产物",
+        "json": "输出 JSON，而不是文本摘要"
+      },
+      "section": {
+        "runtimeState": "-- 运行时状态 --",
+        "events": "-- 事件流 --",
+        "replay": "-- 回放结果 --"
+      },
+      "field": {
+        "path": "路径：{{value}}",
+        "exists": "存在：{{value}}",
+        "version": "版本：{{value}}",
+        "timestamp": "时间：{{value}}",
+        "openPositions": "开仓数：{{value}}",
+        "trackedNotionalUsd": "跟踪名义金额：{{value}}",
+        "count": "数量：{{value}}",
+        "lastEventTs": "最近事件时间：{{value}}",
+        "totalBuyNotional": "累计买入名义金额：{{value}}",
+        "totalSellNotional": "累计卖出名义金额：{{value}}",
+        "reconstructedOpenPositions": "回放重建开仓数：{{value}}",
+        "reconstructedTrackedNotionalUsd": "回放重建名义金额：{{value}}",
+        "deltaPositions": "仓位差值：{{value}}",
+        "deltaNotionalUsd": "名义金额差值：{{value}}"
+      },
+      "row": {
+        "eventType": "  {{type}}：{{count}}"
+      }
+    },
+    "faultDrill": {
+      "title": "Polymarket 故障演练",
+      "field": {
+        "ok": "是否通过：{{value}}",
+        "testsRun": "执行测试数：{{value}}",
+        "durationSeconds": "耗时（秒）：{{value}}",
+        "goal": "  目标：{{value}}",
+        "resultPass": "结果：通过",
+        "resultFail": "结果：失败",
+        "coverage": "覆盖范围：已覆盖启动门禁、持久化停机与对账歧义保护。"
+      },
+      "row": {
+        "category": "[演练] {{category}}：{{title}}",
+        "testLabel": "  - {{value}}",
+        "testPurpose": "    目的：{{value}}",
+        "traceback": "    {{value}}"
+      },
+      "category": {
+        "startupGate": {
+          "title": "启动 / 准入门禁",
+          "goal": "验证当启动状态、账户新鲜度或对账状态不安全时，runner 会阻止新增风险。"
+        },
+        "persistenceFault": {
+          "title": "持久化故障停机",
+          "goal": "验证账本或运行时状态写入失败会升级为 HALTED，并清理不安全的待处理暴露。"
+        },
+        "reconcileAmbiguity": {
+          "title": "对账歧义保护",
+          "goal": "验证多笔待处理订单归因不清时，不会被乐观自动对齐。"
+        }
+      },
+      "testPurpose": {
+        "systemTradingModeBlocksBuy": "系统交易模式会阻止 BUY，但仍允许 SELL",
+        "accountStateStaleBlocksBuy": "账户快照过旧时会强制进入仅减仓行为",
+        "reconciliationWarnBlocksBuy": "对账警告会阻止新的 BUY 订单",
+        "ledgerAppendFailureHaltsOpening": "账本追加失败会停止开仓",
+        "runtimeStatePersistFailureHaltsOpening": "运行时状态持久化失败会停止开仓",
+        "persistenceFaultCancelsPendingBuyOrders": "持久化故障会清空待处理买单暴露",
+        "daemonStateWriteFaultSurfaced": "daemon 状态写入故障会回传并触发 trader 的持久化故障处理",
+        "multiplePendingOrdersMarkedAmbiguous": "同一 token 多笔待处理订单会被标记为歧义，而不是强行补齐成交"
+      },
+      "cli": {
+        "description": "运行 Polymarket 栈的控制面故障演练",
+        "category": "限制只运行一个或多个演练类别，默认全部执行",
+        "json": "输出 JSON，而不是文本摘要",
+        "verbose": "使用更详细的 unittest 输出"
+      }
+    },
+    "networkSmoke": {
+      "cli": {
+        "description": "Polymarket 网络连通性 smoke 测试",
+        "wallet": "用于 positions 接口 smoke 的钱包地址",
+        "historyWallets": "用于真实历史 smoke 的钱包地址列表，以逗号分隔",
+        "historyMaxWallets": "历史 smoke 最多探测的钱包数量",
+        "historyLimit": "历史 smoke 每个接口的条数上限",
+        "resolutionLimit": "每个钱包最多解析的近期已结算市场数量",
+        "skipHistory": "跳过真实钱包历史 smoke 检查",
+        "dataApi": "Data API 基础地址",
+        "clobHost": "CLOB 主机基础地址",
+        "logPath": "追加写入的日志输出路径"
+      },
+      "common": {
+        "none": "(无)"
+      },
+      "section": {
+        "title": "==> Polymarket 网络 smoke 测试",
+        "history": "==> 钱包历史 smoke"
+      },
+      "field": {
+        "wallet": "wallet={{value}}",
+        "dataApi": "data_api={{value}}",
+        "clobHost": "clob_host={{value}}",
+        "historyWallets": "history_wallets={{value}}",
+        "checkExtra": "status={{status}} cf_ray={{cfRay}} restricted={{restricted}} ms={{ms}}",
+        "historyExtra": "active={{active}} trades={{trades}} closed={{closed}} resolved={{resolved}} ms={{ms}}"
+      },
+      "summary": {
+        "requestFailed": "{{name}}：请求失败（{{reason}}）",
+        "geoRestricted": "{{name}}：检测到地理限制标记",
+        "blockedByPolicy": "{{name}}：被策略阻断，状态码={{status}}",
+        "authRequired": "{{name}}：需要鉴权（401，对私有接口属预期）",
+        "unexpectedStatus": "{{name}}：状态码异常={{status}}",
+        "statusOk": "{{name}}：状态码={{status}}"
+      },
+      "history": {
+        "noRecentData": "history_wallet {{wallet}}：active / trades / activity / closed 都没有近期数据",
+        "noResolutionFound": "history_wallet {{wallet}}：历史数据可解析，但最近 {{count}} 个已结算市场没有解析结果",
+        "ok": "history_wallet {{wallet}}：active={{active}} trades={{trades}} activity={{activity}} closed={{closed}} resolved={{resolved}}",
+        "requestFailed": "history_wallet {{wallet}}：请求失败（{{reason}}）"
+      },
+      "result": {
+        "block": "BLOCK：网络路径看起来被地理限制或策略限制",
+        "fail": "FAIL：端点连通性与预期不一致",
+        "warn": "WARN：测试通过，但存在 {{count}} 个非致命警告",
+        "pass": "PASS：当前环境可以访问 Polymarket 端点"
+      }
+    },
+    "reconciliation": {
+      "title": "Polymarket 对账日终报告",
+      "none": "（无）",
+      "section": {
+        "startup": "启动状态",
+        "state_summary": "运行摘要",
+        "ledger_summary": "账本摘要",
+        "issues": "问题",
+        "recommendations": "建议",
+        "fill_by_source": "按来源成交",
+        "fill_by_side": "按方向成交"
+      },
+      "field": {
+        "generated_at": "生成时间",
+        "day_key": "日期",
+        "status": "状态",
+        "state_path": "状态文件",
+        "ledger_path": "账本文件",
+        "ready": "已就绪",
+        "warning_count": "警告数",
+        "failure_count": "失败数",
+        "open_positions": "持仓数",
+        "pending_orders": "挂单数",
+        "tracked_notional_usd": "跟踪名义仓位",
+        "internal_realized_pnl": "内部已实现盈亏",
+        "ledger_realized_pnl": "账本已实现盈亏",
+        "internal_vs_ledger_diff": "内部与账本差额",
+        "broker_floor_gap_vs_internal": "券商口径与内部差额",
+        "account_snapshot_age_seconds": "账户快照延迟秒数",
+        "broker_reconcile_age_seconds": "券商对账延迟秒数",
+        "broker_event_sync_age_seconds": "券商事件同步延迟秒数",
+        "total_entries": "总记录数",
+        "fill_count": "成交数",
+        "buy_fill_count": "买入成交数",
+        "sell_fill_count": "卖出成交数",
+        "fill_notional": "成交名义金额",
+        "realized_pnl": "已实现盈亏",
+        "account_sync_count": "账户同步次数",
+        "startup_checks_count": "启动检查次数"
+      },
+      "row": {
+        "source": "{{source}}：成交={{count}} 名义金额={{notional}} 盈亏={{pnl}}",
+        "side": "{{side}}：成交={{count}} 名义金额={{notional}} 盈亏={{pnl}}"
+      },
+      "source": {
+        "unknown": "未知来源",
+        "api": "接口",
+        "paper": "模拟盘",
+        "runner": "运行器",
+        "account_snapshot": "账户快照",
+        "broker_execute": "券商执行",
+        "broker_reconcile": "券商对账",
+        "broker_trades": "券商成交",
+        "broker_open_orders": "券商挂单",
+        "broker_periodic": "券商周期同步",
+        "broker_startup_merge": "券商启动合并",
+        "runtime_snapshot": "运行时快照",
+        "runtime_previous": "上一轮运行时"
+      },
+      "recommendation": {
+        "startup_not_ready": "先处理启动就绪失败项，再评估任何实盘执行指标。",
+        "status_fail": "执行对账失败，账本与状态漂移应视为生产事故处理。",
+        "status_warn": "执行对账存在警告，请检查陈旧挂单和同步新鲜度。",
+        "status_ok": "所选日期的执行对账已对齐。",
+        "no_fill_entries": "所选日期没有记录任何成交。",
+        "internal_ledger_diff": "内部盈亏与账本盈亏存在差异，提升结论前应先完成对账。"
+      }
+    },
+    "fullFlowValidation": {
+      "title": "Polymarket 全链路验证报告",
+      "field": {
+        "generatedAt": "生成时间",
+        "validationStatus": "验证状态",
+        "flowStandardMet": "是否达到全链路标准",
+        "operationalReadiness": "运行就绪度",
+        "startupReady": "启动已就绪",
+        "reconciliationStatus": "对账状态",
+        "monitor30Recommendation": "30 分钟监控建议",
+        "monitor12Recommendation": "12 小时监控建议",
+        "eodStatus": "日终对账状态"
+      },
+      "section": {
+        "stages": "验证阶段",
+        "operationalReadinessDetail": "运行就绪细节",
+        "issues": "问题",
+        "recommendations": "建议"
+      },
+      "row": {
+        "stage": "  [{{status}}] {{name}}：{{message}}",
+        "detail": "    - {{key}}：{{value}}"
+      },
+      "enum": {
+        "status": {
+          "pass": "通过",
+          "fail": "失败",
+          "warn": "警告",
+          "unknown": "未知"
+        },
+        "readiness": {
+          "ready": "就绪",
+          "observe": "观察",
+          "escalate": "升级处理",
+          "block": "阻断",
+          "unknown": "未知"
+        }
+      },
+      "stage": {
+        "stackBootstrapPass": "堆栈已重启并通过校验",
+        "stackBootstrapWarn": "堆栈启动脚本返回非零状态，继续执行直接验证",
+        "stateValidationFailed": "状态校验失败",
+        "stateApiUnavailable": "状态接口不可用或返回的 JSON 无效",
+        "stateTimestampMissing": "状态时间戳缺失",
+        "statePollIntervalMissing": "轮询间隔缺失",
+        "stateStale": "状态已过期：延迟 {{age}}s，最大允许 {{maxAge}}s",
+        "statePayloadFresh": "状态载荷新鲜",
+        "monitorReportGenerated": "{{name}} 报告已生成",
+        "monitorReportGenerationFailed": "{{name}} 报告生成失败",
+        "monitorApiReturned": "{{name}} 接口已返回 JSON 报告",
+        "monitorApiUnavailable": "{{name}} 接口不可用或返回的 JSON 无效",
+        "reconciliationGenerationPass": "操作员接口已生成对账报告",
+        "reconciliationGenerationFail": "操作员接口生成对账报告失败",
+        "reconciliationApiPass": "对账接口已返回 JSON 报告",
+        "reconciliationApiFail": "对账接口不可用或返回的 JSON 无效",
+        "replayRuntimePass": "运行时回放已完成",
+        "replayRuntimeFail": "运行时回放失败",
+        "replayCalibrationPass": "回放校准已完成",
+        "replayCalibrationFail": "回放校准失败"
+      },
+      "recommendation": {
+        "fixFailedStages": "请先修复失败的验证阶段：{{stages}}。",
+        "pass": "全链路验证已通过，接口、报告和回放工具已端到端打通。",
+        "readinessReview": "当前运行就绪度为{{level}}，在将结果视为可晋级前，请复核 startup / reconciliation / monitor 的建议。"
+      }
+    },
+    "readinessBrief": {
+      "title": "Polymarket 上线就绪简报",
+      "na": "无",
+      "field": {
+        "releaseGate": "发布门禁：{{status}}",
+        "checkpointCount": "检查点：{{count}} / {{expected}}",
+        "lastCheckpoint": "最近检查点：{{value}}",
+        "rehearsalRemaining": "演练剩余时间：{{hours}} 小时 {{minutes}} 分 {{seconds}} 秒"
+      },
+      "section": {
+        "blockers": "阻断项",
+        "advisories": "提示项"
+      }
+    },
+    "releaseGate": {
+      "title": "Polymarket 发布门禁",
+      "field": {
+        "status": "状态：{{status}}"
+      },
+      "section": {
+        "blockers": "阻断项",
+        "advisories": "提示项",
+        "checks": "检查项"
+      },
+      "row": {
+        "check": "- {{name}}：{{status}} | {{message}}"
+      },
+      "enum": {
+        "status": {
+          "ready": "就绪",
+          "blocked": "阻断",
+          "caution": "谨慎",
+          "pass": "通过",
+          "fail": "失败",
+          "unknown": "未知"
+        }
+      },
+      "check": {
+        "fullFlowValidation": "full_flow_validation 报告必须存在、为 PASS，且不能处于 BLOCK/ESCALATE",
+        "rehearsal24h": "24 小时 dry-run 演练必须完成全部检查点且无失败",
+        "remoteAlertSmoke": "远程告警 smoke 必须成功发送到真实配置的通道",
+        "liveSmokePreflight": "实盘 smoke 预检必须在真实配置环境下返回 ready",
+        "liveSmokeExecution": "必须存在真实实盘 smoke 执行摘要且执行成功",
+        "operatorDocs": "签核 / 发布 / 交接草稿中不能残留未解决占位符"
+      },
+      "blocker": {
+        "fullFlowValidationNotPass": "full_flow_validation 未通过 PASS",
+        "operationalReadinessBlocked": "运行就绪度当前为{{level}}",
+        "rehearsalNotClean": "24 小时 dry-run 演练未干净完成",
+        "remoteAlertSmokeFailed": "远程告警 smoke 发送失败",
+        "liveSmokePreflightNotReady": "实盘 smoke 预检未就绪",
+        "liveSmokeExecutionFailed": "实盘 smoke 执行摘要缺失或失败",
+        "operatorDocsPlaceholders": "操作员签核 / 发布 / 交接草稿仍含未解决占位符"
+      },
+      "advisory": {
+        "operationalReadinessObserve": "运行就绪度仍处于 observe"
+      }
+    },
+    "alertDelivery": {
+      "status": {
+        "blocked": "阻断",
+        "ready_to_send": "待发送",
+        "sent": "已发送",
+        "failed": "失败"
+      },
+      "blocker": {
+        "remoteChannelNotConfigured": "未配置远程告警通道",
+        "deliveryFailed": "一个或多个已配置告警通道投递失败"
+      }
+    },
+    "alertDeliveryLocal": {
+      "status": {
+        "sent": "已发送",
+        "failed": "失败"
+      }
+    }
+  },
+  "notification": {
+    "tradingMode": {
+      "persistenceFault": {
+        "title": "{{mode}} · 持久化故障",
+        "body": "模式={{mode}} | 类型={{kind}} | 路径={{path}} | 错误={{error}}",
+        "errorUnknown": "未知错误"
+      },
+      "startupGateBlocked": {
+        "title": "{{mode}} · 启动门禁阻断",
+        "body": "启动失败={{failures}} | 警告={{warnings}} | 准入门禁正在阻止新的 BUY"
+      },
+      "accountStateProtect": {
+        "title": "{{mode}} · 账户状态保护",
+        "body": "账户状态={{accountState}} | 在账户快照恢复前，准入门禁将阻止新的 BUY"
+      },
+      "reconciliationProtect": {
+        "title": "{{mode}} · 对账保护",
+        "body": "状态={{status}} | 待确认挂单={{ambiguousPendingOrders}} | 问题={{issues}}",
+        "defaultIssues": "暂无问题详情"
+      },
+      "haltedTradingStopped": {
+        "title": "已停机 · 交易已停止",
+        "body": "主原因={{primaryReason}} | 原因={{reasons}} | 可能需要人工介入"
+      }
+    },
+    "candidate": {
+      "title": "{{action}} · {{market}}",
+      "body": "{{walletLabel}} 钱包 {{walletScore}} 分 | {{outcome}} · {{notional}}U{{spread}}{{chase}}{{reason}}",
+      "spread": " | 点差 {{value}}%",
+      "chase": " | 追价 {{value}}%",
+      "reason": " | {{value}}"
+    }
+  }
+}

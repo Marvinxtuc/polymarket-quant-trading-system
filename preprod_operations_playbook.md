@@ -6,8 +6,8 @@
 
 | 时间点 | 观察项 | 通过标准 | 异常处理 |
 |---|---|---|---|
-| T0（切换后 0~5 分钟） | `make verify`、`/api/state` | `make verify` 成功；`state.ts` 新鲜（`age <= 3 * poll`） | 立即执行回退流程（下文），先排查端口与服务状态 |
-| T0+5 分钟 | 控制面板状态 | `pause_opening=false`、`reduce_only=false`、`emergency_stop=false`；按钮状态与 API 一致 | 调用控制接口刷新状态，必要时重启 |
+| T0（切换后 0~5 分钟） | `make verify`、`/api/state` | `make verify` 成功；`state.ts` 新鲜（`age <= 3 * poll`）；bootstrap state 可在约 15 秒内出现 | 立即执行回退流程（下文），先排查端口与服务状态 |
+| T0+5 分钟 | 控制面板状态 | 灰度验证阶段默认 `pause_opening=true`、`decision_mode=manual`；`trading_mode=REDUCE_ONLY`；按钮状态与 API 一致 | 调用控制接口刷新状态，必要时重启 |
 | T0+10 分钟 | 风险预算与执行行为 | `tracked_notional_usd` 不出现异常突增；有成交时无明显异常日志 | 记录异常信号与市场，先 `pause_opening=true` |
 | T0+15 分钟 | 仓位边界 | `open_positions <= max_open_positions` | 触发上限保护：`pause_opening=true` 并复盘 |
 | 每 30 分钟（T0+30、+60、+90） | 日内风控 | `daily_loss_used_pct` 持续可控；`slot_utilization_pct` 不突涨 | 若偏离，`pause_opening=true`，必要时 `reduce_only=true` |
@@ -23,6 +23,9 @@
 | 每 1 小时 | `make verify`（每小时 1 次） | 连续通过；`state` 可读、时间新鲜 | 首次失败先执行回退流程，并保留日志 |
 | 每 1 小时 | 风险健康 | `daily_loss_used_pct` 低于设定上限；`notional_utilization_pct` 平稳 | 接近上限时 `pause_opening=true` |
 | 每 1 小时 | 订单质量 | 成交/失败可解释，失败原因可追踪 | 连续失败抬升则 `reduce_only=true` |
+| 每 1 小时 | 保护链演练 | `make fault-drill` 通过，至少确认 startup gate / persistence halt / reconcile ambiguity 三类保护仍可用 | 任一 drill 失败则停止放量，先修保护链 |
+| 每 1 小时 | 验收与运营门禁 | `make full-validate` 可通过；注意区分 `validation_status=PASS` 与 `operational_readiness=OBSERVE/ESCALATE/BLOCK` | `PASS` 但 `OBSERVE` 时继续观察，不放量、不解除 `pause_opening` |
+| 放行前最后一步 | 统一准入 gate | `make release-gate`，要求 `status=READY` | `BLOCKED/CAUTION` 时逐项清空 blocker/advisory，禁止放行 |
 | 每 2 小时 | 面板可用性 | `execution_mode / broker_name / control` 持续与预期一致 | web 不响应时重启服务并检查端口 |
 | 每 2 小时 | 运行可靠性 | 无端口漂移、无反复重启 | 处理旧进程/端口占用，验证 PID 与监听归属 |
 | 每 2 小时 | 仓位行为 | `open_positions` 与策略预期一致 | 长期贴边运行时暂停开仓观察 |
@@ -48,12 +51,59 @@
 
 ```bash
 make verify
-curl -s http://127.0.0.1:8787/api/state | jq '.summary, .control, .config'
-curl -s http://127.0.0.1:8787/api/control | jq .
+make full-validate
+make fault-drill
+make release-gate
+make readiness-brief
+make rehearsal-finalize
+make rehearse-24h-dry-run
+make rehearse-24h-progress
+curl -s "http://127.0.0.1:8787/api/state?token=$POLY_CONTROL_TOKEN" | jq '.summary, .control, .trading_mode, .reconciliation, .persistence'
+curl -s "http://127.0.0.1:8787/api/control?token=$POLY_CONTROL_TOKEN" | jq .
 lsof -nP -iTCP:8787 -sTCP:LISTEN
-tail -n 120 /tmp/poly_runtime_data/poly_bot.log
-tail -n 120 /tmp/poly_runtime_data/poly_web.log
+BOT_LOG="$(PYTHONPATH=src .venv/bin/python scripts/runtime_paths.py bot_log_path)"; tail -n 120 "$BOT_LOG"
+WEB_LOG="$(PYTHONPATH=src .venv/bin/python scripts/runtime_paths.py web_log_path)"; tail -n 120 "$WEB_LOG"
 ```
+
+值守时先看 3 个结论再决定是否继续放量：
+
+1. `validation_status / flow_standard_met`
+2. `operational_readiness`
+3. dashboard 里的 `trading_mode / reconciliation / persistence`
+
+`make rehearse-24h-dry-run` 会把本机 stack 切到 `DRY_RUN=true` 的 paper 模式并在同一端口启动 24h 观察。
+`make rehearsal-finalize` 会在 rehearsal 完成后统一执行最后一轮收尾检查；如果 rehearsal 还没跑满，它会安全返回 `PENDING`，不去乱跑后置动作。
+当前默认启动路径是 direct + nohup；monitor scheduler 在 launchd 无法稳定访问仓库脚本时会自动回退到 namespaced nohup。
+如果 `./scripts/monitor_scheduler_status.sh` 返回 `status=stale`，表示 method 文件还在，但记录的 nohup pid 已经死亡；此时不要把它当成“仍在后台运行”，应先看 `log=` 指向的日志，再重新执行 `make monitor-scheduler-install`。
+值守前可以直接跑 `make monitor-scheduler-smoke`，它会演练一次“活 pid -> stale pid -> 重装恢复”的完整检查。
+值守前还应跑两条前置检查：
+
+1. `make alert-smoke`
+   当前如果返回 `remote alert channel not configured`，必须先补 webhook / Telegram 再进入 live smoke。
+   最低配置要求是：
+   - webhook：`NOTIFY_WEBHOOK_URL` 或 `NOTIFY_WEBHOOK_URLS`
+   - Telegram：`NOTIFY_TELEGRAM_BOT_TOKEN` + `NOTIFY_TELEGRAM_CHAT_ID`
+2. `make live-smoke-preflight`
+   只有它通过后，才允许进入真实 `live connectivity` 烟测。
+3. 真实 smoke 统一入口：
+   `LIVE_SMOKE_ACK=YES LIVE_SMOKE_TOKEN_ID=<token_id> make live-smoke`
+   这个入口会先跑 preflight，并把单腿 notional 默认限制在小额范围；成功后还会写入 `live_smoke_execution_summary.json`。
+4. 如果 `paper` rehearsal 正占着 `8787`，可以用
+   `STACK_WEB_PORT=8788 START_STACK_DISABLE_LAUNCHCTL=1 ./scripts/start_poly_stack.sh`
+   临时拉起 fresh 的 live stack，再做 live preflight；不需要先停掉 rehearsal。
+5. 真正准备放行前，再跑一次：
+   `make release-gate`
+   这个入口会统一读取 `full_flow_validation_report.json`、`24h_dry_run_rehearsal.txt`、`alert_delivery_smoke.json`、`live_smoke_preflight.json`、`live_smoke_execution_summary.json` 和会签草案，给出 `READY / CAUTION / BLOCKED`。
+6. 值守或等待 rehearsal 结束时，可以随时跑：
+   `make readiness-brief`
+   它会输出当前 release gate、checkpoint 数、最近一个 checkpoint 和 rehearsal 剩余时间，适合快速同步现场状态。
+
+关键失败现在会通过 notifier 统一走一套报警口径，值守时重点关注：
+
+1. `startup gate blocked`
+2. `account state protect`
+3. `reconciliation protect`
+4. `HALTED · persistence fault` / `HALTED · trading stopped`
 
 ## 五、操作动作（5 分钟标准流程）
 
@@ -63,16 +113,22 @@ tail -n 120 /tmp/poly_runtime_data/poly_web.log
 4. 快速对账：`state.json`、`open_positions`、`orders`、`positions`
 5. 恢复前必须执行 `make verify` 两次成功
 
+值守交接与上线留痕统一使用以下模板：
+
+- [production_signoff_template.md](/Users/marvin.xa/Desktop/Polymarket/production_signoff_template.md)
+- [production_release_record_template.md](/Users/marvin.xa/Desktop/Polymarket/production_release_record_template.md)
+- [operations_handoff_template.md](/Users/marvin.xa/Desktop/Polymarket/operations_handoff_template.md)
+
 ## 六、12 小时复盘模板（可直接粘贴）
 
 ### 12h Live Checkpoint Report（模板）
 
 | 时间 | 区间 | 关键指标 | 观测结果 | 告警 | 动作 | 结果/结论 |
 |---|---|---|---|---:|---|---|
-| ___ | T0~T1 | state 新鲜度/服务健康 | `age=__s`, `make verify`=通过/失败 | `pass/fail` | 无 | 结论 |
+| ___ | T0~T1 | state 新鲜度/服务健康 | `age=__s`, `make verify`=通过/失败, `full-validate`=PASS/FAIL | `pass/fail` | 无 | 结论 |
 | ___ | T1~T2 | 风控状态 | `open_positions=__/__`, `tracked_notional_usd=$__`, `available_notional_usd=$__` | `pass/fail` | 无 | 结论 |
 | ___ | T1~T2 | 订单质量 | `filled=__`, `reject=__`, `reject_reason=__` | `pass/fail` | 无 | 结论 |
-| ___ | T2~T4 | 控制行为 | `pause_opening=__`, `reduce_only=__`, `emergency_stop=__` | `pass/fail` | 无 | 结论 |
+| ___ | T2~T4 | 控制行为 | `pause_opening=__`, `reduce_only=__`, `emergency_stop=__`, `trading_mode=__` | `pass/fail` | 无 | 结论 |
 | ___ | T2~T4 | 仓位与策略一致性 | `sources/wallets` 变动说明 | `pass/fail` | 无 | 结论 |
 | ___ | T4~T6 | 失败率与风控偏差 | `daily_loss_used_pct=__%`, `slot_utilization=__%` | `pass/fail` | 必要时 pause/reduce | 结论 |
 | ___ | T6~T8 | 运行稳定性 | 进程/端口异常次数 | `pass/fail` | 清理/重启 | 结论 |

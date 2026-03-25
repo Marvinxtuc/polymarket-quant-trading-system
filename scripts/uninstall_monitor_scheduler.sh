@@ -2,14 +2,35 @@
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PY_BIN="$BASE/.venv/bin/python"
 LAUNCHCTL_BIN="/bin/launchctl"
 LAUNCHD_DIR="$HOME/Library/LaunchAgents"
-LABEL="com.poly.market.monitor-reports"
-PLIST="$LAUNCHD_DIR/$LABEL.plist"
 UID_NUM="$(id -u)"
-RUNTIME_DIR="/tmp/poly_monitor_reports"
-BUNDLE_DIR="/tmp/poly_monitor_scheduler_bundle"
-METHOD_FILE="$RUNTIME_DIR/method"
+LABEL=""
+PLIST=""
+RUNTIME_DIR=""
+METHOD_FILE=""
+LEGACY_LABEL="com.poly.market.monitor-reports"
+LEGACY_PLIST="$LAUNCHD_DIR/$LEGACY_LABEL.plist"
+LEGACY_RUNTIME_DIR="/tmp/poly_monitor_reports"
+LEGACY_BUNDLE_DIR="/tmp/poly_monitor_scheduler_bundle"
+
+resolve_runtime_paths() {
+  local runtime_py="$PY_BIN"
+  if [[ ! -x "$runtime_py" ]]; then
+    runtime_py="$(command -v python3)"
+  fi
+  eval "$("$runtime_py" "$BASE/scripts/runtime_paths.py" --format shell runtime_dir monitor_reports_dir)"
+  local mode identity
+  mode="$(basename "$(dirname "$RUNTIME_DIR")")"
+  identity="$(basename "$RUNTIME_DIR")"
+  LABEL="com.poly.market.monitor-reports.${mode}.${identity}"
+  PLIST="$LAUNCHD_DIR/$LABEL.plist"
+  RUNTIME_DIR="$MONITOR_REPORTS_DIR"
+  METHOD_FILE="$RUNTIME_DIR/method"
+}
+
+resolve_runtime_paths
 
 if [[ -f "$PLIST" ]]; then
   if [[ ! -x "$LAUNCHCTL_BIN" ]]; then
@@ -18,9 +39,20 @@ if [[ -f "$PLIST" ]]; then
   fi
   "$LAUNCHCTL_BIN" bootout "gui/$UID_NUM/$LABEL" >/dev/null 2>&1 || true
   rm -f "$PLIST"
-  rm -rf "$BUNDLE_DIR"
   rm -f "$METHOD_FILE"
   echo "monitor reports launchd removed: $LABEL"
+fi
+
+if [[ -f "$LEGACY_PLIST" ]]; then
+  if [[ ! -x "$LAUNCHCTL_BIN" ]]; then
+    echo "launchctl not available" >&2
+    exit 1
+  fi
+  "$LAUNCHCTL_BIN" bootout "gui/$UID_NUM/$LEGACY_LABEL" >/dev/null 2>&1 || true
+  rm -f "$LEGACY_PLIST"
+  rm -rf "$LEGACY_BUNDLE_DIR"
+  rm -f "$LEGACY_RUNTIME_DIR/method"
+  echo "legacy monitor reports launchd removed: $LEGACY_LABEL"
 fi
 
 if [[ -f "$METHOD_FILE" ]]; then
@@ -30,7 +62,6 @@ if [[ -f "$METHOD_FILE" ]]; then
     echo "monitor reports nohup process stopped"
   fi
   rm -f "$METHOD_FILE"
-  rm -rf "$BUNDLE_DIR"
   exit 0
 fi
 

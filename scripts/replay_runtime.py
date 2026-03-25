@@ -7,7 +7,19 @@ from collections.abc import Iterator
 from datetime import datetime, timezone
 import json
 from pathlib import Path
+import sys
 from typing import Any
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from polymarket_bot.i18n import t as i18n_t
+
+
+def _replay_t(key: str, params: dict[str, object] | None = None, *, fallback: str = "") -> str:
+    return i18n_t(f"report.replayRuntime.{key}", dict(params or {}), fallback=fallback)
 
 
 def _load_json(path: Path) -> dict[str, Any] | None:
@@ -88,10 +100,16 @@ def _replay_positions(events: list[dict[str, Any]]) -> tuple[list[dict[str, Any]
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Replay and summarize polymarket runtime artifacts")
+    parser = argparse.ArgumentParser(
+        description=_replay_t("cli.description", fallback="Replay and summarize polymarket runtime artifacts")
+    )
     parser.add_argument("--runtime-state", default="/tmp/poly_runtime_data/runtime_state.json")
     parser.add_argument("--events", default="/tmp/poly_runtime_data/events.ndjson")
-    parser.add_argument("--json", action="store_true", help="Output summary as JSON")
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help=_replay_t("cli.json", fallback="Output summary as JSON"),
+    )
     args = parser.parse_args()
 
     runtime_path = Path(args.runtime_state).expanduser()
@@ -174,32 +192,86 @@ def main() -> int:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return 0
 
-    print("-- runtime state --")
+    print(_replay_t("section.runtimeState", fallback="-- runtime state --"))
     runtime_section = summary["runtime_state"]
-    print(f"path: {runtime_section['path']}")
-    print(f"exists: {runtime_section['exists']}")
-    print(f"version: {runtime_section['runtime_version']}")
-    print(f"ts: {runtime_section['timestamp']}")
-    print(f"open_positions: {runtime_section['open_positions']}")
-    print(f"tracked_notional_usd: {runtime_section['tracked_notional_usd']:.4f}")
+    print(_replay_t("field.path", {"value": runtime_section["path"]}, fallback=f"path: {runtime_section['path']}"))
+    print(_replay_t("field.exists", {"value": runtime_section["exists"]}, fallback=f"exists: {runtime_section['exists']}"))
+    print(_replay_t("field.version", {"value": runtime_section["runtime_version"]}, fallback=f"version: {runtime_section['runtime_version']}"))
+    print(_replay_t("field.timestamp", {"value": runtime_section["timestamp"]}, fallback=f"ts: {runtime_section['timestamp']}"))
+    print(
+        _replay_t(
+            "field.openPositions",
+            {"value": runtime_section["open_positions"]},
+            fallback=f"open_positions: {runtime_section['open_positions']}",
+        )
+    )
+    print(
+        _replay_t(
+            "field.trackedNotionalUsd",
+            {"value": f"{runtime_section['tracked_notional_usd']:.4f}"},
+            fallback=f"tracked_notional_usd: {runtime_section['tracked_notional_usd']:.4f}",
+        )
+    )
 
-    print("\n-- events --")
+    print("\n" + _replay_t("section.events", fallback="-- events --"))
     events_section = summary["events"]
-    print(f"path: {events_section['path']}")
-    print(f"exists: {events_section['exists']}")
-    print(f"count: {events_section['count']}")
-    print(f"last_event_ts: {events_section['last_event_ts']}")
-    print(f"total_buy_notional: {events_section['total_buy_notional']:.4f}")
-    print(f"total_sell_notional: {events_section['total_sell_notional']:.4f}")
+    print(_replay_t("field.path", {"value": events_section["path"]}, fallback=f"path: {events_section['path']}"))
+    print(_replay_t("field.exists", {"value": events_section["exists"]}, fallback=f"exists: {events_section['exists']}"))
+    print(_replay_t("field.count", {"value": events_section["count"]}, fallback=f"count: {events_section['count']}"))
+    print(
+        _replay_t(
+            "field.lastEventTs",
+            {"value": events_section["last_event_ts"]},
+            fallback=f"last_event_ts: {events_section['last_event_ts']}",
+        )
+    )
+    print(
+        _replay_t(
+            "field.totalBuyNotional",
+            {"value": f"{events_section['total_buy_notional']:.4f}"},
+            fallback=f"total_buy_notional: {events_section['total_buy_notional']:.4f}",
+        )
+    )
+    print(
+        _replay_t(
+            "field.totalSellNotional",
+            {"value": f"{events_section['total_sell_notional']:.4f}"},
+            fallback=f"total_sell_notional: {events_section['total_sell_notional']:.4f}",
+        )
+    )
     for typ, qty in sorted(events_section["types"].items()):
-        print(f"  {typ}: {qty}")
+        print(_replay_t("row.eventType", {"type": typ, "count": qty}, fallback=f"  {typ}: {qty}"))
 
-    print("\n-- replay --")
+    print("\n" + _replay_t("section.replay", fallback="-- replay --"))
     replay_section = summary["replay"]
-    print(f"reconstructed_open_positions: {replay_section['reconstructed_open_positions']}")
-    print(f"reconstructed_tracked_notional_usd: {replay_section['reconstructed_tracked_notional_usd']:.4f}")
-    print(f"delta_positions: {summary['drift']['positions_delta']}")
-    print(f"delta_notional_usd: {summary['drift']['notional_delta_usd']:.4f}")
+    print(
+        _replay_t(
+            "field.reconstructedOpenPositions",
+            {"value": replay_section["reconstructed_open_positions"]},
+            fallback=f"reconstructed_open_positions: {replay_section['reconstructed_open_positions']}",
+        )
+    )
+    print(
+        _replay_t(
+            "field.reconstructedTrackedNotionalUsd",
+            {"value": f"{replay_section['reconstructed_tracked_notional_usd']:.4f}"},
+            fallback=f"reconstructed_tracked_notional_usd: {replay_section['reconstructed_tracked_notional_usd']:.4f}",
+        )
+    )
+    print(
+        _replay_t(
+            "field.deltaPositions",
+            {"value": summary["drift"]["positions_delta"]},
+            fallback=f"delta_positions: {summary['drift']['positions_delta']}",
+        )
+    )
+    print(
+        _replay_t(
+            "field.deltaNotionalUsd",
+            {"value": f"{summary['drift']['notional_delta_usd']:.4f}"},
+            fallback=f"delta_notional_usd: {summary['drift']['notional_delta_usd']:.4f}",
+        )
+    )
 
     return 0
 

@@ -7,6 +7,37 @@ window_sec="${3:-1800}"
 state_file="${4:-/tmp/poly_monitor_30m_inconclusive_state}"
 daemon_state_file="${5:-/tmp/poly_runtime_data/state.json}"
 json_out="${6:-/tmp/poly_monitor_30m_report.json}"
+state_api_url="http://127.0.0.1:8787/api/state"
+
+read_dotenv_var() {
+  local key="$1"
+  local dotenv="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/.env"
+  [[ -f "$dotenv" ]] || return 0
+  awk -F= -v key="$key" '
+    $0 ~ "^[[:space:]]*" key "=" {
+      sub(/^[[:space:]]*[^=]+=/, "", $0)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+      gsub(/^"|"$/, "", $0)
+      gsub(/^'\''|'\''$/, "", $0)
+      print $0
+      exit
+    }
+  ' "$dotenv"
+}
+
+append_control_token() {
+  local url="$1"
+  local token="${POLY_CONTROL_TOKEN:-$(read_dotenv_var POLY_CONTROL_TOKEN)}"
+  if [[ -z "${token:-}" ]] || [[ "$url" == *"token="* ]]; then
+    printf '%s\n' "$url"
+    return 0
+  fi
+  if [[ "$url" == *"?"* ]]; then
+    printf '%s&token=%s\n' "$url" "$token"
+  else
+    printf '%s?token=%s\n' "$url" "$token"
+  fi
+}
 
 json_number_or_null() {
   local value="$1"
@@ -118,18 +149,31 @@ recon_broker_reconcile_age="NA"
 recon_event_age="NA"
 startup_json='{}'
 reconciliation_json='{}'
-if [[ -f "$daemon_state_file" ]]; then
-  startup_ready="$(jq -r 'if .startup.ready == true then "true" elif .startup.ready == false then "false" else "unknown" end' "$daemon_state_file" 2>/dev/null || printf 'unknown')"
-  recon_status="$(jq -r '.reconciliation.status // "unknown"' "$daemon_state_file" 2>/dev/null || printf 'unknown')"
-  recon_issues="$(jq -r '(.reconciliation.issues // []) | if length == 0 then "(none)" else join("; ") end' "$daemon_state_file" 2>/dev/null || printf '(state parse failed)')"
-  recon_internal_ledger_diff="$(jq -r '.reconciliation.internal_vs_ledger_diff // "NA"' "$daemon_state_file" 2>/dev/null || printf 'NA')"
-  recon_broker_floor_gap="$(jq -r '.reconciliation.broker_floor_gap_vs_internal // "NA"' "$daemon_state_file" 2>/dev/null || printf 'NA')"
-  recon_stale_pending="$(jq -r '.reconciliation.stale_pending_orders // "NA"' "$daemon_state_file" 2>/dev/null || printf 'NA')"
-  recon_account_age="$(jq -r '.reconciliation.account_snapshot_age_seconds // "NA"' "$daemon_state_file" 2>/dev/null || printf 'NA')"
-  recon_broker_reconcile_age="$(jq -r '.reconciliation.broker_reconcile_age_seconds // "NA"' "$daemon_state_file" 2>/dev/null || printf 'NA')"
-  recon_event_age="$(jq -r '.reconciliation.broker_event_sync_age_seconds // "NA"' "$daemon_state_file" 2>/dev/null || printf 'NA')"
-  startup_json="$(jq -c '.startup // {}' "$daemon_state_file" 2>/dev/null || printf '{}')"
-  reconciliation_json="$(jq -c '.reconciliation // {}' "$daemon_state_file" 2>/dev/null || printf '{}')"
+resolved_state_payload="$(mktemp)"
+cleanup_payload() {
+  rm -f "$resolved_state_payload"
+}
+trap cleanup_payload EXIT
+if ! curl -fsS --max-time 5 "$(append_control_token "$state_api_url")" > "$resolved_state_payload" 2>/dev/null; then
+  if [[ -f "$daemon_state_file" ]]; then
+    cp "$daemon_state_file" "$resolved_state_payload"
+  else
+    rm -f "$resolved_state_payload"
+    resolved_state_payload=""
+  fi
+fi
+if [[ -n "${resolved_state_payload:-}" && -f "$resolved_state_payload" ]]; then
+  startup_ready="$(jq -r 'if .startup.ready == true then "true" elif .startup.ready == false then "false" else "unknown" end' "$resolved_state_payload" 2>/dev/null || printf 'unknown')"
+  recon_status="$(jq -r '.reconciliation.status // "unknown"' "$resolved_state_payload" 2>/dev/null || printf 'unknown')"
+  recon_issues="$(jq -r '(.reconciliation.issues // []) | if length == 0 then "(none)" else join("; ") end' "$resolved_state_payload" 2>/dev/null || printf '(state parse failed)')"
+  recon_internal_ledger_diff="$(jq -r '.reconciliation.internal_vs_ledger_diff // "NA"' "$resolved_state_payload" 2>/dev/null || printf 'NA')"
+  recon_broker_floor_gap="$(jq -r '.reconciliation.broker_floor_gap_vs_internal // "NA"' "$resolved_state_payload" 2>/dev/null || printf 'NA')"
+  recon_stale_pending="$(jq -r '.reconciliation.stale_pending_orders // "NA"' "$resolved_state_payload" 2>/dev/null || printf 'NA')"
+  recon_account_age="$(jq -r '.reconciliation.account_snapshot_age_seconds // "NA"' "$resolved_state_payload" 2>/dev/null || printf 'NA')"
+  recon_broker_reconcile_age="$(jq -r '.reconciliation.broker_reconcile_age_seconds // "NA"' "$resolved_state_payload" 2>/dev/null || printf 'NA')"
+  recon_event_age="$(jq -r '.reconciliation.broker_event_sync_age_seconds // "NA"' "$resolved_state_payload" 2>/dev/null || printf 'NA')"
+  startup_json="$(jq -c '.startup // {}' "$resolved_state_payload" 2>/dev/null || printf '{}')"
+  reconciliation_json="$(jq -c '.reconciliation // {}' "$resolved_state_payload" 2>/dev/null || printf '{}')"
 fi
 
 final_recommendation="$recommendation"

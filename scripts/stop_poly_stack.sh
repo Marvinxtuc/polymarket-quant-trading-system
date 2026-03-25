@@ -2,14 +2,28 @@
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUNTIME_DATA="/tmp/poly_runtime_data"
-WEB_PID_FILE="$RUNTIME_DATA/poly_web.pid"
-BOT_PID_FILE="$RUNTIME_DATA/poly_bot.pid"
+PY_BIN="$BASE/.venv/bin/python"
+RUNTIME_DATA=""
+WEB_PID_FILE=""
+BOT_PID_FILE=""
+PUBLIC_STATE_PATH=""
 STACK_WEB_PORT=8787
 LAUNCHCTL_BIN="/bin/launchctl"
 UID_NUM="$(id -u)"
 WEB_LABEL="ai.poly.web"
 BOT_LABEL="ai.poly.bot"
+
+resolve_runtime_paths() {
+  local runtime_py="$PY_BIN"
+  if [[ ! -x "$runtime_py" ]]; then
+    runtime_py="$(command -v python3)"
+  fi
+  eval "$("$runtime_py" "$BASE/scripts/runtime_paths.py" --format shell runtime_dir public_state_path)"
+  RUNTIME_DATA="$RUNTIME_DIR"
+  PUBLIC_STATE_PATH="$PUBLIC_STATE_PATH"
+  WEB_PID_FILE="$RUNTIME_DATA/poly_web.pid"
+  BOT_PID_FILE="$RUNTIME_DATA/poly_bot.pid"
+}
 
 launchctl_domain_label() {
   local label="$1"
@@ -53,6 +67,7 @@ kill_patterns() {
 }
 
 echo "Stopping polymarket stack..."
+resolve_runtime_paths
 if [[ -x "$BASE/scripts/stop_monitor_reports.sh" ]]; then
   "$BASE/scripts/stop_monitor_reports.sh" >/dev/null 2>&1 || true
 fi
@@ -63,6 +78,6 @@ kill_pid_file "$BOT_PID_FILE"
 kill_patterns
 kill_port
 rm -f "$RUNTIME_DATA/state.json" "$RUNTIME_DATA/state.json.tmp" "$RUNTIME_DATA/poly_web.log" "$RUNTIME_DATA/poly_bot.log"
-rm -f /tmp/poly_public_state.json
+rm -f "$PUBLIC_STATE_PATH"
 
 echo "Stack stop complete."

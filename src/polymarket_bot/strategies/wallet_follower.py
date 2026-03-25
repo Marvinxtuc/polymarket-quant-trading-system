@@ -6,7 +6,7 @@ from datetime import datetime, timezone
 import re
 import time
 
-from polymarket_bot.clients.data_api import ActivityEvent, PolymarketDataClient, Position, TradeFill
+from polymarket_bot.clients.data_api import ActivityEvent, MarketMetadata, PolymarketDataClient, Position, TradeFill
 from polymarket_bot.types import Signal
 from polymarket_bot.wallet_history import infer_market_topic
 from polymarket_bot.wallet_scoring import RealizedWalletMetrics, SmartWalletScorer
@@ -18,6 +18,7 @@ _MARKET_WINDOW_SECONDS = {
     "30m": 1800,
     "1h": 3600,
 }
+_MARKET_METADATA_CACHE_TTL_SECONDS = 300
 _SHORT_WINDOW_EDGE_ASK = 0.97
 
 
@@ -172,6 +173,7 @@ class WalletFollowerStrategy:
     _wallet_event_watermark_keys: dict[str, set[str]] = field(default_factory=dict)
     _wallet_seen_tokens: dict[str, set[str]] = field(default_factory=dict)
     _live_market_cache: dict[str, tuple[int, float, float]] = field(default_factory=dict)
+    _market_metadata_cache: dict[str, tuple[int, MarketMetadata | None]] = field(default_factory=dict)
 
     def update_wallet_activity_counts(self, counts: Mapping[str, int], *, available: bool = True) -> None:
         normalized: dict[str, int] = {}
@@ -1172,6 +1174,41 @@ class WalletFollowerStrategy:
             return None, None, None
         return start_ts, duration_seconds, start_ts + duration_seconds
 
+    @staticmethod
+    def _market_metadata_cache_key(*, condition_id: str = "", market_slug: str = "") -> str:
+        normalized_condition = str(condition_id or "").strip().lower()
+        if normalized_condition:
+            return f"condition:{normalized_condition}"
+        normalized_slug = str(market_slug or "").strip().lower()
+        if normalized_slug:
+            return f"slug:{normalized_slug}"
+        return ""
+
+    def _market_metadata(self, *, condition_id: str = "", market_slug: str = "") -> MarketMetadata | None:
+        cache_key = self._market_metadata_cache_key(condition_id=condition_id, market_slug=market_slug)
+        if not cache_key:
+            return None
+        now_ts = int(time.time())
+        cached = self._market_metadata_cache.get(cache_key)
+        if cached is not None:
+            fetched_ts, metadata = cached
+            if fetched_ts > 0 and (now_ts - int(fetched_ts)) <= _MARKET_METADATA_CACHE_TTL_SECONDS:
+                return metadata
+        getter = getattr(self.client, "get_market_metadata", None)
+        metadata: MarketMetadata | None = None
+        if callable(getter):
+            try:
+                metadata = getter(str(condition_id or "").strip(), slug=str(market_slug or "").strip() or None)
+            except Exception:
+                metadata = None
+        self._market_metadata_cache[cache_key] = (now_ts, metadata)
+        if metadata is not None:
+            if metadata.condition_id:
+                self._market_metadata_cache[self._market_metadata_cache_key(condition_id=metadata.condition_id)] = (now_ts, metadata)
+            if metadata.market_slug:
+                self._market_metadata_cache[self._market_metadata_cache_key(market_slug=metadata.market_slug)] = (now_ts, metadata)
+        return metadata
+
     def _live_market_snapshot(self, token_id: str) -> tuple[float, float] | None:
         token_key = str(token_id or "").strip()
         if not token_key:
@@ -1211,6 +1248,7 @@ class WalletFollowerStrategy:
         if signal.side != "BUY":
             return False
         snapshot = self._live_market_snapshot(signal.token_id)
+        metadata = self._market_metadata(condition_id=str(signal.condition_id or ""), market_slug=str(signal.market_slug or ""))
         best_ask = 0.0
         if snapshot is not None:
             _, best_ask = snapshot
@@ -1218,6 +1256,16 @@ class WalletFollowerStrategy:
                 chase_pct = ((best_ask - float(signal.price_hint)) / float(signal.price_hint)) * 100.0
                 if chase_pct >= float(self.live_buy_max_chase_pct):
                     return True
+
+        if metadata is not None:
+            if metadata.closed:
+                return True
+            if metadata.active is False:
+                return True
+            if metadata.accepting_orders is False:
+                return True
+            if metadata.end_ts is not None and int(metadata.end_ts) <= int(time.time()):
+                return True
 
         _, market_window_seconds, market_end_ts = self._market_window_bounds(signal.market_slug)
         if market_window_seconds is None or market_end_ts is None or market_window_seconds > 900:

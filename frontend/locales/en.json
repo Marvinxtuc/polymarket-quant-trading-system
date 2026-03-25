@@ -1,0 +1,2955 @@
+{
+  "app": {
+    "title": "Polymarket Trading Dashboard",
+    "systemName": "Polymarket Trading System",
+    "statusLine": "Smart-wallet ledger · state {{time}} · bot poll {{pollSeconds}}s · frontend refresh {{refreshSeconds}}s",
+    "guardLine": "{{mode}} · {{broker}} · base {{basePerTrade}}U · theoretical max {{maxPerTrade}}U",
+    "modeNote": {
+      "live": "{{broker}} · real orders enabled",
+      "paper": "{{broker}} · paper trading only"
+    },
+    "liveStatus": {
+      "online": "Online"
+    },
+    "modeBadge": {
+      "paper": "PAPER",
+      "live": "LIVE"
+    },
+    "control": {
+      "pauseOpening": {
+        "enable": "Pause Opening",
+        "disable": "Resume Opening"
+      },
+      "reduceOnly": {
+        "enable": "Reduce-Only",
+        "disable": "Disable Reduce-Only"
+      },
+      "emergencyStop": {
+        "enable": "Emergency Stop",
+        "disable": "Clear Emergency Stop"
+      }
+    }
+  },
+  "nav": {
+    "workspace": {
+      "overview": "Overview",
+      "wallets": "Wallets",
+      "ops": "Ops",
+      "review": "Review"
+    },
+    "candidateFocus": {
+      "summary": "Candidate Summary",
+      "detail": "Full Replay"
+    }
+  },
+  "workspace": {
+    "meta": {
+      "overview": "Current view: overview, focused on decisions, positions, orders, and critical alerts.",
+      "wallets": "Current view: wallets, focused on the core wallet pool, profiles, scores, and source quality.",
+      "ops": "Current view: ops, focused on startup, monitor, reconciliation, risk, and runtime status.",
+      "review": "Current view: review, focused on archives, journal, signal replay, attribution, and exit samples."
+    }
+  },
+  "common": {
+    "waitingData": "Waiting for data...",
+    "waiting": "Waiting...",
+    "loading": "Loading...",
+    "unavailable": "Unavailable",
+    "unknown": "Unknown",
+    "unknownShort": "--",
+    "none": "None",
+    "all": "All",
+    "noneShort": "0",
+    "notRecorded": "Not recorded",
+    "notGenerated": "Not generated",
+    "updatedAt": "Updated",
+    "statusLabel": "Status",
+    "dash": "--",
+    "dashTime": "--:--",
+    "ok": "OK",
+    "separator": " · ",
+    "kvInline": "{{label}}={{value}}",
+    "ageLabel": "{{age}} ago",
+    "save": "Save",
+    "enabled": "Enabled",
+    "disabled": "Disabled",
+    "available": "Available",
+    "configured": "Configured",
+    "notConfigured": "Not configured",
+    "local": "Local",
+    "secondsAgo": "{{count}}s ago",
+    "minutesAgo": "{{count}}m ago",
+    "hoursAgo": "{{count}}h ago",
+    "daysAgo": "{{count}}d ago",
+    "time": {
+      "seconds": "{{count}}s",
+      "minutes": "{{count}}m",
+      "hours": "{{count}}h",
+      "daysHours": "{{days}}d {{hours}}h",
+      "hoursMinutes": "{{hours}}h {{minutes}}m"
+    },
+    "status": {
+      "ok": "OK",
+      "warn": "Warn",
+      "fail": "Fail",
+      "error": "Error",
+      "disabled": "Disabled",
+      "enabled": "Enabled",
+      "available": "Available",
+      "configured": "Configured",
+      "notConfigured": "Not configured"
+    },
+  "actionState": {
+    "saving": "Saving...",
+    "saved": "Saved",
+    "saveFailed": "Save failed",
+    "copied": "Copied",
+    "copyFailed": "Copy failed",
+    "refreshed": "Refreshed",
+    "refreshFailed": "Refresh failed",
+    "synced": "Synced",
+    "dirty": "Unsaved changes",
+      "submitting": "Submitting...",
+      "submitted": "Submitted",
+      "submitFailed": "Submit failed"
+    },
+    "channel": {
+      "local": "Local",
+      "webhook": "Webhook",
+      "telegram": "Telegram",
+      "terminal-notifier": "terminal-notifier",
+      "osascript": "osascript",
+      "notify-send": "notify-send",
+      "unavailable": "Unavailable"
+    },
+    "units": {
+      "shares": "shares"
+    },
+    "entity": {
+      "candidate": "candidate",
+      "order": "order",
+      "signal": "signal",
+      "trace": "trace",
+      "topic": "topic",
+      "cycle": "cycle",
+      "action": "action",
+      "event": "event"
+    }
+  },
+  "metric": {
+    "status": "Status",
+    "issues": "Issues",
+    "warnings": "Warnings",
+    "startup_failures": "Startup Failures",
+    "ambiguous_pending_orders": "Ambiguous Pending Orders",
+    "account_state": "Account State",
+    "primary_reason": "Primary Reason",
+    "reason": "Reason",
+    "reasons": "Reasons",
+    "mode": "Mode",
+    "kind": "Kind",
+    "path": "Path",
+    "error": "Error",
+    "err": "Error",
+    "backend": "Backend",
+    "target": "Target",
+    "targets": "Targets",
+    "delivery_count": "Delivery Count",
+    "deliveries": "Deliveries",
+    "status_code": "Status Code",
+    "broker": "Broker",
+    "account_state_status": "Account State",
+    "reconciliation_status": "Reconciliation Status",
+    "persistence_status": "Persistence Status",
+    "recent_activity_events": "Recent Activity Events",
+    "recent_closed_markets": "Recent Closed Markets",
+    "updated_ts": "Updated At",
+    "created_ts": "Created At"
+  },
+  "enum": {
+    "workspaceView": {
+      "overview": "Overview",
+      "wallets": "Wallets",
+      "ops": "Ops",
+      "review": "Review"
+    },
+    "candidateFocusView": {
+      "summary": "Candidate Summary",
+      "detail": "Full Replay"
+    },
+    "mode": {
+      "manual": "Manual",
+      "semi_auto": "Semi Auto",
+      "auto": "Auto",
+      "paper": "Paper",
+      "live": "Live"
+    },
+    "controlState": {
+      "normal": "Normal",
+      "pause_opening": "Pause Opening",
+      "reduce_only": "Reduce-Only",
+      "emergency_stop": "Emergency Stop"
+    },
+    "trading_mode": {
+      "normal": "Normal",
+      "reduce_only": "Reduce-Only",
+      "halted": "Halted"
+    },
+    "candidateStatus": {
+      "pending": "Pending",
+      "approved": "Approved",
+      "queued": "Queued",
+      "watched": "Watched",
+      "executed": "Executed",
+      "submitted": "Submitted",
+      "rejected": "Rejected",
+      "risk_rejected": "Risk Rejected",
+      "ignored": "Ignored",
+      "expired": "Expired"
+    },
+    "candidateAction": {
+      "ignore": "Ignore",
+      "watch": "Watch",
+      "buy_small": "Follow Small",
+      "buy_normal": "Follow Normal",
+      "follow": "Follow",
+      "follow_sell": "Follow Exit",
+      "close_partial": "Trim",
+      "close_all": "Close All",
+      "default": "Handle"
+    },
+    "reportStatus": {
+      "ok": "OK",
+      "ready": "OK",
+      "warn": "WARN",
+      "warning": "WARN",
+      "fail": "FAIL",
+      "blocked": "BLOCKED",
+      "error": "ERROR",
+      "conclusive": "CONCLUSIVE",
+      "inconclusive": "INCONCLUSIVE",
+      "unknown": "UNKNOWN"
+    },
+    "startupCheck": {
+      "PASS": "PASS",
+      "WARN": "WARN",
+      "FAIL": "FAIL",
+      "UNKNOWN": "UNKNOWN"
+    },
+    "decision": {
+      "BLOCK": "BLOCK",
+      "ESCALATE": "ESCALATE",
+      "OBSERVE": "OBSERVE",
+      "OK": "OK",
+      "INCONCLUSIVE": "INCONCLUSIVE"
+    },
+    "blockbeatsSource": {
+      "pro": "Pro",
+      "public_fallback": "Public fallback",
+      "disabled": "Disabled",
+      "error": "Error"
+    },
+    "exitKind": {
+      "resonance_exit": "Resonance Exit",
+      "smart_wallet_exit": "Smart Wallet Exit",
+      "time_exit": "Time Exit",
+      "emergency_exit": "Emergency Exit",
+      "default": "Exit",
+      "entry": "Entry"
+    },
+    "exitResult": {
+      "emergency": "Emergency",
+      "full_exit": "Full Exit",
+      "partial_trim": "Partial Trim",
+      "reject": "Rejected",
+      "unknown": "Unlabeled"
+    },
+    "signalStatus": {
+      "filled": "Filled",
+      "risk_rejected": "Risk Rejected",
+      "order_rejected": "Order Rejected",
+      "duplicate_skipped": "Duplicate Skipped",
+      "skipped": "Skipped",
+      "candidate": "Candidate",
+      "unknown": "Unknown"
+    },
+    "traceStatus": {
+      "pending": "Pending",
+      "approved": "Approved",
+      "executed": "Executed",
+      "closed": "Closed",
+      "open": "Open",
+      "unknown": "Unknown"
+    },
+    "pendingOrderStatus": {
+      "FILLED": "FILLED",
+      "PARTIAL": "PARTIAL",
+      "LIVE": "LIVE",
+      "CANCELED": "CANCELED",
+      "FAILED": "FAILED",
+      "UNKNOWN": "UNKNOWN"
+    },
+    "operatorAction": {
+      "REQUESTED": "REQUESTED",
+      "CLEARED": "CLEARED",
+      "NOOP": "NOOP",
+      "IDLE": "IDLE"
+    },
+    "actionTag": {
+      "entry": "Entry",
+      "add": "Add",
+      "trim": "Trim",
+      "exit": "Exit",
+      "event": "Event"
+    },
+    "walletTier": {
+      "core": "Core",
+      "trade": "Trade",
+      "watch": "Watch",
+      "high": "High Priority",
+      "low": "Low Priority",
+      "system": "System",
+      "unknown": "Unknown"
+    },
+    "side": {
+      "buy": "Buy",
+      "sell": "Sell",
+      "unknown": "Unknown"
+    },
+    "accountState": {
+      "unknown": "Unknown",
+      "fresh": "Fresh",
+      "stale": "Stale"
+    },
+    "opsGateLevel": {
+      "ready": "READY",
+      "observe": "OBSERVE",
+      "escalate": "ESCALATE",
+      "block": "BLOCK"
+    },
+    "reason": {
+      "pause_opening": "Opening paused",
+      "reduce_only": "Reduce-only mode active",
+      "unknown": "Unknown",
+      "operator_emergency_stop": "Operator emergency stop",
+      "operator_pause_opening": "Operator paused opening",
+      "operator_reduce_only": "Operator reduce-only",
+      "startup_not_ready": "Startup checks not ready",
+      "account_state_unknown": "Account state unknown",
+      "account_state_stale": "Account state stale",
+      "reconciliation_fail": "Reconciliation failed",
+      "reconciliation_warn": "Reconciliation warning",
+      "persistence_fault": "Persistence fault",
+      "system_halted": "System halted",
+      "system_reduce_only": "System reduce-only",
+      "sell_notional_too_small": "Sell notional too small",
+      "daily_loss_limit_reached": "Daily loss limit reached",
+      "max_open_positions_reached": "Max open positions reached",
+      "bankroll_fully_committed": "Bankroll fully committed",
+      "price_outside_allowed_band": "Price outside allowed band",
+      "calculated_notional_too_small": "Calculated notional too small",
+      "remaining_bankroll_capacity_too_small": "Remaining bankroll capacity too small",
+      "emergency_stop_cancel_pending_entry": "Emergency stop, cancel pending entry",
+      "reduce_only_cancel_pending_entry": "Reduce-only, cancel pending entry",
+      "trading_mode_cancel_pending_entry": "Trading mode changed, cancel pending entry",
+      "token_add_cooldown": "Token add cooldown hit",
+      "sell_already_processed_this_cycle": "Sell already handled in this cycle",
+      "no_open_position": "No open position to exit",
+      "entry_wallet_mismatch": "Entry wallet does not match current position",
+      "insufficient_budget": "Insufficient available budget",
+      "wallet_score_gate": "Wallet score below follow threshold",
+      "position_missing_after_execute": "Position missing after execution",
+      "market_data_unavailable": "No tradable market data",
+      "spread_too_wide": "Spread too wide",
+      "chase_too_high": "Chase cost too high",
+      "price_out_of_band": "Price outside allowed band",
+      "invalid_notional": "Invalid order notional",
+      "duplicate_signal": "Duplicate signal in same cycle",
+      "risk_rejected": "Risk rejected",
+      "pending_order_exists": "Related pending order already exists",
+      "netting_limited": "Condition exposure is near the cap"
+    }
+  },
+  "candidate": {
+    "detail": {
+      "title": "Candidate Detail",
+      "selectHint": "Click any candidate card to inspect full detail",
+      "summary": "This pane shows orderbook, wallet, chase-cost, and topic enrichment details for a single candidate.",
+      "status": "Status",
+      "deepRead": "Candidate Deep Read",
+      "breakdown": "Factor Breakdown",
+      "breakdownMeta": "0 factors",
+      "breakdownCard": "Score Breakdown",
+      "conflict": "Risk Conflicts",
+      "conflictMeta": "0 conflicts",
+      "conflictCard": "Risk Conflict",
+      "trail": "Review Trail",
+      "trailMeta": "0 steps",
+      "factors": "Decision Summary",
+      "factorsMeta": "0 factors",
+      "factorsCard": "Factor Card",
+      "explain": "Explain / Snapshot",
+      "explainMeta": "0 lines",
+      "explainLabel": "Explanation",
+      "records": "Records",
+      "enrichment": "Enrichment",
+      "enrichmentMeta": "signal / topic",
+      "snapshot": "snapshot",
+      "fullTitle": "Full Replay Detail",
+      "page": "Detail Page",
+      "timeline": "Timeline",
+      "decisionChain": "Decision Chain",
+      "actionLog": "Action Log",
+      "action": "Action",
+      "journal": "Trading Journal",
+      "runtime": {
+        "metaValue": "{{label}} · {{timelineCount}} timeline / {{chainCount}} chain",
+        "empty": {
+          "meta": "Waiting for candidate detail...",
+          "title": "No candidate detail yet",
+          "detail": "There is no candidate deep-dive content to show right now.",
+          "noDetail": "No extra detail",
+          "noRecord": "No records yet"
+        },
+        "loading": {
+          "metaValue": "{{candidateId}} · loading detail",
+          "body": "Reading single-candidate replay links, actions, and journal.",
+          "title": "Loading candidate detail",
+          "detail": "Reading candidate, replay, and explanation paths.",
+          "overview": "Loading overview",
+          "timeline": "Loading timeline",
+          "chain": "Loading decision chain",
+          "actions": "Loading actions",
+          "journal": "Loading journal"
+        },
+        "unavailable": {
+          "metaValue": "{{candidateId}} · detail unavailable",
+          "body": "candidate detail unavailable",
+          "title": "Candidate detail unavailable",
+          "detail": "The API is temporarily unavailable. Please try again later.",
+          "noDetail": "Detail unavailable",
+          "noRecord": "No available records"
+        },
+        "overview": {
+          "title": "Candidate Overview",
+          "detail": "Candidate: {{label}} · {{value}}",
+          "summary": "Overview: {{count}} items",
+          "value": "Candidate {{label}}",
+          "gateTitle": "Execution Gate",
+          "gateDetail": "Execution layer is clear",
+          "scoreSuffix": "score {{score}}",
+          "traceTitle": "Trace",
+          "traceOpened": "opened {{time}}",
+          "traceOpenedMissing": "trace open time not recorded",
+          "statusTitle": "Trace Status",
+          "statusDetail": "orders {{orders}} · actions {{actions}}",
+          "chainTitle": "Decision Chain",
+          "chainValue": "{{count}} steps",
+          "chainDetail": "cycles {{cycles}} · trace {{trace}}",
+          "traceFound": "found",
+          "traceMissing": "missing",
+          "latestTitle": "Latest Event",
+          "latestDetail": "journal {{journalCount}} · {{action}}"
+        },
+        "timeline": {
+          "title": "Candidate Timeline",
+          "detail": "Latest {{count}} entries · updated {{age}}",
+          "empty": "No timeline entries yet",
+          "noRecord": "No timeline entries yet",
+          "noDetail": "No extra event detail"
+        },
+        "chain": {
+          "title": "Candidate Decision Chain",
+          "detail": "Chain: {{label}}",
+          "summary": "Decision chain: {{count}} steps",
+          "empty": "No decision chain yet",
+          "noDetail": "No extra decision detail"
+        },
+        "actions": {
+          "title": "Candidate Actions",
+          "detail": "Action: {{label}} · value {{value}}",
+          "summary": "Actions: {{count}}",
+          "empty": "No action records yet",
+          "noNote": "No note"
+        },
+        "journal": {
+          "title": "Candidate Journal",
+          "detail": "Journal: {{label}}",
+          "summary": "Journal entries: {{count}}",
+          "empty": "No journal entries yet",
+          "noNote": "No note"
+        }
+      }
+    },
+    "focus": {
+      "unavailable": {
+        "meta": "candidate focus unavailable",
+        "title": "Failed to load candidate detail",
+        "status": "API unavailable"
+      },
+      "replay": {
+        "meta": "recent signal replay",
+        "badge": "Recent Signal",
+        "title": "No active candidates right now. Showing replay from recent signal cycles.",
+        "summary": "{{signals}} signals were produced across the last {{cycles}} cycles, but there are 0 active candidates now.",
+        "noPrimaryReason": "No explicit skip reason in recent cycles",
+        "emptyQueue": "Queue is empty",
+        "emptyBreakdown": "No active candidates",
+        "emptyConflict": "No active conflicts",
+        "modeTitle": "Recent signal mode",
+        "auditOnly": "Recent signals are audit-only and cannot be acted on directly",
+        "statusEmpty": "No active candidates",
+        "noRecentSignals": "No recent signals",
+        "metaSignals": "{{count}} signals",
+        "snapshotValue": "signals {{signals}} / active 0",
+        "timeSourceBreakdown": "M{{metadata}} / L{{legacy}} / U{{unknown}}",
+        "primaryReasonCount": "{{reason}} × {{count}}",
+        "walletTier": "wallet {{tier}}",
+        "values": {
+          "cycles": "{{count}} cycles",
+          "signals": "{{count}} signals",
+          "precheckSkipped": "{{count}} skipped",
+          "replaySignals": "{{count}} replay items"
+        },
+        "list": {
+          "cycles": "Recent Cycles",
+          "signals": "Recent Signals",
+          "precheckSkipped": "Precheck Skipped",
+          "timeSource": "Time Source",
+          "primaryReason": "Primary Reason"
+        }
+      },
+      "runtime": {
+        "metaValue": "{{label}} · {{trigger}} · {{id}}",
+        "head": {
+          "gatePassed": "Gate Passed",
+          "hasConflict": "Has Conflict",
+          "noConflict": "No Conflict"
+        },
+        "list": {
+          "oneLine": "One-line Summary",
+          "executionGate": "Execution Gate",
+          "sourceWallet": "Source Wallet"
+        },
+        "values": {
+          "passed": "passed",
+          "observedNotional": "{{notional}} · {{shares}} shares",
+          "sourcePrice": "{{price}} · bid {{bid}} / ask {{ask}} / mid {{mid}}",
+          "orderbookCost": "spread {{spread}} · chase {{chase}}",
+          "momentum": "5m {{momentum5m}} · 30m {{momentum30m}}",
+          "existingPositionConflict": "conflict {{notional}}",
+          "suggestedAction": "{{action}} · {{confidence}} confidence",
+          "expiryFreshness": "{{expiry}} · {{freshness}}",
+          "longLived": "long-lived",
+          "unlabeled": "Unlabeled",
+          "existingPosition": "existing position",
+          "clear": "clear"
+        },
+        "metrics": {
+          "score": "Candidate Score",
+          "walletScore": "Wallet Score",
+          "walletTier": "Wallet Tier",
+          "sourceWalletCount": "Source Wallet Count"
+        },
+        "metaCount": {
+          "factors": "{{count}} factors",
+          "conflicts": "{{count}} conflicts",
+          "steps": "{{count}} steps",
+          "lines": "{{count}} lines",
+          "items": "{{count}} items",
+          "keys": "{{count}} keys"
+        },
+        "emptyTrail": "No trail yet",
+        "emptyExplain": "No explanation yet",
+        "emptyRecords": "No extra records",
+        "snapshot": {
+          "recommendationReason": "Recommendation Reason",
+          "marketTag": "Market Tag",
+          "resolutionBucket": "Resolution Bucket",
+          "conflict": "Conflict",
+          "signal": "signal snapshot",
+          "topic": "topic snapshot",
+          "note": "Note",
+          "selectedAction": "selected_action={{action}}"
+        }
+      },
+      "list": {
+        "conditionToken": "Condition / Token",
+        "observedNotional": "Observed Notional",
+        "sourcePrice": "Source Price",
+        "orderbookCost": "Orderbook Cost",
+        "momentum": "Momentum",
+        "existingPosition": "Existing Position",
+        "suggestedAction": "Suggested Action",
+        "expiryFreshness": "Expiry / Freshness"
+      },
+      "strip": {
+        "decision": {
+          "label": "Decision Thesis",
+          "detailFallback": "Current candidate summary"
+        },
+        "score": {
+          "detailFallback": "score breakdown"
+        },
+        "momentum": {
+          "detailFallback": "momentum"
+        },
+        "orderbook": {
+          "detailFallback": "spread / chase"
+        },
+        "risk": {
+          "label": "Risk",
+          "detailFallback": "no conflict"
+        }
+      }
+    },
+    "shared": {
+      "walletCount": "{{count}} wallets",
+      "walletTierDefault": "WATCH"
+    },
+    "gate": {
+      "passed": {
+        "label": "Gate Passed",
+        "detail": "Execution layer is clear"
+      },
+      "blocked": {
+        "label": "Not Executable"
+      },
+      "blockedHighScore": {
+        "label": "High score but blocked by gate",
+        "detail": "score {{score}} · {{reason}}"
+      }
+    },
+    "orderbook": {
+      "summary": "bid {{bid}} · ask {{ask}} · mid {{mid}}"
+    },
+    "explain": {
+      "title": {
+        "ignore": "Why Ignore",
+        "watch": "Why Watch First",
+        "recommend": "Why Recommend",
+        "blockedHighScore": "High score but blocked by gate",
+        "blocked": "Not Executable"
+      },
+      "labels": {
+        "actionSuggested": "Suggested Action",
+        "currentAction": "Current Action",
+        "scoreBreakdown": "Score Breakdown",
+        "skipOrRisk": "Skip / Risk",
+        "momentumOrderbook": "Momentum / Orderbook",
+        "resonanceSignal": "Resonance Signal",
+        "riskConflict": "Risk Conflict",
+        "walletProfile": "Wallet Profile",
+        "generic": "Note"
+      },
+      "values": {
+        "scoreBreakdown": "score {{score}} · wallet {{walletScore}} · conf {{confidence}} · {{walletCount}}",
+        "spread": "spread {{spread}}",
+        "chase": "chase {{chase}}",
+        "chaseShort": "chase {{chase}}",
+        "resonanceWallets": "{{count}} aligned wallets",
+        "multiWalletResonance": "multi-wallet resonance"
+      },
+      "conflict": {
+        "existingPosition": "Existing Position",
+        "duplicate": "Duplicate in Cycle",
+        "nettingLimited": "Netting Limited",
+        "budgetLimited": "Budget Limited",
+        "cooldownRemaining": "Cooldown {{age}} left"
+      },
+      "fallback": "This candidate has no extra block or resonance note. Prioritize suggested_action and wallet score."
+    },
+    "trail": {
+      "discovery": {
+        "label": "Discovery",
+        "triggerTypeDefault": "wallet_event",
+        "value": "{{wallet}} · {{triggerType}}",
+        "detail": "{{walletCount}} triggered · {{walletTier}}"
+      },
+      "enrichment": {
+        "label": "Enrichment",
+        "marketDefault": "market",
+        "bucketDefault": "unbucketed",
+        "noCondition": "no condition",
+        "value": "{{marketTag}} · {{bucket}}",
+        "detail": "{{market}} · {{condition}}"
+      },
+      "score": {
+        "label": "Score",
+        "value": "score {{score}} · wallet {{walletScore}} · conf {{confidence}}",
+        "detail": "{{sourcePrice}} · {{action}}",
+        "sourcePrice": "source price {{price}}",
+        "noSourcePrice": "no source price"
+      },
+      "orderbook": {
+        "label": "Orderbook",
+        "detail": "spread {{spread}} · chase {{chase}}"
+      },
+      "decision": {
+        "label": "Decision",
+        "waitingReason": "waiting for explanation"
+      },
+      "review": {
+        "label": "Review",
+        "waiting": "waiting",
+        "detail": "{{status}}{{noteSuffix}}"
+      },
+      "lifecycle": {
+        "label": "Lifecycle",
+        "value": "{{status}} · {{age}}",
+        "detail": "{{created}}{{updatedSuffix}}{{signalSuffix}}",
+        "createdAt": "created {{time}}",
+        "createdUnknown": "created time unknown",
+        "updatedAt": "updated {{time}}",
+        "signalAt": "signal {{time}}"
+      }
+    },
+    "card": {
+      "priority": {
+        "score": "Score",
+        "size": "Size",
+        "scoreValue": "score {{score}}",
+        "walletValue": "wallet {{walletScore}}",
+        "sizeShares": "{{shares}} shares"
+      },
+      "reasonFallback": "{{action}} · triggered by {{walletCount}}",
+      "summary": {
+        "full": "{{prefix}}: {{reason}}{{tail}}",
+        "prefix": {
+          "ignore": "Skip",
+          "watch": "Watch",
+          "recommend": "Take",
+          "blockedHighScore": "High score but blocked",
+          "blocked": "Not executable"
+        }
+      },
+      "metric": {
+        "score": "score {{score}}",
+        "wallet": "wallet {{walletScore}}",
+        "confidence": "conf {{confidence}}"
+      },
+      "gateChip": "Gate · {{reason}}",
+      "actionStatus": "Status {{status}}",
+      "noAction": "No available action",
+      "hover": {
+        "gatePassed": "Gate Passed",
+        "scoreLine": "score {{score}} · wallet {{walletScore}} · conf {{confidence}}",
+        "orderbookLine": "bid {{bid}} · ask {{ask}} · mid {{mid}} · spread {{spread}} · chase {{chase}}",
+        "labelValue": "{{label}}: {{value}}"
+      }
+    },
+    "factor": {
+      "pill": {
+        "positive": "Positive",
+        "negative": "Negative",
+        "warn": "Caution",
+        "neutral": "Neutral"
+      },
+      "card": {
+        "defaultLabel": "factor",
+        "weight": "weight {{weight}}",
+        "empty": "No factors to show"
+      },
+      "breakdown": {
+        "gate": {
+          "label": "Execution Gate"
+        },
+        "score": {
+          "label": "Composite Score"
+        },
+        "walletScore": {
+          "label": "Wallet Score",
+          "detailFallback": "wallet quality"
+        },
+        "confidence": {
+          "label": "Confidence",
+          "detailFallback": "decision confidence"
+        },
+        "resonanceWallets": {
+          "label": "Resonant Wallets",
+          "multi": "multi-wallet confirm",
+          "single": "single wallet trigger"
+        },
+        "momentum": {
+          "label": "Momentum",
+          "pullback": "30m pullback",
+          "tailwind": "tailwind momentum"
+        },
+        "orderbook": {
+          "label": "Orderbook Cost",
+          "detail": "bid {{bid}} · ask {{ask}} · mid {{mid}}"
+        },
+        "triggerType": {
+          "label": "Trigger Type",
+          "detailFallback": "market context"
+        }
+      },
+      "conflict": {
+        "existingPosition": {
+          "label": "Existing Position",
+          "valueFallback": "position conflict",
+          "detail": "Exposure already exists on the same token / condition"
+        },
+        "duplicate": {
+          "label": "Duplicate Signal",
+          "value": "deduped in cycle",
+          "detail": "Avoid repeating the same candidate execution"
+        },
+        "netting": {
+          "label": "Netting Limit",
+          "value": "netting capped",
+          "detail": "Condition exposure is near the cap"
+        },
+        "budget": {
+          "label": "Budget Limited",
+          "value": "budget capped",
+          "detail": "Insufficient available notional"
+        },
+        "cooldown": {
+          "label": "Cooldown",
+          "detail": "Add / follow cooldown has not ended"
+        },
+        "riskReason": {
+          "label": "Risk Reason",
+          "detailFallback": "risk gate"
+        },
+        "skipReason": {
+          "label": "Skip Reason",
+          "detail": "skip / gate / cooldown"
+        },
+        "none": {
+          "label": "Risk Conflict",
+          "value": "none",
+          "detail": "No significant position / duplicate / cooldown / budget conflicts"
+        }
+      }
+    },
+    "summary": {
+      "card": {
+        "title": "Decision Summary",
+        "empty": "No summary factors to show"
+      }
+    },
+    "modeSwitch": {
+      "pending": "Switching to {{mode}} mode...",
+      "success": "Switched to {{mode}} mode",
+      "fail": "Failed to switch to {{mode}} mode"
+    },
+    "panel": {
+      "title": "Candidate Queue",
+      "meta": "{{mode}} · {{count}} candidates · {{visible}} visible · {{sort}}{{updatedAt}}",
+      "statusError": "Candidate API error: {{details}}",
+      "statusReady": "{{mode}} mode active. Prioritize suggested_action and the explanation pane.",
+      "statusEmpty": "No new candidates right now. Keep watching the operator / monitor / reconciliation panels below.",
+      "metaVisible": "{{visible}}/{{total}} visible · {{focusView}}",
+      "summary": {
+        "pending": "Pending {{count}}",
+        "approved": "Approved {{count}}",
+        "watched": "Watched {{count}}",
+        "executed": "Executed {{count}}",
+        "visible": "Visible {{visible}}/{{total}}",
+        "metadata": "Metadata {{hits}}/{{total}}",
+        "timeSource": "Time source M{{metadata}} / L{{legacy}} / U{{unknown}}",
+        "recentSignals": "Last {{cycles}} cycles, {{signals}} signals",
+        "recentTopSkip": "{{reason}} · recent {{count}}"
+      },
+      "searchLabel": "Quick Search",
+      "searchPlaceholder": "Search wallet / market / topic / factor / note",
+      "sortLabel": "Sort",
+      "toggleFiltersExpand": "Expand Filters",
+      "toggleFiltersCollapse": "Collapse Filters",
+      "clearFilters": "Clear Filters",
+      "queueTitle": "Candidate Cards",
+      "queueNote": "Keep only the high-signal fields here. Secondary metrics live in hover and detail panes.",
+      "emptyTitle": {
+        "noMatch": "No matching candidates",
+        "noOpportunity": "No new candidates"
+      },
+      "emptyBody": {
+        "noMatch": "Try another keyword, status, or sort order.",
+        "noOpportunity": "When there are no candidate signals, the execution / reconciliation / monitor panels stay visible."
+      },
+      "apiUnavailableTitle": "Candidate API temporarily unavailable",
+      "apiUnavailableBody": "Unable to load /api/candidates",
+      "replay": {
+        "status": {
+          "filled": "Filled",
+          "precheckSkipped": "Precheck Skipped",
+          "rejected": "Rejected",
+          "recentSignal": "Recent Signal"
+        },
+        "reason": {
+          "skip": "Recent signal · {{reason}}",
+          "action": "Recent signal · {{action}}",
+          "default": "Triggered in a recent cycle but did not enter the active queue"
+        },
+        "gate": "Recent signal replay · not promoted into the active candidate queue",
+        "reviewOnly": "Replay review only. Not directly actionable.",
+        "strip": {
+          "walletScore": "Wallet Score",
+          "walletTier": "Wallet Tier",
+          "source": "Source",
+          "cycleTime": "Cycle Time"
+        },
+        "source": {
+          "metadata": "metadata"
+        }
+      }
+    },
+    "sort": {
+      "score_desc": "Composite Score",
+      "freshness_desc": "Freshness",
+      "confidence_desc": "Confidence",
+      "wallet_score_desc": "Wallet Score",
+      "observed_notional_desc": "Observed Notional"
+    },
+    "filter": {
+      "status": "Status",
+      "action": "Action",
+      "side": "Side",
+      "all": "All"
+    },
+    "status": {
+      "loading": "Loading candidates...",
+      "pending": "Pending",
+      "approved": "Approved",
+      "queued": "Queued",
+      "watched": "Watched",
+      "executed": "Executed",
+      "submitted": "Submitted",
+      "rejected": "Rejected",
+      "risk_rejected": "Risk Rejected",
+      "ignored": "Ignored",
+      "expired": "Expired"
+    },
+    "action": {
+      "ignore": "Ignore",
+      "watch": "Watch",
+      "buy_small": "Small Follow",
+      "buy_normal": "Normal Follow",
+      "follow": "Follow Directly",
+      "follow_sell": "Follow Exit Now",
+      "close_partial": "Trim",
+      "close_all": "Close All"
+    },
+    "side": {
+      "buy": "Buy",
+      "sell": "Sell"
+    },
+    "request": {
+      "pending": "{{action}} submitting...",
+      "success": "{{action}} submitted",
+      "fail": "{{action}} failed"
+    }
+  },
+  "blockbeats": {
+    "meta": "prediction {{predictionCount}} · important {{importantCount}}",
+    "summary": {
+      "overallStatus": "Overall Status",
+      "status": "Status",
+      "updatedAt": "Updated",
+      "predictionSource": "Prediction Source",
+      "importantSource": "Important Source",
+      "errors": "Errors"
+    },
+    "status": {
+      "line": "status {{status}} · {{updatedAt}}{{issues}}",
+      "issuesSuffix": " · {{count}} issues",
+      "apiUnavailable": "/api/blockbeats unavailable"
+    },
+    "panel": {
+      "title": "Market Catalysts / News Context",
+      "meta": "prediction {{predictionCount}} · important {{importantCount}}",
+      "status": "status {{status}} · {{updatedAt}}{{issues}}",
+      "statusIssues": " · {{count}} issues",
+      "waiting": "Waiting for BlockBeats catalyst data..."
+    },
+    "feed": {
+      "empty": "{{label}} is empty",
+      "untitled": "Untitled newsflash",
+      "prediction": {
+        "title": "Prediction Feed",
+        "subtitle": "event-driven",
+        "empty": "Prediction feed is empty"
+      },
+      "important": {
+        "title": "Important Feed",
+        "subtitle": "broader crypto context",
+        "empty": "Important feed is empty"
+      },
+      "noItems": "No news items available right now"
+    },
+    "message": {
+      "proPredictionFallback": "BlockBeats Pro prediction is unavailable. Showing public flash fallback.",
+      "apiKeyMissingFallback": "BLOCKBEATS_API_KEY is missing. Showing public flash fallback.",
+      "importantRequiresApiKey": "Important feed requires BLOCKBEATS_API_KEY",
+      "apiKeyMissing": "BLOCKBEATS_API_KEY is not set",
+      "feedUnavailable": "{{feed}} unavailable: {{reason}}",
+      "dashboardUnavailable": "Dashboard unavailable: {{reason}}"
+    }
+  },
+  "notifier": {
+    "defaultTitle": "Polymarket",
+    "empty": {
+      "title": "Notification"
+    },
+    "panel": {
+      "title": "Notifications & Alerts",
+      "meta": "{{count}} recent",
+      "statusConfigured": "{{channels}} · {{updatedAt}}",
+      "statusNone": "No notifier backend configured",
+      "waiting": "Waiting for notifier data..."
+    },
+    "summary": {
+      "local": "Local",
+      "webhook": "Webhook",
+      "telegram": "Telegram",
+      "deliveryStats": "Delivery Stats",
+      "updatedAt": "Updated",
+      "available": "Available",
+      "unavailable": "Unavailable",
+      "configured": "Configured",
+      "notConfigured": "Not configured",
+      "targets": "Configured · {{count}} targets",
+      "okEvents": "{{ok}} / {{total}} OK",
+      "deliveryOk": "{{ok}} / {{total}} OK"
+    },
+    "list": {
+      "recentEvents": "Recent Events",
+      "detail": "Notification Detail",
+      "channelScope": "local / webhook",
+      "recentCount": "latest 5",
+      "recentNone": "No events yet",
+      "noBody": "No body",
+      "deliveries": "{{count}} deliveries"
+    },
+    "channel": {
+      "telegramMeta": "{{chat}} · {{mode}}"
+    },
+    "parseMode": {
+      "plain": "plain",
+      "html": "HTML",
+      "markdown": "Markdown"
+    },
+    "event": {
+      "ok": "OK",
+      "fail": "FAIL"
+    },
+    "delivery": {
+      "localDisabled": "Local notifications are disabled",
+      "localBackendUnavailable": "No local notification backend is available",
+      "webhookNotConfigured": "Webhook is not configured",
+      "telegramNotConfigured": "Telegram is not configured",
+      "deliveryFailed": "Delivery failed: {{reason}}"
+    },
+    "phrase": {
+      "reconciliationProtect": "reconciliation protect",
+      "startupGateBlocked": "startup gate blocked",
+      "isBlockingNewBuy": "is blocking new BUY",
+      "noBody": "no body",
+      "chatUnavailable": "chat unavailable"
+    }
+  },
+  "decision": {
+    "apiUnavailableCandidates": "Candidate API",
+    "apiUnavailableMode": "Mode API",
+    "apiError": "Candidate API error: {{parts}}",
+    "updatedAtSuffix": " · {{updatedAt}}",
+    "meta": "{{mode}} · {{count}} candidates{{updatedAt}}",
+    "gridMeta": "{{visible}}/{{total}} visible · {{focusView}}",
+    "hasOpportunities": "Actionable opportunities are available in {{mode}} mode",
+    "noOpportunities": "No actionable opportunities right now"
+  },
+  "walletProfiles": {
+    "panel": {
+      "title": "Core Wallet Pool"
+    },
+    "meta": "{{count}} wallets · enabled {{enabled}}",
+    "status": {
+      "error": "Wallet pool API error: {{error}}",
+      "ready": "You can edit tag / notes / enabled inline and save back to the wallet profile store.",
+      "apiError": "Wallet pool API error: {{reason}}",
+      "loading": "Loading wallet profiles..."
+    },
+    "empty": {
+      "apiUnavailable": "Wallet profiles API unavailable",
+      "none": "No wallet profiles"
+    },
+    "fallback": {
+      "apiUnavailable": "Wallet profiles API unavailable",
+      "empty": "No wallet profiles"
+    },
+    "category": {
+      "unknown": "Uncategorized"
+    },
+    "enabled": {
+      "on": "Enabled",
+      "off": "Disabled"
+    },
+    "inputs": {
+      "tag": "Tag",
+      "notes": "Notes",
+      "save": "Save"
+    },
+    "field": {
+      "followability": "follow {{score}}",
+      "tagPlaceholder": "Enter tag",
+      "notesPlaceholder": "Enter notes",
+      "unclassified": "Unclassified"
+    },
+    "table": {
+      "wallet": "Wallet",
+      "enabled": "Enabled",
+      "tag": "Tag",
+      "followability": "Trust / Follow",
+      "notes": "Notes",
+      "actions": "Actions",
+      "market": "Market",
+      "side": "Side",
+      "result": "Result",
+      "roi": "ROI",
+      "pnl": "PnL"
+    },
+    "detail": {
+      "title": "Smart Wallet Profile",
+      "selectHint": "Click a wallet row to inspect detail",
+      "summary": "This section shows scoring logic, historical samples, and realized performance for a single wallet.",
+      "status": "Status",
+      "scoreBreakdown": "Score Breakdown",
+      "topicProfile": "Topic Preference Profile",
+      "topicCount": "0 themes",
+      "topicCard": "Topic Preference",
+      "recentSamples": "Recent Settled Samples",
+      "sampleCount": "0 samples"
+    },
+    "rowState": {
+      "dirty": "Unsaved changes",
+      "noChange": "No changes",
+      "error": "Save failed",
+      "saved": "Saved",
+      "saving": "Saving...",
+      "synced": "Synced"
+    }
+  },
+  "journal": {
+    "meta": "{{count}} recent",
+    "status": {
+      "apiError": "Journal API error: {{reason}}",
+      "loading": "Waiting for journal data...",
+      "ready": "{{count}} records in recent history. Quick notes are supported."
+    },
+    "note": {
+      "help": "Quick notes supported",
+      "missing": "No note"
+    },
+    "panel": {
+      "title": "Trading Journal",
+      "meta": "{{count}} recent",
+      "statusError": "Journal API error: {{error}}",
+      "statusReady": "{{count}} records in recent history. Quick notes are supported.",
+      "waiting": "Waiting for journal data..."
+    },
+    "composer": {
+      "placeholder": "Write a quick note, for example: spread is too wide, watch first and avoid chasing",
+      "save": "Save Note",
+      "ready": "Quick notes supported",
+      "empty": "Enter a note before submitting",
+      "saving": "Saving journal note...",
+      "saved": "Journal note saved",
+      "saveFailed": "Failed to save journal note"
+    },
+    "card": {
+      "title": "Trading Journal",
+      "apiUnavailable": "API unavailable",
+      "emptyTitle": "No action records yet",
+      "emptyBody": "You can write a quick observation above and the backend will persist it via /api/journal/note.",
+      "noNote": "No note"
+    },
+    "empty": {
+      "apiUnavailableReason": "Unable to load /api/journal",
+      "apiUnavailableTitle": "Journal API unavailable",
+      "apiUnavailableBody": "Journal data is temporarily unavailable. Please try again later.",
+      "noneTitle": "No journal entries yet",
+      "noneBody": "There is no journal content to show yet.",
+      "noneHelp": "You can write a quick observation above."
+    }
+  },
+  "control": {
+    "pauseOpening": "Pause Opening",
+    "resumeOpening": "Resume Opening",
+    "reduceOnly": "Reduce-Only",
+    "clearReduceOnly": "Disable Reduce-Only",
+    "emergencyStop": "Emergency Stop",
+    "clearEmergencyStop": "Clear Emergency Stop"
+  },
+  "alerts": {
+    "emptyTag": "OK",
+    "emptyMessage": "No active alerts",
+    "panel": {
+      "title": "Notifications & Alerts",
+      "subtitle": "Latest 5"
+    }
+  },
+  "archive": {
+    "meta": "state {{stateAge}} · 30m {{monitor30Age}} · 12h {{monitor12Age}} · EOD {{eodAge}}",
+    "panel": {
+      "title": "Archive & Export",
+      "meta": "State snapshot"
+    },
+    "journalTagsEmpty": "No journal tags yet",
+    "tags": {
+      "defaultLabel": "Tag"
+    },
+    "summary": {
+      "candidates": "Candidates",
+      "pending": "Pending",
+      "journal": "Journal",
+      "notifications": "Notifications",
+      "positions": "Positions",
+      "slots": "Slots",
+      "wallets": "Wallets"
+    },
+    "action": {
+      "title": "Export Archive",
+      "detail": "Bundle the current state, monitor, candidates, and journal for export.",
+      "tag": "Export",
+      "stateBundleTitle": "Export State Bundle JSON",
+      "stateBundleDetail": "state / monitor / reconciliation / candidates / journal / notifier",
+      "candidatesCsvTitle": "Export Candidates CSV",
+      "candidatesCsvDetail": "Use offline to filter and review candidate opportunities",
+      "journalJsonTitle": "Export Journal JSON",
+      "journalJsonDetail": "Includes recent notes, tags, and action summaries",
+      "monitorBundleTitle": "Export Monitor Bundle JSON",
+      "monitorBundleDetail": "Includes 30m / 12h / EOD reconciliation results"
+    },
+    "export": {
+      "title": "Export Archive",
+      "detail": "Bundle the current state, monitor, candidates, and journal for export.",
+      "tag": "Export",
+      "stateBundle": {
+        "title": "Export State Bundle JSON",
+        "detail": "state / monitor / reconciliation / candidates / journal / notifier"
+      },
+      "candidatesCsv": {
+        "title": "Export Candidates CSV",
+        "detail": "Use offline to filter and review candidate opportunities"
+      },
+      "journalJson": {
+        "title": "Export Journal JSON",
+        "detail": "Includes recent notes, tags, and action summaries"
+      },
+      "monitorBundle": {
+        "title": "Export Monitor Bundle JSON",
+        "detail": "Includes 30m / 12h / EOD reconciliation results"
+      }
+    },
+    "cards": {
+      "topJournalTags": "Top Journal Tags",
+      "recentSnapshots": "Recent Snapshots",
+      "recentEod": "Recent EOD",
+      "stats": "Stats"
+    },
+    "columns": {
+      "recentNotificationsJournal": "Recent Notifications / Journal",
+      "candidatesWalletsPool": "Candidates / Wallet Pool"
+    },
+    "stats": {
+      "monitor": "Monitor",
+      "eod": "EOD Reconciliation",
+      "internalVsLedger": "Ledger Gap",
+      "fills": "{{count}} fills",
+      "walletPool": "Wallet Pool",
+      "profiles": "{{count}} profiles",
+      "enabled": "enabled {{count}}",
+      "walletPoolDetail": "{{enabled}} · {{localNotifier}}",
+      "localNotifier": "local notifier {{status}}",
+      "recentNotifications": "Recent Notifications",
+      "events": "{{count}} events",
+      "channelStatus": "{{channel}} {{status}}",
+      "recentNotificationsDetail": "{{webhook}} · {{telegram}} · {{latest}}",
+      "latest": "latest {{title}}",
+      "none": "none"
+    },
+    "snapshot": {
+      "eod": {
+        "title": "Recent EOD",
+        "meta": "{{time}}{{ageSuffix}} · {{status}}"
+      },
+      "monitor30": {
+        "title": "monitor 30m"
+      },
+      "monitor12": {
+        "title": "monitor 12h"
+      },
+      "journal": {
+        "title": "Recent Journal",
+        "empty": "No journal entries yet"
+      }
+    },
+    "recentNotifications": {
+      "itemTitleFallback": "Notification",
+      "emptyTitle": "Recent Notifications",
+      "emptyBody": "No events yet"
+    }
+  },
+  "budget": {
+    "overview": {
+      "title": "Budget Overview",
+      "meta": "Equity / Cash / Used / Available",
+      "accountSyncWaiting": "Waiting for account sync",
+      "metaValue": "Equity {{equity}}U · Cash {{cash}}U · Used {{tracked}}U / Available {{available}}U"
+    }
+  },
+  "kpi": {
+    "executionMode": {
+      "title": "Execution Mode",
+      "value": "PAPER",
+      "note": "PaperBroker · no real orders will be sent"
+    },
+    "equity": {
+      "title": "Equity",
+      "value": "--",
+      "note": "Cash -- · Positions --",
+      "noteValue": "Cash {{cash}} · Positions {{positions}}"
+    },
+    "cash": {
+      "title": "Cash Balance",
+      "value": "--",
+      "note": "Available budget -- · waiting for account sync",
+      "noteValue": "Available budget {{available}}U · {{snapshot}}"
+    },
+    "positions": {
+      "title": "Positions / Slots",
+      "value": "-- / --",
+      "note": "Slot utilization --",
+      "noteValue": "Slot utilization {{utilization}}"
+    },
+    "notional": {
+      "title": "Follow Notional",
+      "value": "--",
+      "note": "Signals per cycle -- · ledger snapshot --",
+      "noteValue": "Signals per cycle {{signals}} · ledger snapshot {{snapshot}}"
+    },
+    "risk": {
+      "title": "Risk State",
+      "value": "Normal Risk",
+      "note": "Congestion threshold -- / trim on congestion --",
+      "noteValue": "Congestion threshold {{threshold}} / trim {{trim}}",
+      "modeAdaptive": "Congestion Adaptive",
+      "modeNormal": "Normal Risk"
+    }
+  },
+  "positions": {
+    "table": {
+      "title": "Position Overview",
+      "subtitle": "Current positions and exit rules",
+      "market": "Market",
+      "side": "Side",
+      "size": "Size",
+      "notional": "Notional",
+      "entryPrice": "Entry Price",
+      "holdTime": "Hold Time",
+      "reason": "Reason",
+      "exitRule": "Exit Rule",
+      "empty": "No positions"
+    }
+  },
+  "orders": {
+    "panel": {
+      "title": "Order Overview",
+      "subtitle": "Recent order status"
+    },
+    "status": {
+      "pending": "Pending",
+      "filled": "Filled",
+      "partiallyFilled": "Partially Filled",
+      "canceled": "Canceled",
+      "rejected": "Rejected",
+      "failed": "Failed",
+      "cleared": "Cleared",
+      "pendingCount": "Pending {{count}}",
+      "filledCount": "Filled {{count}}",
+      "canceledCount": "Canceled {{count}}",
+      "rejectedCount": "Rejected {{count}}"
+    },
+    "table": {
+      "time": "Time",
+      "market": "Market",
+      "action": "Action",
+      "status": "Status",
+      "reason": "Reason",
+      "empty": "No orders"
+    }
+  },
+  "wallets": {
+    "monitor": {
+      "title": "Wallet Monitor",
+      "subtitle": "Core wallet pool, samples, and performance",
+      "row": {
+        "detail": "{{positions}} positions · {{markets}} markets · {{notional}}U"
+      },
+      "empty": "No wallet data",
+      "table": {
+        "wallet": "Wallet",
+        "score": "Score",
+        "samples": "Samples",
+        "roi": "ROI",
+        "winRate": "Win Rate",
+        "parsed": "Parsed",
+        "concentration": "Concentration"
+      }
+    }
+  },
+  "strategy": {
+    "params": {
+      "title": "Strategy Parameters",
+      "walletPool": "Wallet Pool Size",
+      "minIncrease": "Minimum Add Notional",
+      "maxSignals": "Max Signals per Cycle",
+      "minWalletScore": "Minimum Wallet Score",
+      "scoreMultipliers": "Wallet Score Multipliers",
+      "historyWindow": "History Window",
+      "topicBias": "Topic Bias",
+      "discoveryBias": "Discovery Bias",
+      "walletExit": "Wallet Exit",
+      "riskTrade": "Per-Trade Risk",
+      "riskDay": "Daily Loss Limit",
+      "priceBand": "Price Band",
+      "addCooldown": "Add Cooldown",
+      "value": {
+        "walletPool": "wallet_pool={{count}}",
+        "minIncrease": "{{amount}} USD",
+        "scoreMultipliers": "W {{watch}} / T {{trade}} / C {{core}}",
+        "historyWindow": "{{window}} / min {{minClosed}} / strong {{strongClosed}}c {{strongResolved}}r",
+        "disabled": "off",
+        "topicBias": "min {{minSamples}} / +{{boost}} / -{{penalty}}",
+        "discoveryBias": "top {{topN}} / hist +{{historyBonus}} / topic +{{topicBonus}}",
+        "walletExitSingle": "single / min {{amount}} USD",
+        "walletExitResonance": "single {{amount}} / res {{wallets}} wallets / {{trim}} -> {{coreExit}}",
+        "addCooldown": "{{seconds}}s"
+      }
+    }
+  },
+  "sources": {
+    "availability": {
+      "title": "Source Availability",
+      "subtitle": "Source wallets, scores, and history state",
+      "empty": "No source data",
+      "sourceDetail": "{{positions}} positions · {{markets}} markets",
+      "historyValue": "W {{winRate}} / ROI {{roi}}",
+      "historyResolved": "{{history}} · resolved {{resolved}}",
+      "historyEmpty": "No settled history",
+      "discoveryPool": "Pool #{{rank}} · {{score}}",
+      "discoveryEmpty": "Pool --",
+      "updatedDetail": "history {{historyAge}} · {{discovery}}",
+      "table": {
+        "source": "Source",
+        "score": "Score",
+        "weight": "Weight",
+        "history": "History",
+        "updated": "Updated"
+      }
+    }
+  },
+  "runtime": {
+    "panel": {
+      "title": "Runtime Overview",
+      "meta": "Waiting for state"
+    },
+    "health": {
+      "stateAge": "State Age",
+      "broker": "Broker",
+      "walletPool": "Wallet Pool Size",
+      "discovery": "Discovery",
+      "control": "Control State"
+    }
+  },
+  "risk": {
+    "panel": {
+      "title": "Risk Monitor",
+      "subtitle": "Drawdown / Exposure"
+    },
+    "meters": {
+      "drawdown": "Realized Loss Usage",
+      "drawdownText": "0.0% / daily limit",
+      "drawdownValue": "{{used}} / daily limit {{limit}}",
+      "exposure": "Slot Utilization",
+      "exposureText": "0 / 0",
+      "exposureValue": "{{open}} / {{max}}",
+      "cooldown": "Add Cooldown Hits",
+      "cooldownText": "0 / 0",
+      "cooldownValue": "{{skips}} / {{orders}}",
+      "staleness": "State Freshness",
+      "stalenessText": "0s / 0s",
+      "stalenessValue": "{{stateAge}}s / {{poll}}s"
+    }
+  },
+  "diagnostics": {
+    "panel": {
+      "title": "Diagnostics & Alerts",
+      "meta": "System diagnostics",
+      "metaValue": "startup {{startupAge}} · 30m {{monitor30Age}} · 12h {{monitor12Age}} · EOD {{eodAge}}"
+    },
+    "columns": {
+      "startupChecks": "Startup Checks",
+      "reconciliationFacts": "Reconciliation Facts",
+      "issuesAndAdvice": "Issues & Advice"
+    },
+    "startup": {
+      "defaultName": "startup",
+      "messageFallback": "No message",
+      "empty": "No startup checks",
+      "names": {
+        "networkSmoke": "Network Smoke",
+        "apiCredentials": "API Credentials",
+        "funderAddress": "Funder Address",
+        "signatureType": "Signature Type",
+        "marketPreflight": "Market Preflight",
+        "orderStatusSupport": "Order Status Support",
+        "heartbeatSupport": "Heartbeat Support",
+        "userStream": "User Stream",
+        "clobHost": "CLOB Host"
+      }
+    },
+    "facts": {
+      "internalLedgerLabel": "Internal / Ledger",
+      "internalLedgerSub": "broker floor gap {{brokerGap}}",
+      "pendingStaleLabel": "Pending / Stale",
+      "pendingStaleSub": "entry {{entry}} · exit {{exit}}",
+      "snapshotAgeLabel": "Snapshot Age",
+      "snapshotAgeSub": "reconcile {{reconcileAge}} · events {{eventAge}}",
+      "fillsTodayLabel": "Fills Today",
+      "fillsTodaySub": "notional {{notional}} · account sync {{syncCount}}",
+      "startupChecksTodayLabel": "Startup Checks Today",
+      "startupChecksTodaySub": "last fill {{lastFill}}",
+      "openTrackedLabel": "Open / Tracked",
+      "openTrackedSub": "status {{status}}",
+      "operatorCleanupLabel": "Operator Cleanup",
+      "operatorCleanupSub": "{{processed}} · request {{requested}}{{remainingSuffix}}",
+      "operatorCleanupProcessed": "processed {{time}}",
+      "operatorCleanupQueued": "request queued",
+      "operatorCleanupRemaining": " · remain {{count}}",
+      "operatorCleanupWaiting": "clear_stale_pending has not been requested yet"
+    },
+    "issues": {
+      "stateReconciliationTitle": "State Reconciliation",
+      "monitor30Title": "30m Monitor",
+      "monitor12Title": "12h Monitor",
+      "eodIssueTitle": "EOD Issue",
+      "eodRecommendationTitle": "EOD Recommendation",
+      "operatorActionTitle": "Operator Action",
+      "operatorRequestedDetail": "clear_stale_pending has been requested and is waiting for the next runner cycle.",
+      "currentDiagnosisTitle": "Current Diagnosis",
+      "currentDiagnosisDetail": "Startup checks, monitor, and reconciliation have no standout issues right now. Keep watching the next report cycle."
+    },
+    "pending": {
+      "title": "Pending Orders",
+      "meta": "0 orders",
+      "metaValue": "{{orders}} orders",
+      "metaValueWithStale": "{{orders}} orders · stale {{stale}}",
+      "flowExit": "Exit",
+      "flowEntry": "Entry",
+      "empty": "There are no active pending / stale orders",
+      "table": {
+        "time": "Time",
+        "market": "Market",
+        "status": "Status",
+        "requestMatched": "Request / Matched",
+        "reason": "Reason"
+      }
+    },
+    "focus": {
+      "title": "Diagnostic Focus",
+      "meta": "Not selected",
+      "hint": "Click a startup check or pending order to inspect details",
+      "summary": "This area shows structured details for startup checks or pending orders so the operator can quickly decide the next step.",
+      "notSelected": "Not selected",
+      "waitingTag": "Waiting",
+      "waitingHint": "Click a startup check or pending order to inspect details",
+      "waitingSummary": "This area shows structured details for startup checks or pending orders so the operator can quickly decide the next step.",
+      "checkLabel": "Check",
+      "statusLabel": "Status",
+      "messageLabel": "Message",
+      "startupMeta": "startup · {{name}}",
+      "startupSummaryEmpty": "This startup check has no extra detail",
+      "pendingExitTag": "Exit Pending",
+      "pendingEntryTag": "Entry Pending",
+      "pendingMeta": "pending · {{label}}",
+      "pendingSummaryEmpty": "This pending order has no extra detail",
+      "labels": {
+        "marketDirection": "Market / Direction",
+        "orderTrace": "Order / Trace",
+        "requestedNotional": "Requested Notional",
+        "matchedHint": "Matched Hint",
+        "sourceWallet": "Source Wallet",
+        "entryWallet": "Entry Wallet",
+        "cycleSignal": "Cycle / Signal",
+        "timeHeartbeat": "Time / Heartbeat",
+        "topic": "Topic",
+        "conditionToken": "Condition / Token"
+      },
+      "values": {
+        "matchedHintEmpty": "No matched hint",
+        "sourceWalletEmpty": "Unlabeled source",
+        "entryWalletEmpty": "Unlabeled entry wallet",
+        "timeHeartbeat": "{{time}} · {{age}}{{heartbeatSuffix}}",
+        "heartbeatSuffix": " / heartbeat {{age}}"
+      },
+      "list": {
+        "status": "Status"
+      }
+    },
+    "runtime": {
+      "empty": {
+        "title": "No diagnostics yet",
+        "detail": "There is no diagnostic detail available for this window."
+      },
+      "meta": {
+        "title": "Diagnostics Meta",
+        "detail": "Latest {{count}} items · updated {{age}}"
+      },
+      "detail": {
+        "title": "Diagnostics Runtime",
+        "summary": "Current diagnostic item: {{label}}",
+        "hint": "Status {{label}} · Value {{value}}"
+      },
+      "summary": {
+        "title": "Diagnostics Summary",
+        "value": "{{count}} issues"
+      },
+      "list": {
+        "status": "Status",
+        "label": "{{label}}",
+        "value": "{{label}}: {{value}}"
+      },
+      "table": {
+        "title": "Diagnostics Table",
+        "label": "{{label}}"
+      },
+      "rank": {
+        "topWallets": "Priority Items",
+        "bottomWallets": "Secondary Items"
+      },
+      "value": {
+        "label": "{{label}}",
+        "detail": "{{label}}: {{value}}",
+        "empty": "No value"
+      },
+      "operatorAction": {
+        "clearedCount": "CLEARED {{count}}"
+      }
+    }
+  },
+  "exitReview": {
+    "panel": {
+      "title": "Exit Sample Replay",
+      "meta": "Latest 0",
+      "metaValue": "{{count}} recent exits · {{topics}} topics · {{sources}} sources"
+    },
+    "summary": {
+      "recentExit": "Recent Exit",
+      "filled": "Filled",
+      "rejected": "Rejected",
+      "amount": "Amount",
+      "avgHold": "Average Hold",
+      "maxHold": "Longest Hold"
+    },
+    "columns": {
+      "byKind": "By Exit Kind",
+      "byTopic": "By Topic",
+      "bySource": "By Source"
+    },
+    "filter": {
+      "state": "Filter State",
+      "reset": "Reset Filters",
+      "summary": "Filters: {{labels}}",
+      "summaryEmpty": "All exit samples"
+    },
+    "samples": {
+      "title": "Exit Samples",
+      "meta": "Latest 0",
+      "metaValue": "{{visible}} / {{total}} samples",
+      "table": {
+        "time": "Time",
+        "market": "Market",
+        "exit": "Exit",
+        "sourceTopic": "Source / Topic",
+        "amountSummary": "Amount Summary"
+      }
+    },
+    "detail": {
+      "title": "Exit Sample Detail",
+      "meta": "Not selected",
+      "hint": "Click an exit sample to inspect detail",
+      "summary": "This area shows the source wallet, topic, current position context, and the latest exit record for a single exit sample.",
+      "list": {
+        "status": "Status"
+      },
+      "chain": {
+        "title": "Same Token Event Chain",
+        "meta": "0 events"
+      }
+    },
+    "runtime": {
+      "defaults": {
+        "kind": "Exit Kind",
+        "exit": "exit"
+      },
+      "fillReject": "{{filled}} filled / {{rejected}} rejected",
+      "reviewList": {
+        "detail": "{{notional}} · {{count}} rows · avg {{avgHold}} · {{latest}}"
+      },
+      "empty": {
+        "title": "No exit samples yet",
+        "detail": "There are no exit records to replay in this window.",
+        "byKind": "No exit-kind stats",
+        "byTopic": "No topic stats",
+        "bySource": "No source stats",
+        "filteredSamples": "No exit samples match the current filters"
+      },
+      "sample": {
+        "statusDetail": "{{kind}} · hold {{hold}}",
+        "summaryEmpty": "No summary"
+      },
+      "detail": {
+        "title": "Exit Sample Runtime",
+        "summary": "Current sample: {{label}}",
+        "hint": "Source wallet {{label}} · result {{value}}",
+        "metaValue": "{{time}} · {{tag}}",
+        "summaryEmpty": "No exit summary",
+        "currentOpen": "Position still open",
+        "currentClosed": "No open position",
+        "currentPositionClosed": "No current position; exit may already be complete",
+        "entryWalletEmpty": "No entry wallet",
+        "entryReasonEmpty": "No entry rationale",
+        "latestExitEmpty": "No record",
+        "chainMetaValue": "{{count}} events",
+        "chainEmpty": "No same-token event chain",
+        "list": {
+          "marketDirection": "Market / Side",
+          "sourceWallet": "Source Wallet",
+          "entryContext": "Entry Context",
+          "entryReason": "Entry Reason",
+          "trace": "Replay Trace",
+          "holdMinutes": "Hold Duration",
+          "currentPosition": "Current Position",
+          "latestExit": "Latest Exit Record"
+        }
+      },
+      "event": {
+        "buy": "Buy",
+        "entry": "Entry",
+        "hold": "hold {{hold}}",
+        "reasonEmpty": "No detail"
+      }
+    }
+  },
+  "traceReview": {
+    "panel": {
+      "title": "Signal Replay",
+      "meta": "Latest 0 cycles",
+      "metaValue": "{{cycles}} recent cycles · {{traces}} traces"
+    },
+    "summary": {
+      "recentCycles": "Recent Cycles",
+      "candidates": "Candidate Signals",
+      "filled": "Filled",
+      "rejected": "Rejected",
+      "activeTraces": "Active Traces",
+      "closedTraces": "Closed Traces"
+    },
+    "columns": {
+      "recentCycles": "Recent Signal Cycles",
+      "cycleCandidates": "Cycle Candidate Signals",
+      "cycleCandidatesMeta": "0 candidates",
+      "cycleCandidatesMetaValue": "{{count}} candidates"
+    },
+    "table": {
+      "market": "Market",
+      "wallet": "Wallet",
+      "action": "Action",
+      "decision": "Decision",
+      "order": "Order"
+    },
+    "detail": {
+      "title": "Trace Decision Chain",
+      "meta": "Not selected",
+      "hint": "Click a position, exit sample, or candidate signal to inspect the full chain",
+      "summary": "This area shows the full decision chain for a trace, from the first entry through add, trim, and exit.",
+      "list": {
+        "status": "Status"
+      },
+      "chain": {
+        "title": "Decision Chain",
+        "meta": "0 events"
+      }
+    },
+    "runtime": {
+      "cycles": {
+        "previewEmpty": "wallet pool snapshot",
+        "countValue": "{{count}} sig",
+        "detail": "{{filled}} filled / {{rejected}} rejected / {{skipped}} skipped · {{preview}}"
+      },
+      "candidates": {
+        "previewEmpty": "No wallet-pool snapshot",
+        "topicBiasNeutral": "neutral",
+        "decisionPass": "Pass",
+        "noOrder": "No order",
+        "candidateState": "candidate"
+      },
+      "empty": {
+        "title": "No trace yet",
+        "detail": "There is no signal chain to replay in this window.",
+        "cycles": "No signal cycles",
+        "cycleCandidates": "No candidate signals in the selected cycle"
+      },
+      "detail": {
+        "title": "Trace Runtime",
+        "summary": "Current trace: {{label}}",
+        "hint": "Decision {{label}} · result {{value}}",
+        "metaValue": "{{traceId}} · {{market}}",
+        "noOrder": "No order",
+        "entryReasonEmpty": "No entry rationale",
+        "entryWalletEmpty": "No entry wallet",
+        "currentPositionEmpty": "No current position",
+        "closedAt": "closed",
+        "chainMetaValue": "{{count}} events",
+        "chainReasonEmpty": "No detail",
+        "poolPreview": "pool {{preview}}",
+        "chainEmpty": "No decision chain",
+        "list": {
+          "marketDirection": "Market / Side",
+          "firstEntry": "First Entry",
+          "currentPosition": "Current Position",
+          "latestAction": "Latest Action",
+          "openedTime": "Opened At",
+          "currentStatus": "Current Status"
+        }
+      }
+    }
+  },
+  "attributionReview": {
+    "panel": {
+      "title": "Attribution Report",
+      "meta": "Latest 0 orders",
+      "metaValue": "ledger {{orders}} orders · {{exits}} exits"
+    },
+    "windows": {
+      "24h": "24h",
+      "7d": "7d",
+      "30d": "30d",
+      "all": "All"
+    },
+    "window": {
+      "meta": "24h",
+      "metaValue": "{{label}} · {{orders}} orders"
+    },
+    "summary": {
+      "orders": "Orders",
+      "filled": "Filled",
+      "rejected": "Rejected",
+      "exits": "Exits",
+      "highScoreRejects": "High-Score Rejects",
+      "topics": "Topics"
+    },
+    "columns": {
+      "byWallet": "By Wallet",
+      "byTopic": "By Topic",
+      "byExitKind": "By Exit Kind",
+      "rejectReasons": "Reject Reasons",
+      "holdBuckets": "Hold Duration",
+      "topBottom": "Top / Bottom"
+    },
+    "tables": {
+      "walletTopic": {
+        "title": "Wallet x Topic",
+        "meta": "0 rows",
+        "wallet": "Wallet",
+        "topic": "Topic",
+        "fillReject": "Fill / Reject",
+        "amount": "Amount",
+        "hold": "Hold"
+      },
+      "topicExit": {
+        "title": "Topic x Exit Kind",
+        "meta": "0 rows",
+        "topic": "Topic",
+        "exitKind": "Exit Kind",
+        "fillReject": "Fill / Reject",
+        "amount": "Amount",
+        "hold": "Hold"
+      },
+      "sourceResult": {
+        "title": "Source x Result",
+        "meta": "0 rows",
+        "source": "Source",
+        "result": "Result",
+        "count": "Count",
+        "amount": "Amount",
+        "rejectRate": "Reject Rate"
+      }
+    },
+    "rank": {
+      "topWallets": "Top Wallets",
+      "bottomWallets": "Bottom Wallets",
+      "topTopics": "Top Topics",
+      "bottomTopics": "Bottom Topics"
+    },
+    "runtime": {
+      "defaults": {
+        "topic": "Unlabeled Topic",
+        "exit": "Exit",
+        "reject": "Reject",
+        "holdBucket": "Hold Bucket"
+      },
+      "empty": {
+        "title": "No attribution samples yet",
+        "detail": "There are no attribution results to show in this window.",
+        "byWallet": "No wallet attribution",
+        "byTopic": "No topic attribution",
+        "byExitKind": "No exit attribution",
+        "rejectReasons": "No reject attribution",
+        "holdBuckets": "No hold-duration attribution",
+        "rankings": "No ranking"
+      },
+      "meta": {
+        "title": "Attribution Meta",
+        "detail": "Latest {{count}} orders · updated {{age}}"
+      },
+      "detail": {
+        "title": "Attribution Runtime",
+        "summary": "Current attribution dimension: {{label}}",
+        "hint": "Value {{value}} · Label {{label}}"
+      },
+      "summary": {
+        "title": "Attribution Summary",
+        "value": "{{count}} attribution items"
+      },
+      "list": {
+        "status": "Status",
+        "label": "{{label}}",
+        "value": "{{label}}: {{value}}",
+        "fillRejectShort": "{{filled}} filled / {{rejected}} rejected",
+        "walletDetail": "{{entryCount}} in / {{exitCount}} out · {{notional}} · reject {{rejectRate}}",
+        "topicDetail": "{{entryCount}} in / {{exitCount}} out · {{notional}} · avg {{hold}}",
+        "exitDetail": "{{filled}} filled / {{rejected}} rejected · {{notional}} · avg {{hold}}",
+        "rejectDetail": "{{rejected}} times · high-score wallets {{highScoreRejected}} times · avg {{walletScore}}",
+        "holdBucketDetail": "{{count}} times · avg {{avgHold}} · max {{maxHold}}",
+        "rankTopDetail": "{{filled}}F · {{notional}}",
+        "rankBottomDetail": "{{rejected}}R · reject {{rejectRate}}"
+      },
+      "table": {
+        "title": "Attribution Table",
+        "label": "{{label}}",
+        "metaRows": "{{count}} rows",
+        "walletTopicEmpty": "No wallet x topic attribution",
+        "topicExitEmpty": "No topic x exit attribution",
+        "sourceResultEmpty": "No source x result attribution"
+      },
+      "rank": {
+        "topWallets": "Top Wallets",
+        "bottomWallets": "Bottom Wallets"
+      },
+      "value": {
+        "label": "{{label}}",
+        "detail": "{{label}}: {{value}}",
+        "empty": "No value"
+      }
+    }
+  },
+  "health": {
+    "runtime": "state {{age}} · bot {{poll}}s",
+    "discovery": "{{mode}} / {{enabled}}"
+  },
+  "monitor": {
+  "meta": "30m {{monitor30Age}} · 12h {{monitor12Age}} · EOD {{eodAge}}",
+    "report": {
+      "title": "Monitor Report",
+      "meta": "30m / 12h / EOD",
+      "summary": {
+        "ready": "Monitor Ready",
+        "window30m": "30m",
+        "window12h": "12h",
+        "windowEod": "EOD",
+        "ledgerDiff": "Ledger Gap",
+        "fillsToday": "Today's Fills"
+      },
+      "callout": {
+        "title": "Execution and Monitor Aligned",
+        "detail": "Execution and monitor pipelines are aligned"
+      },
+      "columns": {
+        "window30m": "30m Window",
+        "window12h": "12h Window",
+        "eod": "EOD"
+      },
+      "breakdown": {
+        "title": "Fill Breakdown",
+        "meta": "Sources / Sides",
+        "card": "Fill Breakdown"
+      },
+      "runtime": {
+        "empty": {
+          "title": "No monitor report yet",
+          "detail": "There is no monitor runtime for this window yet."
+        },
+        "meta": {
+          "title": "Monitor Runtime Meta",
+          "detail": "Latest {{count}} reports · updated {{age}}"
+        },
+        "detail": {
+          "title": "Monitor Runtime",
+          "summary": "Current window: {{label}}",
+          "hint": "Status {{label}} · Value {{value}}"
+        },
+        "summary": {
+          "title": "Monitor Summary",
+          "value": "{{count}} reports"
+        },
+        "list": {
+          "status": "Status",
+          "label": "{{label}}",
+          "value": "{{label}}: {{value}}"
+        },
+        "table": {
+          "title": "Monitor Table",
+          "label": "{{label}}"
+        },
+        "rank": {
+          "topWallets": "Preferred Windows",
+          "bottomWallets": "Secondary Windows"
+        },
+        "value": {
+          "label": "{{label}}",
+          "detail": "{{label}}: {{value}}",
+          "empty": "No value"
+        }
+      }
+    },
+  "window": {
+    "stale": "STALE",
+    "staleAgeTag": "STALE · {{age}}",
+    "inconclusiveCount": "INCONCLUSIVE x{{count}}",
+    "label": "{{label}} Window",
+    "summaryWithFreshness": "{{summary}} · {{freshness}}",
+    "generatedValue": "{{time}} · {{age}}",
+    "notGenerated": "Report not generated yet",
+    "samplesTitle": "Samples & Counts",
+    "execValue": "{{count}} EXEC",
+    "samplesDetail": "skip max {{skipMax}} · cooldown {{cooldown}} · time exit {{timeExit}}{{rejectSuffix}}",
+    "samplesRejectSuffix": " · reject {{reject}}",
+    "syncTitle": "Ratios & Sync",
+    "syncDetail": "skip {{skipRatio}} · exit {{exitRatio}}{{rejectSuffix}} · reconcile {{reconcileAge}} · events {{eventAge}}",
+    "syncRejectSuffix": " · reject {{rejectRatio}}",
+    "recommendationDiff": "{{final}} · raw monitor: {{raw}}",
+    "finalAdviceTitle": "Final Recommendation",
+    "noAdvice": "No recommendation"
+  },
+    "summary": {
+      "startupReady": "Startup Ready",
+      "monitor30": "30m",
+      "monitor12": "12h",
+      "eod": "EOD",
+      "ledgerGap": "Ledger Gap",
+      "todayFills": "Today's Fills",
+      "fills": "{{count}} fills / {{notional}}"
+    },
+  "callout": {
+    "alignedTag": "ALIGNED",
+    "alignedTitle": "Execution and monitor pipelines are aligned",
+    "alignedBody": "30m {{monitor30Age}}, 12h {{monitor12Age}}, EOD {{eodAge}}.",
+    "startupBlockedTag": "BLOCK",
+    "startupBlockedTitle": "Startup checks are not ready",
+    "startupBlockedBody": "Fix smoke, account, or broker prerequisites before discussing parameters or strategy performance.",
+    "reconciliationFailedTag": "RECON FAIL",
+    "reconciliationFailedTitle": "Execution facts are drifting",
+    "reconciliationFailedBodyFallback": "Check ledger drift, broker sync, and stale pending orders first.",
+    "observeTag": "OBSERVE",
+    "observeTitle": "Execution layer has warnings; avoid tuning parameters for now",
+    "observeBodyStale": "Monitor reports are stale: 30m {{monitor30Age}}, 12h {{monitor12Age}}.",
+    "observeBodyFallback": "Handle stale pending orders, snapshot age, and reconcile age first."
+  },
+  "eod": {
+    "noRecommendation": "No EOD recommendation",
+    "statusTitle": "EOD Status",
+    "statusDetail": "{{dayKey}} · {{generated}} · latest fill {{latestFill}}",
+    "pnlTitle": "PnL & Diff",
+    "pnlDetail": "internal vs ledger {{internalDiff}} · broker floor gap {{brokerGap}}",
+    "startupPendingTitle": "Startup & Pending",
+    "startupPendingValue": "{{failures}} fail / {{warnings}} warn",
+    "startupPendingDetail": "stale pending {{stalePending}} · open {{openCount}} · tracked {{tracked}}",
+    "actionsTitle": "Recommended Actions",
+    "actionsDetail": "{{issuesPrefix}}{{recommendations}}",
+    "actionsIssuesPrefix": "{{issues}} · "
+  },
+  "breakdown": {
+    "sourceCard": "Source {{source}}",
+    "sideCard": "Side {{side}}",
+    "fills": "{{count}} fills",
+    "amount": "Amount",
+    "realized": "Realized",
+    "metaValue": "{{sources}} sources / {{sides}} sides",
+    "emptyLabel": "Fill Breakdown",
+    "emptyValue": "No fills today"
+  }
+  },
+  "opsGate": {
+    "banner": {
+      "title": "Ops Gate",
+      "detail": "This area surfaces the combined conclusion from startup, self-checks, monitor, and reconciliation.",
+      "tag": {
+        "wait": "WAIT"
+      },
+      "checks": {
+        "status": "Check Status"
+      },
+      "actions": {
+        "title": "Action Suggestions",
+        "meta": "0 actions",
+        "waitingTag": "WAIT",
+        "waitingTitle": "Waiting for ops gate guidance",
+        "waitingDetail": "This section will propose the next action based on startup, monitor, and reconciliation."
+      }
+    },
+    "titleFallback": "Ops gate is waiting for data",
+    "detailFallback": "This area surfaces the combined conclusion from startup, self-checks, monitor, and reconciliation.",
+    "pillLabel": "Ops Gate {{label}}",
+    "issuesLabel": "Key issue",
+    "actionsMeta": "{{visible}}/{{total}} actions",
+    "actionsMetaSimple": "{{count}} actions",
+    "emptyActionTitle": "Waiting for ops gate guidance",
+    "emptyActionDetail": "This section will propose the next action based on startup, monitor, and reconciliation.",
+    "levelTag": {
+      "danger": "Priority",
+      "ok": "Continue",
+      "wait": "Watch"
+    },
+    "runtime": {
+      "checks": {
+        "startupLabel": "Startup",
+        "monitor30Label": "30m",
+        "monitor12Label": "12h",
+        "reconciliationLabel": "Reconciliation",
+        "startupCounts": "{{failures}} fail / {{warnings}} warn",
+        "issueLine": "{{name}}: {{message}}"
+      },
+      "state": {
+        "readyTitle": "Execution gate is ready",
+        "readyDetail": "Startup, self-checks, monitor, and reconciliation have no blockers right now; keep watching strategy and execution quality.",
+        "blockTitle": "Ops gate is blocking",
+        "blockDetailFallback": "Startup checks failed or live prerequisites are missing. Fix environment and account issues first.",
+        "escalateTitle": "Execution reconciliation needs escalation",
+        "escalateFailDetail": "Reconciliation is currently failing{{summarySuffix}}. Stop parameter changes and generate an EOD reconciliation report to verify ledger drift.",
+        "escalateFallback": "The ledger and broker fact layers may have drifted. Stop parameter changes first.",
+        "observeTitle": "Warnings are active; observe before tuning",
+        "observeWarnDetail": "Reconciliation is currently warning{{summarySuffix}}. Check freshness and sync age before deciding whether monitor is only sample-thin.",
+        "observeMonitorDetail": "Monitor is still in observe mode: {{focus}}. Add more samples or refresh stale reports before changing parameters.",
+        "observeStaleDetail": "Monitor reports are stale: {{windows}}. Refresh the 30m / 12h reports before deciding whether tuning is needed.",
+        "observeFallback": "This currently looks more like execution warning noise than a strategy signal conclusion.",
+        "summarySuffix": " ({{summary}})"
+      },
+      "controls": {
+        "copyCommand": "Copy Command",
+        "openStateJson": "Open State JSON",
+        "jumpDiagnostics": "Jump to Diagnostics",
+        "jumpMonitor": "Jump to Monitor",
+        "refreshEodReport": "Refresh EOD Report",
+        "openEodJson": "Open EOD JSON",
+        "clearStalePending": "Clear Stale Pending",
+        "jumpOrders": "Jump to Orders",
+        "open30mJson": "Open 30m JSON",
+        "open12hJson": "Open 12h JSON",
+        "copyInstallCommand": "Copy Install Command"
+      },
+      "actions": {
+        "networkSmoke": {
+          "title": "Rerun network smoke",
+          "detail": "Run <code>make network-smoke</code> first and confirm geoblock / endpoint health; current note: {{message}}.",
+          "fallbackMessage": "network smoke needs review"
+        },
+        "liveCredentials": {
+          "title": "Verify live account and signature config",
+          "detail": "Check <code>PRIVATE_KEY</code>, <code>FUNDER_ADDRESS</code>, and <code>CLOB_SIGNATURE_TYPE</code> so API credentials can be derived reliably; current note: {{message}}."
+        },
+        "marketPreflight": {
+          "title": "Restore market preflight",
+          "detail": "Confirm the live broker has a market client configured, or book / midpoint / tick preflight will reject immediately; current note: {{message}}."
+        },
+        "orderStatusSupport": {
+          "title": "Fix broker order-query support",
+          "detail": "Verify the <code>py-clob-client</code> version and adapter layer so <code>get_order</code> / <code>get_orders</code> are available; current note: {{message}}."
+        },
+        "heartbeat": {
+          "title": "Confirm heartbeat strategy",
+          "detail": "There are currently <code>{{pendingCount}}</code> pending orders, but the SDK may lack heartbeat support. Avoid relying on long-lived resting orders for now; current note: {{message}}."
+        },
+        "userStream": {
+          "title": "Check user stream dependencies",
+          "detail": "Install <code>websocket-client</code> and verify <code>USER_STREAM_*</code> config, otherwise the system falls back to polling reconcile; current note: {{message}}."
+        },
+        "clobHost": {
+          "title": "Verify CLOB host",
+          "detail": "Check live CLOB host configuration and network reachability; current note: {{message}}."
+        },
+        "ledgerDrift": {
+          "title": "Review ledger drift first",
+          "detail": "Current internal ledger gap is <code>{{diff}}</code>. Generate <code>make reconciliation-report</code> first and verify realized PnL for the day."
+        },
+        "stalePending": {
+          "title": "Handle stale pending orders",
+          "detail": "There are still <code>{{count}}</code> stale pending orders. Check broker open orders / recent fills first, and cancel if needed before moving on."
+        },
+        "syncAge": {
+          "title": "Refresh broker / account sync",
+          "detail": "Sync freshness is aging out: account <code>{{accountAge}}</code>, reconcile <code>{{reconcileAge}}</code>, events <code>{{eventAge}}</code>. Verify the daemon and user stream are still updating."
+        },
+        "inconclusive": {
+          "title": "Build more sample windows",
+          "detail": "Monitor still has <code>{{windows}}</code> inconclusive windows. Keep observing execution samples and do not tune parameters off zero-sample windows.",
+          "windowPart": "{{label}} for {{count}} consecutive windows",
+          "unknownCount": "?"
+        },
+        "monitorSummary": {
+          "title": "Handle execution issues in monitor summary first",
+          "detail": "Read the raw 30m / 12h monitor guidance first and refresh stale windows; current 30m {{monitor30}} / 12h {{monitor12}}."
+        },
+        "consistency": {
+          "title": "Keep watching shadow / live consistency",
+          "detail": "The gate is currently clear. Keep comparing the 12h monitor with EOD reconciliation and watch whether the next startup / broker sync cycle stays stable."
+        }
+      }
+    }
+  },
+  "timeline": {
+    "panel": {
+      "title": "Automated Trading Timeline",
+      "subtitle": "System Timeline"
+    },
+    "empty": "No timeline events yet",
+    "notRecorded": "Not recorded"
+  },
+  "wallet": {
+    "component": {
+      "notional": "Notional",
+      "positions": "Active Positions",
+      "unique_markets": "Market Diversity",
+      "concentration": "Concentration",
+      "activity": "Activity",
+      "history_win_rate": "Historical Win Rate",
+      "history_roi": "Historical Return",
+      "history_profit_factor": "Profit Factor",
+      "history_resolution": "Resolution Hit Rate"
+    },
+    "detail": {
+      "empty": {
+        "title": "Not selected",
+        "subtitle": "Click a wallet row to inspect detail",
+        "summary": "This area shows scoring logic, historical samples, and realized performance for a single wallet."
+      },
+      "mode": {
+        "tradeEnabled": "Trade Enabled",
+        "observeOnly": "Observe Only"
+      },
+      "summaryEmpty": "No score summary yet",
+      "topicCount": "{{count}} themes",
+      "values": {
+        "status": "{{score}} pts · {{mode}}",
+        "positionProfile": "{{positions}} positions · {{markets}} markets · {{notional}}U",
+        "history": "closed {{closed}} / resolved {{resolved}} · {{age}}",
+        "performance": "ROI {{roi}} · Win {{winRate}}",
+        "resolutionPf": "Resolution {{resolvedWinRate}} · PF {{profitFactor}}",
+        "realizedPnl": "{{realizedPnl}} / bought {{totalBought}}",
+        "activity": "{{count}} events",
+        "poolPriority": "#{{rank}} · {{score}}{{topicSuffix}}",
+        "winBreakdown": "{{wins}}/{{closed}} · resolved {{resolvedWins}}/{{resolvedMarkets}}",
+        "topicResolved": "resolved {{resolvedWinRate}}",
+        "sampleResolved": "resolved{{winnerSuffix}}",
+        "sampleResolvedWinner": " / winner {{winner}}"
+      },
+      "list": {
+        "status": "Current Status",
+        "positionProfile": "Position Profile",
+        "history": "History",
+        "performance": "Performance",
+        "resolutionPf": "Resolution / PF",
+        "realizedPnl": "Realized PnL",
+        "activity": "Activity",
+        "poolPriority": "Pool Priority",
+        "winBreakdown": "Win Breakdown"
+      },
+      "history": {
+        "resolvedEmpty": "resolved --",
+        "sampleCount": "{{count}} samples",
+        "unresolved": "Unresolved",
+        "empty": "No settled samples yet"
+      }
+    },
+    "historyProfile": {
+      "missing": {
+        "label": "Missing",
+        "detail": "No settled history"
+      },
+      "thin": {
+        "label": "Thin",
+        "detail": "closed {{closed}} / min {{minClosed}}"
+      },
+      "strong": {
+        "label": "Strong",
+        "detail": "closed {{closed}} / resolved {{resolved}}"
+      },
+      "usable": {
+        "label": "Usable",
+        "detail": "closed {{closed}} / resolved {{resolved}}"
+      }
+    },
+    "sampleVerdict": {
+      "resolvedCorrect": "Correct",
+      "resolvedWrong": "Missed",
+      "profit": "Profit",
+      "loss": "Loss",
+      "flat": "Flat"
+    },
+    "source": {
+      "unlabeled": "Unlabeled source",
+      "systemTimeExit": "System time exit",
+      "systemEmergencyStop": "System emergency stop"
+    }
+  },
+  "runner": {
+    "candidateRecommendation": {
+      "marketDataUnavailable": "There is no sell-side liquidity to follow right now. Watch first to avoid hitting a thin book.",
+      "marketWindowElapsed": "This short-duration market has already ended, so the old signal is no longer actionable.",
+      "marketNearClose": "This short-duration market is close to ending, so skip chasing the last stretch.",
+      "marketClosed": "The market is closed and cannot open a new position.",
+      "marketInactive": "The market is not active right now, so stay out for now.",
+      "marketNotAcceptingOrders": "The market is not accepting orders right now, so watch first.",
+      "spreadTooWide": "The spread is too wide right now, so watch first.",
+      "chaseTooHigh": "Price has already moved too far, so chase risk is elevated.",
+      "momentumTooWeak": "Short-term momentum has weakened, so wait for a better entry.",
+      "existingPositionConflict": "There is already a position in this market, so avoid duplicate exposure.",
+      "sellCrossWalletExit": "{{count}} wallets are exiting in resonance, so trim first.",
+      "sellFullExit": "The source wallet has mostly exited, so prioritize following the exit.",
+      "sellPartialExit": "The source wallet is trimming, so a partial exit fits better.",
+      "existingPositionPresent": "There is already a live position, so watch before adding again.",
+      "buyMomentumStrong": "5m/30m momentum is both strengthening, so {{action}} is more aligned with trend.",
+      "buyMomentumWeak": "5m/30m momentum is both weak, so be cautious before {{action}}.",
+      "follow": "Score {{score}} with a strong wallet tier supports a normal follow.",
+      "buyNormal": "Score {{score}} suggests a solid opportunity for normal-size follow.",
+      "buySmall": "Score {{score}} is worth following, but a smaller probe size fits better.",
+      "watchDefault": "Score {{score}} suggests waiting for more confirmation."
+    },
+    "candidateFactor": {
+      "wallet": {
+        "label": "Wallet Strength"
+      },
+      "walletValue": "{{tier}} · {{score}}",
+      "confidence": {
+        "label": "Confidence"
+      },
+      "topic": {
+        "label": "Topic Bias"
+      },
+      "marketState": {
+        "label": "Market State",
+        "detail": "Prefer authoritative market metadata for closed, active, accepting-orders, and end-time state.",
+        "closed": "closed",
+        "inactive": "inactive",
+        "acceptingOrdersFalse": "acceptingOrders=false",
+        "metadata": "metadata",
+        "remainSeconds": "{{seconds}}s remaining"
+      },
+      "spread": {
+        "label": "Spread",
+        "detail": "A wider spread makes chasing less attractive."
+      },
+      "chase": {
+        "label": "Chase Distance",
+        "detail": "How far the live ask is above the source price."
+      },
+      "momentum": {
+        "label": "Price Momentum",
+        "detail": "Momentum helps judge whether the order is trend-following or counter-trend."
+      },
+      "existingPosition": {
+        "label": "Existing Position",
+        "detailDefault": "An existing position is already open."
+      },
+      "exit": {
+        "label": "Exit Fraction",
+        "detail": "Sell signals mainly reflect the source wallet trimming or fully exiting."
+      },
+      "resonanceExit": {
+        "label": "Resonance Exit",
+        "value": "{{count}} wallets",
+        "detail": "When multiple wallets trim together, exit priority rises."
+      },
+      "decision": {
+        "label": "Suggested Action"
+      },
+      "skipReason": {
+        "label": "Skip Reason"
+      }
+    },
+    "candidateExplanation": {
+      "walletSummary": "Wallet {{tier}} · {{walletScore}} pts · confidence {{confidence}}",
+      "topicSummary": "Topic {{topic}} · bias {{bias}} · multiplier {{multiplier}}",
+      "marketPrefix": "Market {{bits}}",
+      "marketStatusPrefix": "State {{bits}}",
+      "historyMomentum": "History {{points}} points · 5m {{momentum5m}} · 30m {{momentum30m}}",
+      "trendStrong": "5m/30m trend is aligned to the upside.",
+      "trendWeak": "5m/30m trend is aligned to the downside.",
+      "existingPosition": "Existing position {{notional}}{{sourceSuffix}}",
+      "existingSourceSuffix": " · source {{tier}}",
+      "sellCrossWalletExit": "Cross-wallet resonance exit across {{count}} wallets",
+      "sellExitFraction": "Exit fraction {{fraction}}",
+      "buyObservedNotional": "Observed notional {{notional}} · action {{action}}",
+      "skipPrefix": "Why not chase yet: {{reason}}",
+      "decisionSummary": "Suggested action {{action}} · score {{score}}",
+      "buyMomentumStrong": "Short-term momentum is aligned and stronger, so chase pressure is lower.",
+      "buyMomentumWeak": "Short-term momentum is aligned and weaker, so do not rush the chase.",
+      "marketBit": {
+        "mid": "mid {{value}}",
+        "ask": "ask {{value}}",
+        "bid": "bid {{value}}",
+        "spread": "spread {{value}}",
+        "chase": "chase {{value}}"
+      },
+      "marketStatusBit": {
+        "closed": "closed",
+        "inactive": "inactive",
+        "acceptingOrdersFalse": "acceptingOrders=false",
+        "timeSource": "time {{value}}",
+        "endDate": "end {{value}}",
+        "remainSeconds": "{{seconds}}s remaining"
+      }
+    }
+  },
+  "web": {
+    "field": {
+      "force": "Force Refresh",
+      "candidate_id": "Candidate ID",
+      "action": "Action",
+      "mode": "Mode",
+      "text": "Text",
+      "wallet": "Wallet",
+      "trust_score": "Trust Score",
+      "followability_score": "Followability Score",
+      "avg_hold_minutes": "Average Hold Minutes",
+      "enabled": "Enabled"
+    },
+    "api": {
+      "unauthorized": "Unauthorized",
+      "forceInvalidBool": "Force refresh must be true or false",
+      "candidateIdRequired": "Candidate ID is required",
+      "candidateNotFound": "Candidate {{candidateId}} was not found",
+      "csvRequiresSingleScope": "CSV export requires a single scope",
+      "exportUnsupportedFormat": "Unsupported export format",
+      "notFound": "Endpoint not found",
+      "candidateActionRequired": "Candidate ID and action are required",
+      "invalidMode": "Invalid mode",
+      "textRequired": "Text is required",
+      "walletRequired": "Wallet is required",
+      "walletProfileFieldsUnsupported": "Unsupported wallet profile fields",
+      "invalidCommand": "Invalid command",
+      "stalePendingQueued": "Stale pending cleanup request queued",
+      "validationFailed": "Request validation failed",
+      "reportGenerationFailed": "Failed to generate reconciliation report",
+      "fieldMustBeNumber": "{{field}} must be a number",
+      "fieldMustBeBoolean": "{{field}} must be a boolean"
+    },
+    "auth": {
+      "title": "Polymarket Dashboard Access",
+      "heading": "Protected Access",
+      "description": "This dashboard requires an access token. Open a shared link with {{tokenQuery}} or enter the access token here.",
+      "placeholder": "Enter access token",
+      "submit": "Open dashboard"
+    }
+  },
+  "cli": {
+    "main": {
+      "description": "Polymarket automated trader entrypoint",
+      "once": "Run one cycle and exit",
+      "runtime": {
+        "liveRequiresSecrets": "LIVE mode requires PRIVATE_KEY and FUNDER_ADDRESS"
+      }
+    }
+  },
+  "script": {
+    "checkEnv": {
+      "cli": {
+        "description": "Validate .env against .env.example",
+        "warnOnly": "Print warnings only and do not exit non-zero on problems"
+      },
+      "problem": {
+        "missingRequiredKey": "Missing required key in .env: {{key}}",
+        "dryRunRequiresKey": "DRY_RUN=false requires {{key}} to be set",
+        "dryRunRequiresTrue": "DRY_RUN=false requires {{key}}=true",
+        "missingExample": "Missing .env.example; expected keys cannot be validated",
+        "missingEnv": "Missing .env; create it from .env.example"
+      },
+      "warning": {
+        "missingOptionalKeys": "Missing optional keys in .env: {{keys}}",
+        "blockbeatsUnavailable": "BLOCKBEATS_API_KEY is not set; the shared BlockBeats skill and scripts/blockbeats_query.sh will be unavailable",
+        "remoteAlertMissing": "DRY_RUN=false has no remote alert channel configured (webhook or telegram)"
+      },
+      "output": {
+        "prefix": {
+          "warn": "WARN: ",
+          "error": "ERROR: "
+        },
+        "ok": "OK: .env looks good"
+      }
+    }
+  },
+  "report": {
+    "liveSmokePreflight": {
+      "status": {
+        "ready": "READY",
+        "blocked": "BLOCKED"
+      },
+      "cli": {
+        "description": "Safe preflight for live connectivity smoke. Does not place orders.",
+        "reportPath": "Optional JSON report output path."
+      },
+      "check": {
+        "dryRunDisabled": "DRY_RUN=false is required for live smoke preflight",
+        "liveSecrets": "PRIVATE_KEY and FUNDER_ADDRESS must both be configured",
+        "liveAdmissionFlags": "LIVE_ALLOWANCE_READY, LIVE_GEOBLOCK_READY, and LIVE_ACCOUNT_READY must all be true",
+        "remoteAlertConfigured": "A remote alert channel must be configured before live smoke",
+        "stateFilePresent": "The live state file must exist and be readable",
+        "stateFresh": "The live state age must be less than or equal to {{maxAge}} seconds",
+        "decisionModeManual": "decision_mode must be manual before live smoke",
+        "pauseOpeningEnabled": "pause_opening must remain true before live smoke",
+        "startupReady": "startup_ready must be true",
+        "reconciliationOk": "reconciliation.status must be ok",
+        "persistenceOk": "persistence.status must be ok",
+        "openPositionsZero": "open_positions must be 0 before live smoke",
+        "trackedNotionalZero": "tracked_notional_usd must be 0 before live smoke"
+      },
+      "blocker": {
+        "dryRunTrue": "DRY_RUN is true",
+        "liveSecretsMissing": "Live credentials are not fully configured",
+        "liveAdmissionFlagsMissing": "Live admission confirmations are incomplete",
+        "remoteAlertNotConfigured": "Remote alert channel is not configured",
+        "stateFileMissing": "Live state file is missing or unreadable",
+        "stateStale": "Live state is stale",
+        "decisionModeNotManual": "decision_mode is not manual",
+        "pauseOpeningDisabled": "pause_opening is not enabled",
+        "startupNotReady": "startup_ready is false",
+        "reconciliationNotOk": "reconciliation.status is not ok",
+        "persistenceNotOk": "persistence.status is not ok",
+        "openPositionsNonZero": "open_positions is not zero",
+        "trackedNotionalNonZero": "tracked_notional_usd is not zero"
+      }
+    },
+    "rehearsalFinalize": {
+      "title": "Polymarket Rehearsal Finalize",
+      "common": {
+        "na": "n/a"
+      },
+      "status": {
+        "missing": "MISSING",
+        "pending": "PENDING",
+        "failed": "FAILED",
+        "completed": "COMPLETED"
+      },
+      "nextAction": {
+        "waitForRehearsalCompletion": "Wait for rehearsal completion",
+        "configureRealRemoteAlerts": "Configure real remote alerts",
+        "executeRealLiveSmoke": "Execute real live smoke"
+      },
+      "field": {
+        "status": "status: {{value}}",
+        "checkpointCount": "checkpoint_count: {{count}} / {{expected}}",
+        "lastCheckpoint": "last_checkpoint: {{value}}"
+      },
+      "section": {
+        "checks": "checks:"
+      },
+      "row": {
+        "check": "- {{name}}: {{status}}"
+      },
+      "checkStatus": {
+        "pass": "PASS",
+        "fail": "FAIL"
+      },
+      "cli": {
+        "description": "Finalize the 24h rehearsal once it completes.",
+        "rehearsalPath": "Optional rehearsal file path.",
+        "outputPath": "Optional JSON report output path.",
+        "runChecks": "If rehearsal is complete, also run the post-rehearsal checks.",
+        "json": "Emit JSON instead of text."
+      }
+    },
+    "replayRuntime": {
+      "cli": {
+        "description": "Replay and summarize Polymarket runtime artifacts",
+        "json": "Output summary as JSON"
+      },
+      "section": {
+        "runtimeState": "-- runtime state --",
+        "events": "-- events --",
+        "replay": "-- replay --"
+      },
+      "field": {
+        "path": "path: {{value}}",
+        "exists": "exists: {{value}}",
+        "version": "version: {{value}}",
+        "timestamp": "ts: {{value}}",
+        "openPositions": "open_positions: {{value}}",
+        "trackedNotionalUsd": "tracked_notional_usd: {{value}}",
+        "count": "count: {{value}}",
+        "lastEventTs": "last_event_ts: {{value}}",
+        "totalBuyNotional": "total_buy_notional: {{value}}",
+        "totalSellNotional": "total_sell_notional: {{value}}",
+        "reconstructedOpenPositions": "reconstructed_open_positions: {{value}}",
+        "reconstructedTrackedNotionalUsd": "reconstructed_tracked_notional_usd: {{value}}",
+        "deltaPositions": "delta_positions: {{value}}",
+        "deltaNotionalUsd": "delta_notional_usd: {{value}}"
+      },
+      "row": {
+        "eventType": "  {{type}}: {{count}}"
+      }
+    },
+    "faultDrill": {
+      "title": "Polymarket Fault Drill",
+      "field": {
+        "ok": "ok: {{value}}",
+        "testsRun": "tests_run: {{value}}",
+        "durationSeconds": "duration_seconds: {{value}}",
+        "goal": "  goal: {{value}}",
+        "resultPass": "result: PASS",
+        "resultFail": "result: FAIL",
+        "coverage": "coverage: startup gate, persistence halt, and reconcile ambiguity protections are all exercised."
+      },
+      "row": {
+        "category": "[DRILL] {{category}}: {{title}}",
+        "testLabel": "  - {{value}}",
+        "testPurpose": "    purpose: {{value}}",
+        "traceback": "    {{value}}"
+      },
+      "category": {
+        "startupGate": {
+          "title": "Startup / Admission Gate",
+          "goal": "Verify the runner blocks new risk when startup, account freshness, or reconciliation state is unsafe."
+        },
+        "persistenceFault": {
+          "title": "Persistence Fault Halt",
+          "goal": "Verify ledger/runtime state write failures escalate into HALTED and cancel unsafe pending exposure."
+        },
+        "reconcileAmbiguity": {
+          "title": "Reconcile Ambiguity Guard",
+          "goal": "Verify ambiguous multi-pending attribution is not auto-resolved optimistically."
+        }
+      },
+      "testPurpose": {
+        "systemTradingModeBlocksBuy": "System trading_mode blocks BUY while still allowing SELL",
+        "accountStateStaleBlocksBuy": "Stale account snapshot forces reduce-only behavior",
+        "reconciliationWarnBlocksBuy": "Reconciliation warning blocks fresh BUY orders",
+        "ledgerAppendFailureHaltsOpening": "Ledger append failure halts opening",
+        "runtimeStatePersistFailureHaltsOpening": "Runtime state persist failure halts opening",
+        "persistenceFaultCancelsPendingBuyOrders": "Persistence fault drains pending buy exposure",
+        "daemonStateWriteFaultSurfaced": "Daemon state write fault is surfaced back into trader persistence fault handling",
+        "multiplePendingOrdersMarkedAmbiguous": "Multiple pending orders for the same token are marked ambiguous instead of force-filled"
+      },
+      "cli": {
+        "description": "Run curated control-plane fault drills for the Polymarket stack",
+        "category": "Limit execution to one or more drill categories. Defaults to all.",
+        "json": "Emit JSON instead of text",
+        "verbose": "Use verbose unittest output"
+      }
+    },
+    "networkSmoke": {
+      "cli": {
+        "description": "Polymarket network smoke test",
+        "wallet": "Wallet for positions endpoint smoke test",
+        "historyWallets": "Comma-separated wallets for real history smoke checks",
+        "historyMaxWallets": "Max wallets to probe in history smoke",
+        "historyLimit": "Per-endpoint limit for wallet history smoke",
+        "resolutionLimit": "Max recent closed markets to resolve per wallet",
+        "skipHistory": "Skip real wallet history smoke checks",
+        "dataApi": "Data API base URL",
+        "clobHost": "CLOB host base URL",
+        "logPath": "Append-only log output path"
+      },
+      "common": {
+        "none": "(none)"
+      },
+      "section": {
+        "title": "==> Polymarket network smoke test",
+        "history": "==> Wallet history smoke"
+      },
+      "field": {
+        "wallet": "wallet={{value}}",
+        "dataApi": "data_api={{value}}",
+        "clobHost": "clob_host={{value}}",
+        "historyWallets": "history_wallets={{value}}",
+        "checkExtra": "status={{status}} cf_ray={{cfRay}} restricted={{restricted}} ms={{ms}}",
+        "historyExtra": "active={{active}} trades={{trades}} closed={{closed}} resolved={{resolved}} ms={{ms}}"
+      },
+      "summary": {
+        "requestFailed": "{{name}}: request failed ({{reason}})",
+        "geoRestricted": "{{name}}: geo-restricted marker detected",
+        "blockedByPolicy": "{{name}}: blocked by policy/status={{status}}",
+        "authRequired": "{{name}}: auth required (401, expected for private endpoint)",
+        "unexpectedStatus": "{{name}}: unexpected status={{status}}",
+        "statusOk": "{{name}}: status={{status}}"
+      },
+      "history": {
+        "noRecentData": "history_wallet {{wallet}}: no recent data across active/trades/activity/closed",
+        "noResolutionFound": "history_wallet {{wallet}}: parsed data ok but no resolutions found for {{count}} recent closed markets",
+        "ok": "history_wallet {{wallet}}: active={{active}} trades={{trades}} activity={{activity}} closed={{closed}} resolved={{resolved}}",
+        "requestFailed": "history_wallet {{wallet}}: request failed ({{reason}})"
+      },
+      "result": {
+        "block": "BLOCK: network path appears geoblocked/restricted",
+        "fail": "FAIL: endpoint connectivity not aligned with expectation",
+        "warn": "WARN: test passed with {{count}} warning(s) (non-fatal)",
+        "pass": "PASS: Polymarket endpoints are reachable from this environment"
+      }
+    },
+    "reconciliation": {
+      "title": "Polymarket Reconciliation EOD Report",
+      "none": "(none)",
+      "section": {
+        "startup": "Startup",
+        "state_summary": "State Summary",
+        "ledger_summary": "Ledger Summary",
+        "issues": "Issues",
+        "recommendations": "Recommendations",
+        "fill_by_source": "Fills by Source",
+        "fill_by_side": "Fills by Side"
+      },
+      "field": {
+        "generated_at": "Generated At",
+        "day_key": "Day Key",
+        "status": "Status",
+        "state_path": "State Path",
+        "ledger_path": "Ledger Path",
+        "ready": "Ready",
+        "warning_count": "Warning Count",
+        "failure_count": "Failure Count",
+        "open_positions": "Open Positions",
+        "pending_orders": "Pending Orders",
+        "tracked_notional_usd": "Tracked Notional USD",
+        "internal_realized_pnl": "Internal Realized PnL",
+        "ledger_realized_pnl": "Ledger Realized PnL",
+        "internal_vs_ledger_diff": "Internal vs Ledger Diff",
+        "broker_floor_gap_vs_internal": "Broker Floor Gap vs Internal",
+        "account_snapshot_age_seconds": "Account Snapshot Age Seconds",
+        "broker_reconcile_age_seconds": "Broker Reconcile Age Seconds",
+        "broker_event_sync_age_seconds": "Broker Event Sync Age Seconds",
+        "total_entries": "Total Entries",
+        "fill_count": "Fill Count",
+        "buy_fill_count": "Buy Fill Count",
+        "sell_fill_count": "Sell Fill Count",
+        "fill_notional": "Fill Notional",
+        "realized_pnl": "Realized PnL",
+        "account_sync_count": "Account Sync Count",
+        "startup_checks_count": "Startup Checks Count"
+      },
+      "row": {
+        "source": "{{source}}: count={{count}} notional={{notional}} pnl={{pnl}}",
+        "side": "{{side}}: count={{count}} notional={{notional}} pnl={{pnl}}"
+      },
+      "source": {
+        "unknown": "Unknown Source",
+        "api": "API",
+        "paper": "Paper",
+        "runner": "Runner",
+        "account_snapshot": "Account Snapshot",
+        "broker_execute": "Broker Execute",
+        "broker_reconcile": "Broker Reconcile",
+        "broker_trades": "Broker Trades",
+        "broker_open_orders": "Broker Open Orders",
+        "broker_periodic": "Broker Periodic Sync",
+        "broker_startup_merge": "Broker Startup Merge",
+        "runtime_snapshot": "Runtime Snapshot",
+        "runtime_previous": "Previous Runtime"
+      },
+      "recommendation": {
+        "startup_not_ready": "Resolve startup readiness failures before trusting any live execution metrics.",
+        "status_fail": "Execution reconciliation is failing. Treat ledger/state drift as a production incident.",
+        "status_warn": "Execution reconciliation has warnings. Review stale pending orders and sync freshness.",
+        "status_ok": "Execution reconciliation is aligned for the selected day.",
+        "no_fill_entries": "No fill entries were recorded for the selected day.",
+        "internal_ledger_diff": "Internal PnL and ledger PnL differ. Reconcile before promoting results."
+      }
+    },
+    "fullFlowValidation": {
+      "title": "Polymarket Full Flow Validation Report",
+      "field": {
+        "generatedAt": "Generated At",
+        "validationStatus": "Validation Status",
+        "flowStandardMet": "Flow Standard Met",
+        "operationalReadiness": "Operational Readiness",
+        "startupReady": "Startup Ready",
+        "reconciliationStatus": "Reconciliation Status",
+        "monitor30Recommendation": "30m Recommendation",
+        "monitor12Recommendation": "12h Recommendation",
+        "eodStatus": "EOD Status"
+      },
+      "section": {
+        "stages": "Stages",
+        "operationalReadinessDetail": "Operational Readiness Detail",
+        "issues": "Issues",
+        "recommendations": "Recommendations"
+      },
+      "row": {
+        "stage": "  [{{status}}] {{name}}: {{message}}",
+        "detail": "    - {{key}}: {{value}}"
+      },
+      "enum": {
+        "status": {
+          "pass": "PASS",
+          "fail": "FAIL",
+          "warn": "WARN",
+          "unknown": "UNKNOWN"
+        },
+        "readiness": {
+          "ready": "READY",
+          "observe": "OBSERVE",
+          "escalate": "ESCALATE",
+          "block": "BLOCK",
+          "unknown": "UNKNOWN"
+        }
+      },
+      "stage": {
+        "stackBootstrapPass": "Stack restarted and verified",
+        "stackBootstrapWarn": "Stack bootstrap helper returned non-zero; continuing with direct validation",
+        "stateValidationFailed": "State validation failed",
+        "stateApiUnavailable": "State API unavailable or returned invalid JSON",
+        "stateTimestampMissing": "State timestamp missing",
+        "statePollIntervalMissing": "Poll interval missing",
+        "stateStale": "State is stale: age {{age}}s, max allowed {{maxAge}}s",
+        "statePayloadFresh": "State payload is fresh",
+        "monitorReportGenerated": "{{name}} report generated",
+        "monitorReportGenerationFailed": "{{name}} report generation failed",
+        "monitorApiReturned": "{{name}} API returned JSON report",
+        "monitorApiUnavailable": "{{name}} API unavailable or returned invalid JSON",
+        "reconciliationGenerationPass": "Operator API generated reconciliation report",
+        "reconciliationGenerationFail": "Operator API failed to generate reconciliation report",
+        "reconciliationApiPass": "Reconciliation API returned JSON report",
+        "reconciliationApiFail": "Reconciliation API unavailable or returned invalid JSON",
+        "replayRuntimePass": "Runtime replay completed",
+        "replayRuntimeFail": "Runtime replay failed",
+        "replayCalibrationPass": "Replay calibration completed",
+        "replayCalibrationFail": "Replay calibration failed"
+      },
+      "recommendation": {
+        "fixFailedStages": "Fix failed validation stages first: {{stages}}.",
+        "pass": "Full flow validation passed. APIs, reports, and replay tooling are wired end-to-end.",
+        "readinessReview": "Operational readiness is {{level}}. Review startup / reconciliation / monitor recommendations before treating results as promotion-ready."
+      }
+    },
+    "readinessBrief": {
+      "title": "Polymarket Readiness Brief",
+      "na": "n/a",
+      "field": {
+        "releaseGate": "Release Gate: {{status}}",
+        "checkpointCount": "Checkpoint Count: {{count}} / {{expected}}",
+        "lastCheckpoint": "Last Checkpoint: {{value}}",
+        "rehearsalRemaining": "Rehearsal Remaining: {{hours}}h {{minutes}}m {{seconds}}s"
+      },
+      "section": {
+        "blockers": "Blockers",
+        "advisories": "Advisories"
+      }
+    },
+    "releaseGate": {
+      "title": "Polymarket Release Gate",
+      "field": {
+        "status": "Status: {{status}}"
+      },
+      "section": {
+        "blockers": "Blockers",
+        "advisories": "Advisories",
+        "checks": "Checks"
+      },
+      "row": {
+        "check": "- {{name}}: {{status}} | {{message}}"
+      },
+      "enum": {
+        "status": {
+          "ready": "READY",
+          "blocked": "BLOCKED",
+          "caution": "CAUTION",
+          "pass": "PASS",
+          "fail": "FAIL",
+          "unknown": "UNKNOWN"
+        }
+      },
+      "check": {
+        "fullFlowValidation": "The full_flow_validation report must exist, be PASS, and not be BLOCK/ESCALATE",
+        "rehearsal24h": "The 24h dry-run rehearsal must complete all checkpoints without failure",
+        "remoteAlertSmoke": "Remote alert smoke must be sent successfully to a real configured channel",
+        "liveSmokePreflight": "Live smoke preflight must report ready in the real configured environment",
+        "liveSmokeExecution": "A real live smoke execution summary must exist and report success",
+        "operatorDocs": "Signoff / release / handoff drafts must not contain unresolved placeholders"
+      },
+      "blocker": {
+        "fullFlowValidationNotPass": "full_flow_validation is not PASS",
+        "operationalReadinessBlocked": "Operational readiness is {{level}}",
+        "rehearsalNotClean": "24h dry-run rehearsal did not complete cleanly",
+        "remoteAlertSmokeFailed": "Remote alert smoke did not send successfully",
+        "liveSmokePreflightNotReady": "Live smoke preflight is not ready",
+        "liveSmokeExecutionFailed": "Live smoke execution summary is missing or failed",
+        "operatorDocsPlaceholders": "Operator signoff / release / handoff drafts still contain unresolved placeholders"
+      },
+      "advisory": {
+        "operationalReadinessObserve": "Operational readiness remains observe"
+      }
+    },
+    "alertDelivery": {
+      "status": {
+        "blocked": "BLOCKED",
+        "ready_to_send": "READY TO SEND",
+        "sent": "SENT",
+        "failed": "FAILED"
+      },
+      "blocker": {
+        "remoteChannelNotConfigured": "Remote alert channel is not configured",
+        "deliveryFailed": "One or more configured alert channels failed delivery"
+      }
+    },
+    "alertDeliveryLocal": {
+      "status": {
+        "sent": "SENT",
+        "failed": "FAILED"
+      }
+    }
+  },
+  "notification": {
+    "tradingMode": {
+      "persistenceFault": {
+        "title": "{{mode}} · persistence fault",
+        "body": "mode={{mode}} | kind={{kind}} | path={{path}} | err={{error}}",
+        "errorUnknown": "Unknown error"
+      },
+      "startupGateBlocked": {
+        "title": "{{mode}} · startup gate blocked",
+        "body": "startup_failures={{failures}} | warnings={{warnings}} | admission gate is blocking new BUY"
+      },
+      "accountStateProtect": {
+        "title": "{{mode}} · account state protect",
+        "body": "account_state={{accountState}} | admission gate is blocking new BUY until account snapshot recovers"
+      },
+      "reconciliationProtect": {
+        "title": "{{mode}} · reconciliation protect",
+        "body": "status={{status}} | ambiguous_pending_orders={{ambiguousPendingOrders}} | issues={{issues}}",
+        "defaultIssues": "No issues available"
+      },
+      "haltedTradingStopped": {
+        "title": "HALTED · trading stopped",
+        "body": "primary_reason={{primaryReason}} | reasons={{reasons}} | operator intervention may be required"
+      }
+    },
+    "candidate": {
+      "title": "{{action}} · {{market}}",
+      "body": "{{walletLabel}} wallet {{walletScore}} pts | {{outcome}} · {{notional}}U{{spread}}{{chase}}{{reason}}",
+      "spread": " | spread {{value}}%",
+      "chase": " | chase {{value}}%",
+      "reason": " | {{value}}"
+    }
+  }
+}

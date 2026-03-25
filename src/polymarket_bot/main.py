@@ -7,9 +7,14 @@ from polymarket_bot.brokers.live_clob import LiveClobBroker
 from polymarket_bot.brokers.paper import PaperBroker
 from polymarket_bot.clients.data_api import PolymarketDataClient
 from polymarket_bot.config import Settings
+from polymarket_bot.i18n import t as i18n_t
 from polymarket_bot.risk import RiskManager
 from polymarket_bot.runner import Trader
 from polymarket_bot.strategies.wallet_follower import WalletFollowerStrategy
+
+
+def _main_t(key: str, params: dict[str, object] | None = None, *, fallback: str = "") -> str:
+    return i18n_t(f"cli.main.{key}", dict(params or {}), fallback=fallback)
 
 
 def setup_logger(level: str) -> None:
@@ -52,10 +57,12 @@ def build_trader(settings: Settings) -> Trader:
     risk = RiskManager(settings)
 
     if settings.dry_run:
-        broker = PaperBroker()
+        broker = PaperBroker(settings=settings)
     else:
         if not settings.private_key or not settings.funder_address:
-            raise RuntimeError("LIVE mode requires PRIVATE_KEY and FUNDER_ADDRESS")
+            raise RuntimeError(
+                _main_t("runtime.liveRequiresSecrets", fallback="LIVE mode requires PRIVATE_KEY and FUNDER_ADDRESS")
+            )
         broker = LiveClobBroker(
             host=settings.polymarket_clob_host,
             chain_id=settings.chain_id,
@@ -80,8 +87,8 @@ def build_trader(settings: Settings) -> Trader:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Polymarket automated trader")
-    parser.add_argument("--once", action="store_true", help="Run one cycle and exit")
+    parser = argparse.ArgumentParser(description=_main_t("description", fallback="Polymarket automated trader"))
+    parser.add_argument("--once", action="store_true", help=_main_t("once", fallback="Run one cycle and exit"))
     args = parser.parse_args()
 
     settings = Settings()

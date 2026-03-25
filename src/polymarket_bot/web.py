@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+from html import escape as html_escape
 import io
 import json
 import os
@@ -13,8 +14,18 @@ from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlsplit, urlunsplit
+import urllib.error
+import urllib.request
 
+from polymarket_bot.config import Settings, build_runtime_artifact_paths
 from polymarket_bot.db import PersonalTerminalStore
+from polymarket_bot.i18n import (
+    current_locale as i18n_current_locale,
+    enum_label as i18n_enum_label,
+    humanize_identifier as i18n_humanize_identifier,
+    label as i18n_label,
+    t as i18n_t,
+)
 from polymarket_bot.reconciliation_report import (
     build_reconciliation_report_from_paths,
     write_report_files,
@@ -27,6 +38,30 @@ class ReusableThreadingHTTPServer(ThreadingHTTPServer):
 
 
 AUTH_COOKIE_NAME = "poly_dashboard_token"
+
+
+def _web_field_label(field: str) -> str:
+    return i18n_label(
+        "web.field",
+        field,
+        fallback=i18n_humanize_identifier(field),
+    )
+
+
+def _api_error_payload(
+    code: str,
+    params: dict[str, object] | None = None,
+    *,
+    fallback: str = "",
+    detail: str = "",
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "error": i18n_t(f"web.api.{code}", params, fallback=fallback or code),
+        "error_code": code,
+    }
+    if detail:
+        payload["error_detail"] = detail
+    return payload
 
 
 def _safe_write_json(path: str, payload: dict) -> None:
@@ -68,12 +103,75 @@ def _empty_candidates() -> dict:
             "waiting_review": 0,
             "queued_actions": 0,
         },
+        "observability": {
+            "updated_ts": 0,
+            "candidate_count": 0,
+            "market_metadata": {
+                "hits": 0,
+                "misses": 0,
+                "coverage_pct": 0.0,
+            },
+            "market_time_source": {
+                "metadata": 0,
+                "slug_legacy": 0,
+                "unknown": 0,
+            },
+            "skip_reasons": {},
+            "recent_cycles": {
+                "cycles": 0,
+                "signals": 0,
+                "precheck_skipped": 0,
+                "market_time_source": {
+                    "metadata": 0,
+                    "slug_legacy": 0,
+                    "unknown": 0,
+                },
+                "skip_reasons": {},
+            },
+        },
         "items": [],
     }
 
 
+def _merge_candidate_observability_defaults(observability: dict | None) -> dict:
+    defaults = dict((_empty_candidates().get("observability") or {}))
+    source = dict(observability or {})
+    merged = dict(defaults)
+    merged.update(source)
+    merged["market_metadata"] = {
+        **dict(defaults.get("market_metadata") or {}),
+        **dict(source.get("market_metadata") or {}),
+    }
+    merged["market_time_source"] = {
+        **dict(defaults.get("market_time_source") or {}),
+        **dict(source.get("market_time_source") or {}),
+    }
+    default_recent_cycles = dict(defaults.get("recent_cycles") or {})
+    source_recent_cycles = dict(source.get("recent_cycles") or {})
+    merged["recent_cycles"] = {
+        **default_recent_cycles,
+        **source_recent_cycles,
+        "market_time_source": {
+            **dict(default_recent_cycles.get("market_time_source") or {}),
+            **dict(source_recent_cycles.get("market_time_source") or {}),
+        },
+        "skip_reasons": dict(source_recent_cycles.get("skip_reasons") or default_recent_cycles.get("skip_reasons") or {}),
+    }
+    merged["skip_reasons"] = dict(source.get("skip_reasons") or defaults.get("skip_reasons") or {})
+    return merged
+
+
 def _api_state_payload(state: dict, candidate_store: PersonalTerminalStore, *, days: int = 30, recent_days: int = 7) -> dict:
     payload = dict(state)
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, dict):
+        candidates = _empty_candidates()
+    else:
+        merged_candidates = _empty_candidates()
+        merged_candidates.update(candidates)
+        merged_candidates["observability"] = _merge_candidate_observability_defaults(candidates.get("observability"))
+        candidates = merged_candidates
+    payload["candidates"] = candidates
     payload["stats"] = _stats_from_store(candidate_store, days=days, recent_days=recent_days)
     payload["archive"] = _archive_from_store(candidate_store, days=days, recent_days=recent_days)
     return payload
@@ -280,13 +378,22 @@ def _state_candidates(state: dict) -> dict:
     current = state.get("candidates")
     signal_review = dict(state.get("signal_review") or {})
     fallback_cycles = list(signal_review.get("cycles") or [])
+    current_observability = {}
+    if isinstance(current, dict):
+        current_observability = _merge_candidate_observability_defaults(current.get("observability"))
     if (
         isinstance(current, dict)
-        and isinstance(current.get("items"), list)
-        and (list(current.get("items") or []) or not fallback_cycles)
+        and (
+            not fallback_cycles
+            or (
+                isinstance(current.get("items"), list)
+                and list(current.get("items") or [])
+            )
+        )
     ):
         payload = _empty_candidates()
         payload.update(current)
+        payload["observability"] = _merge_candidate_observability_defaults(current.get("observability"))
         return payload
 
     items = []
@@ -299,6 +406,9 @@ def _state_candidates(state: dict) -> dict:
             if not isinstance(raw, dict):
                 continue
             final_status = str(raw.get("final_status") or "candidate")
+            decision_snapshot = dict(raw.get("decision_snapshot") or {})
+            candidate_snapshot = dict(raw.get("candidate_snapshot") or {})
+            review_only_status = "executed" if final_status == "filled" else "rejected" if "reject" in final_status else "watched"
             items.append(
                 {
                     "cycle_id": cycle_id,
@@ -319,6 +429,11 @@ def _state_candidates(state: dict) -> dict:
                     "topic_bias": str(raw.get("topic_bias") or ""),
                     "topic_multiplier": float(raw.get("topic_multiplier") or 1.0),
                     "decision_reason": str(raw.get("decision_reason") or ""),
+                    "skip_reason": str(decision_snapshot.get("skip_reason") or ""),
+                    "market_time_source": str(decision_snapshot.get("market_time_source") or ""),
+                    "market_metadata_hit": bool(decision_snapshot.get("market_metadata_hit", False)),
+                    "suggested_action": "watch",
+                    "status": review_only_status,
                     "sized_notional": float(raw.get("sized_notional") or 0.0),
                     "final_notional": float(raw.get("final_notional") or 0.0),
                     "budget_limited": bool(raw.get("budget_limited", False)),
@@ -326,14 +441,17 @@ def _state_candidates(state: dict) -> dict:
                     "order_status": str(raw.get("order_status") or ""),
                     "order_reason": str(raw.get("order_reason") or ""),
                     "order_notional": float(raw.get("order_notional") or 0.0),
+                    "decision_snapshot": decision_snapshot,
+                    "signal_snapshot": candidate_snapshot,
                     "review_action": "",
-                    "review_status": "waiting" if final_status == "candidate" else "closed",
+                    "review_status": "closed",
                     "review_note": "",
                     "review_updated_ts": 0,
                 }
             )
     payload = _empty_candidates()
     payload["items"] = items[:32]
+    payload["observability"] = current_observability
     payload["summary"] = {
         "count": len(items),
         "candidate": sum(1 for row in items if str(row.get("final_status") or "") == "candidate"),
@@ -386,6 +504,58 @@ def _merged_candidates(state: dict, action_store: dict | None) -> dict:
         ),
     }
     return payload
+
+
+def _candidate_observability(items: list[dict]) -> dict:
+    observability = _merge_candidate_observability_defaults(None)
+    if not items:
+        return observability
+
+    metadata_hits = 0
+    time_sources: dict[str, int] = {"metadata": 0, "slug_legacy": 0, "unknown": 0}
+    skip_reasons: dict[str, int] = {}
+    candidate_count = 0
+
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        candidate_count += 1
+        metadata_hit = bool(raw.get("market_metadata_hit"))
+        if metadata_hit:
+            metadata_hits += 1
+        time_source = str(raw.get("market_time_source") or "").strip().lower()
+        if not time_source:
+            time_source = "metadata" if metadata_hit else "unknown"
+        time_sources[time_source] = int(time_sources.get(time_source, 0) or 0) + 1
+        skip_reason = str(raw.get("skip_reason") or "").strip()
+        if skip_reason:
+            skip_reasons[skip_reason] = int(skip_reasons.get(skip_reason, 0) or 0) + 1
+
+    metadata_misses = max(0, candidate_count - metadata_hits)
+    coverage_pct = round((metadata_hits / candidate_count) * 100.0, 1) if candidate_count > 0 else 0.0
+    observability["updated_ts"] = max(
+        int(time.time()),
+        max(int(raw.get("updated_ts") or raw.get("created_ts") or 0) for raw in items if isinstance(raw, dict)),
+    )
+    observability["candidate_count"] = candidate_count
+    observability["market_metadata"] = {
+        "hits": metadata_hits,
+        "misses": metadata_misses,
+        "coverage_pct": coverage_pct,
+    }
+    observability["market_time_source"] = dict(
+        sorted(
+            time_sources.items(),
+            key=lambda item: (-int(item[1] or 0), str(item[0] or "")),
+        )
+    )
+    observability["skip_reasons"] = dict(
+        sorted(
+            skip_reasons.items(),
+            key=lambda item: (-int(item[1] or 0), str(item[0] or "")),
+        )
+    )
+    return observability
 
 
 def _wallet_profile_store_map(payload: dict | None) -> dict[str, dict]:
@@ -664,18 +834,21 @@ def _candidate_relation_match(candidate: dict[str, Any], row: dict[str, Any]) ->
 
 
 def _exit_kind_label(kind: str, fallback: str = "") -> str:
-    value = str(kind or "").strip().lower()
     if fallback:
         return fallback
-    if value == "resonance_exit":
-        return "共振退出"
-    if value == "smart_wallet_exit":
-        return "主钱包减仓"
-    if value == "time_exit":
-        return "时间退出"
-    if value == "emergency_exit":
-        return "紧急退出"
-    return "退出"
+    raw = str(kind or "").strip()
+    return i18n_enum_label(
+        "enum.exitKind",
+        raw or "default",
+        fallback=i18n_humanize_identifier(raw) or i18n_t("enum.exitKind.default", fallback="Exit"),
+    )
+
+
+def _timeline_kind_label(kind: str) -> str:
+    raw = str(kind or "").strip().lower()
+    if raw in {"order", "trace", "cycle", "action", "event"}:
+        return i18n_t(f"common.entity.{raw}", fallback=i18n_humanize_identifier(raw))
+    return i18n_humanize_identifier(raw) or i18n_t("common.entity.event", fallback="Event")
 
 
 def _order_action_meta(order: dict[str, Any]) -> tuple[str, str]:
@@ -687,52 +860,53 @@ def _order_action_meta(order: dict[str, Any]) -> tuple[str, str]:
         return action, action_label
     if flow == "exit":
         if action == "trim":
-            return "trim", action_label or "部分减仓"
+            return "trim", action_label or i18n_t("enum.actionTag.trim", fallback="Trim")
         if action == "exit":
-            return "exit", action_label or "完全退出"
+            return "exit", action_label or i18n_t("enum.actionTag.exit", fallback="Exit")
         return "exit", action_label or _exit_kind_label(str(order.get("exit_kind") or ""), str(order.get("exit_label") or ""))
     if action == "add":
-        return "add", action_label or "追加买入"
+        return "add", action_label or i18n_t("enum.actionTag.add", fallback="Add")
     if action == "entry":
-        return "entry", action_label or "首次入场"
+        return "entry", action_label or i18n_t("enum.actionTag.entry", fallback="Entry")
     if side == "BUY":
-        return "entry", action_label or "买入"
+        return "entry", action_label or i18n_enum_label("enum.side", "buy", fallback="Buy")
     if side == "SELL":
-        return "exit", action_label or "卖出"
-    return action or side.lower(), action_label or side or "事件"
+        return "exit", action_label or i18n_enum_label("enum.side", "sell", fallback="Sell")
+    return action or side.lower(), action_label or side or i18n_t("enum.actionTag.event", fallback="Event")
 
 
 def _timeline_text(order: dict[str, Any]) -> str:
     _action, action_label = _order_action_meta(order)
-    title = str(order.get("title") or "-")
+    title = str(order.get("title") or i18n_t("common.dash", fallback="-"))
     return f"{action_label} {title}"
 
 
 def _candidate_detail_timeline_text(item: dict[str, Any]) -> str:
     kind = str(item.get("kind") or "").strip().lower()
     text = str(item.get("text") or item.get("label") or item.get("action") or "").strip()
+    separator = i18n_t("common.separator", fallback=" · ")
     if kind == "order":
         status = str(item.get("status") or "").strip()
         action = str(item.get("action_label") or item.get("action") or "").strip()
-        parts = [action or "order"]
+        parts = [action or _timeline_kind_label(kind)]
         if status:
             parts.append(status)
         if text:
             parts.append(text)
-        return " · ".join(parts)
+        return separator.join(parts)
     if kind == "journal":
         action = str(item.get("action") or "").strip()
         rationale = str(item.get("rationale") or "").strip()
-        return " · ".join(part for part in [action, rationale or text] if part)
+        return separator.join(part for part in [action, rationale or text] if part)
     if kind == "trace":
-        return text or str(item.get("trace_id") or "trace")
+        return text or str(item.get("trace_id") or _timeline_kind_label(kind))
     if kind == "cycle":
-        return text or str(item.get("cycle_id") or "cycle")
+        return text or str(item.get("cycle_id") or _timeline_kind_label(kind))
     if kind == "action":
         action = str(item.get("action") or "").strip()
         note = str(item.get("note") or "").strip()
-        return " · ".join(part for part in [action, note or text] if part)
-    return text or kind or "event"
+        return separator.join(part for part in [action, note or text] if part)
+    return text or _timeline_kind_label(kind)
 
 
 def _candidate_detail_payload(
@@ -1192,6 +1366,21 @@ def _empty_state() -> dict:
             "clear_stale_pending_requested_ts": 0,
             "updated_ts": 0,
         },
+        "trading_mode": {
+            "mode": "NORMAL",
+            "opening_allowed": True,
+            "reason_codes": [],
+            "updated_ts": 0,
+            "source": "runner",
+            "account_state_status": "unknown",
+            "reconciliation_status": "unknown",
+            "persistence_status": "ok",
+        },
+        "persistence": {
+            "status": "ok",
+            "failure_count": 0,
+            "last_failure": {},
+        },
         "mode": "manual",
         "decision_mode": _default_decision_mode(),
         "startup_ready": True,
@@ -1412,7 +1601,7 @@ def _empty_state() -> dict:
                 },
                 "all": {
                     "key": "all",
-                    "label": "全部",
+                    "label": i18n_t("common.all", fallback="All"),
                     "summary": {
                         "order_count": 0,
                         "filled_count": 0,
@@ -1567,7 +1756,13 @@ def _parse_optional_float(value: object, *, field: str) -> float | None:
     try:
         return float(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"{field} must be a number") from exc
+        raise ValueError(
+            i18n_t(
+                "web.api.fieldMustBeNumber",
+                {"field": _web_field_label(field)},
+                fallback=f"{field} must be a number",
+            )
+        ) from exc
 
 
 def _parse_bool_value(value: object, *, field: str) -> bool:
@@ -1578,7 +1773,13 @@ def _parse_bool_value(value: object, *, field: str) -> bool:
         return True
     if text in {"0", "false", "no", "off"}:
         return False
-    raise ValueError(f"{field} must be a boolean")
+    raise ValueError(
+        i18n_t(
+            "web.api.fieldMustBeBoolean",
+            {"field": _web_field_label(field)},
+            fallback=f"{field} must be a boolean",
+        )
+    )
 
 
 def _strip_token_from_path(raw_path: str) -> str:
@@ -1588,6 +1789,260 @@ def _strip_token_from_path(raw_path: str) -> str:
         query.pop("token", None)
     clean_query = urlencode(query, doseq=True)
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", clean_query, parsed.fragment))
+
+
+def _read_repo_dotenv_var(key: str) -> str:
+    dotenv = Path(__file__).resolve().parents[2] / ".env"
+    if not dotenv.exists():
+        return ""
+    for raw in dotenv.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        env_key, value = line.split("=", 1)
+        if env_key.strip() == key:
+            return value.strip().strip('"').strip("'")
+    return ""
+
+
+def _env_or_repo_dotenv(key: str, default: str = "") -> str:
+    value = str(os.getenv(key, "")).strip()
+    if value:
+        return value
+    value = _read_repo_dotenv_var(key)
+    if value:
+        return value
+    return default
+
+
+def _truthy_text(value: object) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _empty_blockbeats_feed(
+    *,
+    source: str = "disabled",
+    status: str = "disabled",
+    message: str = "",
+    message_key: str = "",
+    message_params: dict | None = None,
+) -> dict:
+    return {
+        "source": source,
+        "status": status,
+        "message": message,
+        "message_key": message_key,
+        "message_params": dict(message_params or {}),
+        "items": [],
+    }
+
+
+def _empty_blockbeats_payload() -> dict:
+    return {
+        "updated_ts": 0,
+        "status": "disabled",
+        "stale_after_seconds": 180,
+        "prediction": _empty_blockbeats_feed(),
+        "important": _empty_blockbeats_feed(),
+        "errors": [],
+    }
+
+
+def _blockbeats_extract_items(payload: dict | None) -> list[dict]:
+    data = (payload or {}).get("data")
+    if isinstance(data, list):
+        return [dict(row) for row in data if isinstance(row, dict)]
+    if isinstance(data, dict):
+        for key in ("data", "items", "list", "records"):
+            nested = data.get(key)
+            if isinstance(nested, list):
+                return [dict(row) for row in nested if isinstance(row, dict)]
+    return []
+
+
+def _normalize_blockbeats_time(value: object) -> object:
+    if isinstance(value, (int, float)):
+        return int(value)
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.isdigit():
+        if len(text) >= 13:
+            return int(text[:10])
+        return int(text)
+    return text
+
+
+def _normalize_blockbeats_item(raw: dict) -> dict:
+    return {
+        "id": str(raw.get("id") or raw.get("news_id") or ""),
+        "title": str(raw.get("title") or raw.get("name") or ""),
+        "content": str(raw.get("content") or raw.get("summary") or raw.get("brief") or ""),
+        "link": str(raw.get("link") or raw.get("url") or ""),
+        "url": str(raw.get("url") or raw.get("link") or ""),
+        "create_time": _normalize_blockbeats_time(
+            raw.get("create_time") or raw.get("created_at") or raw.get("publish_time") or raw.get("ts") or ""
+        ),
+    }
+
+
+def _fetch_blockbeats_json(url: str, *, api_key: str = "", timeout: float = 20.0) -> dict:
+    headers = {"accept": "application/json"}
+    if api_key.strip():
+        headers["api-key"] = api_key.strip()
+    request = urllib.request.Request(url, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace").strip()
+        raise RuntimeError(body or f"HTTP {exc.code}") from exc
+    except Exception as exc:
+        raise RuntimeError(str(exc)) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("invalid BlockBeats payload")
+    return payload
+
+
+def _fetch_blockbeats_dashboard(limit: int = 6) -> dict:
+    api_key = _env_or_repo_dotenv("BLOCKBEATS_API_KEY")
+    base_url = _env_or_repo_dotenv("BLOCKBEATS_BASE_URL", "https://api-pro.theblockbeats.info/v1")
+    public_base_url = _env_or_repo_dotenv("BLOCKBEATS_PUBLIC_BASE_URL", "https://api.theblockbeats.news/v1/open-api")
+    lang = _env_or_repo_dotenv("BLOCKBEATS_LANG", "en")
+    stale_after_seconds = max(30, int(float(_env_or_repo_dotenv("BLOCKBEATS_CACHE_SECONDS", "180") or 180)))
+    timeout = max(5.0, float(_env_or_repo_dotenv("BLOCKBEATS_MAX_TIME_SECONDS", "20") or 20))
+    allow_public_fallback = _truthy_text(_env_or_repo_dotenv("BLOCKBEATS_ALLOW_PUBLIC_FALLBACK", "1"))
+
+    payload = _empty_blockbeats_payload()
+    payload["stale_after_seconds"] = stale_after_seconds
+    errors: list[str] = []
+
+    prediction_feed = _empty_blockbeats_feed()
+    important_feed = _empty_blockbeats_feed()
+
+    prediction_url = f"{base_url}/newsflash/prediction?page=1&size={limit}&lang={lang}"
+    important_url = f"{base_url}/newsflash/important?page=1&size={limit}&lang={lang}"
+    public_prediction_url = f"{public_base_url}/open-flash?page=1&size={limit}&type=push&lang={lang}"
+
+    if api_key:
+        try:
+            prediction_payload = _fetch_blockbeats_json(prediction_url, api_key=api_key, timeout=timeout)
+            prediction_feed = {
+                "source": "pro",
+                "status": "ok",
+                "message": str(prediction_payload.get("message") or ""),
+                "items": [_normalize_blockbeats_item(row) for row in _blockbeats_extract_items(prediction_payload)],
+            }
+        except Exception as exc:
+            errors.append(f"prediction: {exc}")
+            if allow_public_fallback:
+                try:
+                    public_prediction_payload = _fetch_blockbeats_json(public_prediction_url, timeout=timeout)
+                    prediction_feed = {
+                        "source": "public_fallback",
+                        "status": "degraded",
+                        "message": i18n_t("blockbeats.message.proPredictionFallback"),
+                        "message_key": "blockbeats.message.proPredictionFallback",
+                        "message_params": {},
+                        "items": [_normalize_blockbeats_item(row) for row in _blockbeats_extract_items(public_prediction_payload)],
+                    }
+                except Exception as fallback_exc:
+                    errors.append(f"prediction_fallback: {fallback_exc}")
+                    prediction_feed = _empty_blockbeats_feed(
+                        source="error",
+                        status="error",
+                        message=i18n_t("blockbeats.message.feedUnavailable", {"feed": "prediction", "reason": str(fallback_exc)}),
+                        message_key="blockbeats.message.feedUnavailable",
+                        message_params={"feed": "prediction", "reason": str(fallback_exc)},
+                    )
+            else:
+                prediction_feed = _empty_blockbeats_feed(
+                    source="error",
+                    status="error",
+                    message=i18n_t("blockbeats.message.feedUnavailable", {"feed": "prediction", "reason": str(exc)}),
+                    message_key="blockbeats.message.feedUnavailable",
+                    message_params={"feed": "prediction", "reason": str(exc)},
+                )
+
+        try:
+            important_payload = _fetch_blockbeats_json(important_url, api_key=api_key, timeout=timeout)
+            important_feed = {
+                "source": "pro",
+                "status": "ok",
+                "message": str(important_payload.get("message") or ""),
+                "items": [_normalize_blockbeats_item(row) for row in _blockbeats_extract_items(important_payload)],
+            }
+        except Exception as exc:
+            errors.append(f"important: {exc}")
+            important_feed = _empty_blockbeats_feed(
+                source="error",
+                status="error",
+                message=i18n_t("blockbeats.message.feedUnavailable", {"feed": "important", "reason": str(exc)}),
+                message_key="blockbeats.message.feedUnavailable",
+                message_params={"feed": "important", "reason": str(exc)},
+            )
+    elif allow_public_fallback:
+        try:
+            public_prediction_payload = _fetch_blockbeats_json(public_prediction_url, timeout=timeout)
+            prediction_feed = {
+                "source": "public_fallback",
+                "status": "degraded",
+                "message": i18n_t("blockbeats.message.apiKeyMissingFallback"),
+                "message_key": "blockbeats.message.apiKeyMissingFallback",
+                "message_params": {},
+                "items": [_normalize_blockbeats_item(row) for row in _blockbeats_extract_items(public_prediction_payload)],
+            }
+            important_feed = _empty_blockbeats_feed(
+                source="disabled",
+                status="disabled",
+                message=i18n_t("blockbeats.message.importantRequiresApiKey"),
+                message_key="blockbeats.message.importantRequiresApiKey",
+            )
+            errors.append("important: BLOCKBEATS_API_KEY not set")
+        except Exception as exc:
+            errors.append(f"prediction_fallback: {exc}")
+            prediction_feed = _empty_blockbeats_feed(
+                source="error",
+                status="error",
+                message=i18n_t("blockbeats.message.feedUnavailable", {"feed": "prediction", "reason": str(exc)}),
+                message_key="blockbeats.message.feedUnavailable",
+                message_params={"feed": "prediction", "reason": str(exc)},
+            )
+            important_feed = _empty_blockbeats_feed(
+                source="disabled",
+                status="disabled",
+                message=i18n_t("blockbeats.message.importantRequiresApiKey"),
+                message_key="blockbeats.message.importantRequiresApiKey",
+            )
+    else:
+        prediction_feed = _empty_blockbeats_feed(
+            source="disabled",
+            status="disabled",
+            message=i18n_t("blockbeats.message.apiKeyMissing"),
+            message_key="blockbeats.message.apiKeyMissing",
+        )
+        important_feed = _empty_blockbeats_feed(
+            source="disabled",
+            status="disabled",
+            message=i18n_t("blockbeats.message.apiKeyMissing"),
+            message_key="blockbeats.message.apiKeyMissing",
+        )
+        errors.append("BLOCKBEATS_API_KEY not set")
+
+    payload["updated_ts"] = int(time.time())
+    payload["prediction"] = prediction_feed
+    payload["important"] = important_feed
+    payload["errors"] = errors
+    has_items = bool(prediction_feed["items"] or important_feed["items"])
+    if not api_key and prediction_feed["items"]:
+        payload["status"] = "degraded"
+    elif errors and has_items:
+        payload["status"] = "degraded"
+    elif errors:
+        payload["status"] = "error"
+    else:
+        payload["status"] = "ok"
+    return payload
 
 
 def build_handler(
@@ -1638,6 +2093,13 @@ def build_handler(
         "POLY_PUBLIC_STATE_PATH",
     )
     candidate_store = PersonalTerminalStore(resolved_candidate_db_path)
+    blockbeats_cache_ttl = max(30, int(float(_env_or_repo_dotenv("BLOCKBEATS_CACHE_SECONDS", "180") or 180)))
+    blockbeats_limit = max(2, min(12, int(float(_env_or_repo_dotenv("BLOCKBEATS_DASHBOARD_LIMIT", "6") or 6))))
+    blockbeats_cache_lock = threading.Lock()
+    blockbeats_cache: dict[str, object] = {
+        "fetched_at": 0.0,
+        "payload": _empty_blockbeats_payload(),
+    }
 
     def _sync_public_state_snapshot() -> None:
         if not resolved_public_state_path:
@@ -1650,6 +2112,45 @@ def build_handler(
             _safe_write_json(resolved_public_state_path, payload)
         except Exception:
             return
+
+    def _cached_blockbeats_payload(force: bool = False) -> dict:
+        now = time.time()
+        with blockbeats_cache_lock:
+            cached_payload = blockbeats_cache.get("payload")
+            fetched_at = float(blockbeats_cache.get("fetched_at") or 0.0)
+        if isinstance(cached_payload, dict):
+            cache_ttl = max(30, int(float(cached_payload.get("stale_after_seconds") or blockbeats_cache_ttl)))
+        else:
+            cache_ttl = blockbeats_cache_ttl
+        if not force and isinstance(cached_payload, dict) and fetched_at > 0 and (now - fetched_at) < cache_ttl:
+            return cached_payload
+        try:
+            payload = _fetch_blockbeats_dashboard(limit=blockbeats_limit)
+        except Exception as exc:
+            error_message = i18n_t("blockbeats.message.dashboardUnavailable", {"reason": str(exc)})
+            payload = _empty_blockbeats_payload()
+            payload["updated_ts"] = int(now)
+            payload["stale_after_seconds"] = blockbeats_cache_ttl
+            payload["status"] = "error"
+            payload["errors"] = [error_message]
+            payload["prediction"] = _empty_blockbeats_feed(
+                source="error",
+                status="error",
+                message=error_message,
+                message_key="blockbeats.message.dashboardUnavailable",
+                message_params={"reason": str(exc)},
+            )
+            payload["important"] = _empty_blockbeats_feed(
+                source="error",
+                status="error",
+                message=error_message,
+                message_key="blockbeats.message.dashboardUnavailable",
+                message_params={"reason": str(exc)},
+            )
+        with blockbeats_cache_lock:
+            blockbeats_cache["fetched_at"] = now
+            blockbeats_cache["payload"] = payload
+        return payload
 
     class Handler(SimpleHTTPRequestHandler):
         def __init__(self, *args, **kwargs):
@@ -1666,6 +2167,9 @@ def build_handler(
                     f"{AUTH_COOKIE_NAME}={self._set_auth_cookie}; Path=/; HttpOnly; SameSite=Lax",
                 )
                 self._set_auth_cookie = ""
+            header_buffer = getattr(self, "_headers_buffer", [])
+            if not any(b"Cache-Control:" in chunk for chunk in header_buffer):
+                self.send_header("Cache-Control", "no-store")
             super().end_headers()
 
         def _json_response(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
@@ -1714,12 +2218,24 @@ def build_handler(
             self.end_headers()
 
         def _unauthorized_page(self) -> str:
-            return """<!doctype html>
-<html lang="zh-CN">
+            locale = html_escape(i18n_current_locale())
+            title = html_escape(i18n_t("web.auth.title", fallback="Polymarket Dashboard Access"))
+            heading = html_escape(i18n_t("web.auth.heading", fallback="Protected access"))
+            description = html_escape(
+                i18n_t(
+                    "web.auth.description",
+                    {"tokenQuery": "?token=..."},
+                    fallback="This dashboard requires an access token. Open a shared link with ?token=... or enter the token below.",
+                )
+            )
+            placeholder = html_escape(i18n_t("web.auth.placeholder", fallback="Enter access token"))
+            submit = html_escape(i18n_t("web.auth.submit", fallback="Open dashboard"))
+            return f"""<!doctype html>
+<html lang="{locale}">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Polymarket Dashboard Access</title>
+  <title>{title}</title>
   <style>
     body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#0f172a; color:#e2e8f0; margin:0; display:grid; min-height:100vh; place-items:center; }
     main { width:min(92vw, 460px); background:#111827; border:1px solid #334155; border-radius:16px; padding:24px; box-shadow:0 20px 60px rgba(0,0,0,.35); }
@@ -1732,11 +2248,11 @@ def build_handler(
 </head>
 <body>
   <main>
-    <h1>访问受保护</h1>
-    <p>这个控制台需要访问令牌。你可以直接打开带 <code>?token=...</code> 的分享链接，或者在这里输入 token。</p>
+    <h1>{heading}</h1>
+    <p>{description}</p>
     <form method="GET" action="/">
-      <input name="token" type="password" placeholder="输入访问 token" autocomplete="current-password" />
-      <button type="submit">打开控制台</button>
+      <input name="token" type="password" placeholder="{placeholder}" autocomplete="current-password" />
+      <button type="submit">{submit}</button>
     </form>
   </main>
 </body>
@@ -1769,7 +2285,7 @@ def build_handler(
 
             if control_token and not self._is_authorized(query):
                 if path.startswith("/api/"):
-                    self._json_response({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+                    self._json_response(_api_error_payload("unauthorized", fallback="unauthorized"), HTTPStatus.UNAUTHORIZED)
                 else:
                     self._html_response(self._unauthorized_page(), HTTPStatus.UNAUTHORIZED)
                 return
@@ -1787,13 +2303,14 @@ def build_handler(
                     days=_query_limit(query, "days", default=30, maximum=365),
                     recent_days=_query_limit(query, "recent_days", default=7, maximum=90),
                 )
+                payload["control"] = _load_json(control_path, _default_control())
                 _sync_public_state_snapshot()
                 self._json_response(payload)
                 return
 
             if path == "/api/control":
                 if not self._is_authorized(query):
-                    self._json_response({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+                    self._json_response(_api_error_payload("unauthorized", fallback="unauthorized"), HTTPStatus.UNAUTHORIZED)
                     return
                 payload = _load_json(control_path, _default_control())
                 self._json_response(payload)
@@ -1814,10 +2331,22 @@ def build_handler(
                 self._json_response(payload)
                 return
 
+            if path == "/api/blockbeats":
+                force = False
+                if query.get("force"):
+                    try:
+                        force = _parse_bool_value(query.get("force", ["false"])[0], field="force")
+                    except ValueError:
+                        self._json_response(_api_error_payload("forceInvalidBool", fallback="force must be true/false"), HTTPStatus.BAD_REQUEST)
+                        return
+                payload = _cached_blockbeats_payload(force=force)
+                self._json_response(payload)
+                return
+
             if path.startswith("/api/candidates/") and path != "/api/candidates/":
                 candidate_id = path[len("/api/candidates/") :].strip("/")
                 if not candidate_id:
-                    self._json_response({"error": "candidate_id is required"}, HTTPStatus.BAD_REQUEST)
+                    self._json_response(_api_error_payload("candidateIdRequired", fallback="candidate_id is required"), HTTPStatus.BAD_REQUEST)
                     return
                 state = _load_json(state_path, _empty_state())
                 payload = _candidate_detail_payload(
@@ -1830,7 +2359,13 @@ def build_handler(
                     journal_path=resolved_journal_path,
                 )
                 if not payload:
-                    self._json_response({"error": "candidate not found", "candidate_id": candidate_id}, HTTPStatus.NOT_FOUND)
+                    error_payload = _api_error_payload(
+                        "candidateNotFound",
+                        {"candidateId": candidate_id},
+                        fallback="candidate not found",
+                    )
+                    error_payload["candidate_id"] = candidate_id
+                    self._json_response(error_payload, HTTPStatus.NOT_FOUND)
                     return
                 self._json_response(payload)
                 return
@@ -1845,6 +2380,9 @@ def build_handler(
                     journal_path=resolved_journal_path,
                 )
                 runtime_candidates = list(((runtime_state.get("candidates") or {}).get("items") or []))
+                runtime_candidate_observability = _merge_candidate_observability_defaults(
+                    ((runtime_state.get("candidates") or {}).get("observability") or {})
+                )
                 statuses = _query_values(query, "status")
                 limit = _query_limit(query, "limit", default=24)
                 wallet = str(query.get("wallet", [""])[0] or "").strip().lower()
@@ -1873,7 +2411,11 @@ def build_handler(
                     sort=sort,
                     order=order,
                 )
-                items = _merge_candidate_rows(store_candidates, runtime_candidates)
+                if candidate_store is not None:
+                    store_items = list(store_candidates)
+                    items = store_items if store_items else _merge_candidate_rows([], runtime_candidates)
+                else:
+                    items = _merge_candidate_rows([], runtime_candidates)
                 if candidate_id:
                     items = [row for row in items if str(row.get("id") or "").strip() == candidate_id or str(row.get("signal_id") or "").strip() == candidate_id or str(row.get("trace_id") or "").strip() == candidate_id]
                 if trace_id:
@@ -1909,6 +2451,8 @@ def build_handler(
                     reverse=reverse,
                 )
                 items = items[: max(1, limit)]
+                observability = _candidate_observability(items)
+                observability["recent_cycles"] = dict(runtime_candidate_observability.get("recent_cycles") or {})
                 payload = {
                     "summary": {
                         "count": len(items),
@@ -1917,6 +2461,7 @@ def build_handler(
                         "watched": sum(1 for item in items if str(item.get("status") or "") == "watched"),
                         "executed": sum(1 for item in items if str(item.get("status") or "") == "executed"),
                     },
+                    "observability": observability,
                     "filters": {
                         "status": statuses,
                         "limit": limit,
@@ -1980,11 +2525,24 @@ def build_handler(
                 try:
                     payload = _export_bundle(candidate_store, scope=scope, days=days, recent_days=recent_days, limit=limit)
                 except ValueError as exc:
-                    self._json_response({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                    self._json_response(
+                        _api_error_payload(
+                            "validationFailed",
+                            fallback="request validation failed",
+                            detail=str(exc),
+                        ),
+                        HTTPStatus.BAD_REQUEST,
+                    )
                     return
                 if fmt == "csv":
                     if scope == "bundle":
-                        self._json_response({"error": "csv export requires a single scope"}, HTTPStatus.BAD_REQUEST)
+                        self._json_response(
+                            _api_error_payload(
+                                "csvRequiresSingleScope",
+                                fallback="csv export requires a single scope",
+                            ),
+                            HTTPStatus.BAD_REQUEST,
+                        )
                         return
                     if scope == "archive":
                         rows = list(payload.get("daily_rows") or [])
@@ -1996,7 +2554,13 @@ def build_handler(
                     self._text_response(csv_text, "text/csv; charset=utf-8")
                     return
                 if fmt != "json":
-                    self._json_response({"error": "unsupported export format"}, HTTPStatus.BAD_REQUEST)
+                    self._json_response(
+                        _api_error_payload(
+                            "exportUnsupportedFormat",
+                            fallback="unsupported export format",
+                        ),
+                        HTTPStatus.BAD_REQUEST,
+                    )
                     return
                 self._json_response(payload)
                 return
@@ -2030,10 +2594,10 @@ def build_handler(
                 "/api/journal/note",
                 "/api/wallet-profiles/update",
             }:
-                self._json_response({"error": "not found"}, HTTPStatus.NOT_FOUND)
+                self._json_response(_api_error_payload("notFound", fallback="not found"), HTTPStatus.NOT_FOUND)
                 return
             if not self._is_authorized(query):
-                self._json_response({"error": "unauthorized"}, HTTPStatus.UNAUTHORIZED)
+                self._json_response(_api_error_payload("unauthorized", fallback="unauthorized"), HTTPStatus.UNAUTHORIZED)
                 return
             self._maybe_arm_cookie(query)
 
@@ -2042,7 +2606,13 @@ def build_handler(
                 candidate_id = str(incoming.get("candidate_id") or incoming.get("signal_id") or "").strip()
                 action = str(incoming.get("action") or "").strip().lower()
                 if not candidate_id or not action:
-                    self._json_response({"error": "candidate_id and action are required"}, HTTPStatus.BAD_REQUEST)
+                    self._json_response(
+                        _api_error_payload(
+                            "candidateActionRequired",
+                            fallback="candidate_id and action are required",
+                        ),
+                        HTTPStatus.BAD_REQUEST,
+                    )
                     return
                 requested_ts = int(time.time())
                 try:
@@ -2059,10 +2629,24 @@ def build_handler(
                         idempotency_key=str(incoming.get("idempotency_key") or "").strip() or None,
                     )
                 except ValueError as exc:
-                    self._json_response({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                    self._json_response(
+                        _api_error_payload(
+                            "validationFailed",
+                            fallback="request validation failed",
+                            detail=str(exc),
+                        ),
+                        HTTPStatus.BAD_REQUEST,
+                    )
                     return
                 if updated is None:
-                    self._json_response({"error": "candidate not found"}, HTTPStatus.NOT_FOUND)
+                    self._json_response(
+                        _api_error_payload(
+                            "candidateNotFound",
+                            {"candidateId": candidate_id},
+                            fallback="candidate not found",
+                        ),
+                        HTTPStatus.NOT_FOUND,
+                    )
                     return
                 idempotent_replay = bool(updated.get("_idempotent_replay", False))
                 note = str(incoming.get("note") or "").strip()
@@ -2084,7 +2668,7 @@ def build_handler(
             if path == "/api/mode":
                 mode = str(incoming.get("mode") or "").strip().lower()
                 if mode not in {"manual", "semi_auto", "auto"}:
-                    self._json_response({"error": "invalid mode"}, HTTPStatus.BAD_REQUEST)
+                    self._json_response(_api_error_payload("invalidMode", fallback="invalid mode"), HTTPStatus.BAD_REQUEST)
                     return
                 payload = _load_json(control_path, _default_control())
                 payload["decision_mode"] = mode
@@ -2107,7 +2691,7 @@ def build_handler(
             if path == "/api/journal/note":
                 text = str(incoming.get("text") or incoming.get("note") or incoming.get("rationale") or "").strip()
                 if not text:
-                    self._json_response({"error": "text is required"}, HTTPStatus.BAD_REQUEST)
+                    self._json_response(_api_error_payload("textRequired", fallback="text is required"), HTTPStatus.BAD_REQUEST)
                     return
                 ts = int(time.time())
                 note = candidate_store.append_journal_entry(
@@ -2133,7 +2717,7 @@ def build_handler(
             if path == "/api/wallet-profiles/update":
                 wallet = str(incoming.get("wallet") or "").strip().lower()
                 if not wallet:
-                    self._json_response({"error": "wallet is required"}, HTTPStatus.BAD_REQUEST)
+                    self._json_response(_api_error_payload("walletRequired", fallback="wallet is required"), HTTPStatus.BAD_REQUEST)
                     return
                 allowed_fields = {
                     "wallet",
@@ -2148,10 +2732,12 @@ def build_handler(
                 }
                 unknown_fields = sorted(key for key in incoming if key not in allowed_fields)
                 if unknown_fields:
-                    self._json_response(
-                        {"error": "unsupported wallet profile fields", "fields": unknown_fields},
-                        HTTPStatus.BAD_REQUEST,
+                    error_payload = _api_error_payload(
+                        "walletProfileFieldsUnsupported",
+                        fallback="unsupported wallet profile fields",
                     )
+                    error_payload["fields"] = unknown_fields
+                    self._json_response(error_payload, HTTPStatus.BAD_REQUEST)
                     return
                 existing_profiles = {
                     str(row.get("wallet") or "").strip().lower(): row
@@ -2194,7 +2780,14 @@ def build_handler(
                         },
                     }
                 except ValueError as exc:
-                    self._json_response({"error": str(exc)}, HTTPStatus.BAD_REQUEST)
+                    self._json_response(
+                        _api_error_payload(
+                            "validationFailed",
+                            fallback="request validation failed",
+                            detail=str(exc),
+                        ),
+                        HTTPStatus.BAD_REQUEST,
+                    )
                     return
                 candidate_store.upsert_wallet_profile(profile)
                 self._json_response({"ok": True, "wallet_profile": profile})
@@ -2203,7 +2796,7 @@ def build_handler(
             if path == "/api/operator":
                 command = str(incoming.get("command", "")).strip().lower()
                 if command not in {"generate_reconciliation_report", "clear_stale_pending"}:
-                    self._json_response({"error": "invalid command"}, HTTPStatus.BAD_REQUEST)
+                    self._json_response(_api_error_payload("invalidCommand", fallback="invalid command"), HTTPStatus.BAD_REQUEST)
                     return
                 if command == "clear_stale_pending":
                     payload = _load_json(control_path, _default_control())
@@ -2216,7 +2809,10 @@ def build_handler(
                             "ok": True,
                             "command": command,
                             "requested_ts": requested_ts,
-                            "message": "stale pending cleanup request queued",
+                            "message": i18n_t(
+                                "web.api.stalePendingQueued",
+                                fallback="stale pending cleanup request queued",
+                            ),
                         }
                     )
                     return
@@ -2237,7 +2833,11 @@ def build_handler(
                         {
                             "ok": False,
                             "command": command,
-                            "error": str(exc),
+                            **_api_error_payload(
+                                "reportGenerationFailed",
+                                fallback="report generation failed",
+                                detail=str(exc),
+                            ),
                         },
                         HTTPStatus.INTERNAL_SERVER_ERROR,
                     )
@@ -2268,7 +2868,7 @@ def build_handler(
                 payload["emergency_stop"] = False
                 payload["clear_stale_pending_requested_ts"] = 0
             else:
-                self._json_response({"error": "invalid command"}, HTTPStatus.BAD_REQUEST)
+                self._json_response(_api_error_payload("invalidCommand", fallback="invalid command"), HTTPStatus.BAD_REQUEST)
                 return
 
             payload["updated_ts"] = int(time.time())
@@ -2313,6 +2913,34 @@ def main() -> None:
     )
     parser.add_argument("--frontend-dir", default="")
     args = parser.parse_args()
+    settings = Settings()
+    runtime_paths = build_runtime_artifact_paths(settings)
+    if args.state_path == "/tmp/poly_runtime_data/state.json":
+        args.state_path = runtime_paths["state_path"]
+    if args.control_path == "/tmp/poly_runtime_data/control.json":
+        args.control_path = runtime_paths["control_path"]
+    if args.monitor_30m_json_path == "/tmp/poly_monitor_30m_report.json":
+        args.monitor_30m_json_path = runtime_paths["monitor_30m_json_path"]
+    if args.monitor_12h_json_path == "/tmp/poly_monitor_12h_report.json":
+        args.monitor_12h_json_path = runtime_paths["monitor_12h_json_path"]
+    if args.reconciliation_eod_json_path == "/tmp/poly_reconciliation_eod_report.json":
+        args.reconciliation_eod_json_path = runtime_paths["reconciliation_eod_json_path"]
+    if args.reconciliation_eod_text_path == "/tmp/poly_reconciliation_eod_report.txt":
+        args.reconciliation_eod_text_path = runtime_paths["reconciliation_eod_text_path"]
+    if args.ledger_path == os.getenv("LEDGER_PATH", "/tmp/poly_runtime_data/ledger.jsonl"):
+        args.ledger_path = runtime_paths["ledger_path"]
+    if args.public_state_path == os.getenv("POLY_PUBLIC_STATE_PATH", "/tmp/poly_public_state.json"):
+        args.public_state_path = runtime_paths["public_state_path"]
+    if args.decision_mode_path == os.getenv("POLY_DECISION_MODE_PATH", "/tmp/poly_runtime_data/decision_mode.json"):
+        args.decision_mode_path = runtime_paths["decision_mode_path"]
+    if args.candidate_actions_path == os.getenv("POLY_CANDIDATE_ACTIONS_PATH", "/tmp/poly_runtime_data/candidate_actions.json"):
+        args.candidate_actions_path = runtime_paths["candidate_actions_path"]
+    if args.wallet_profiles_path == os.getenv("POLY_WALLET_PROFILES_PATH", "/tmp/poly_runtime_data/wallet_profiles.json"):
+        args.wallet_profiles_path = runtime_paths["wallet_profiles_path"]
+    if args.journal_path == os.getenv("POLY_JOURNAL_PATH", "/tmp/poly_runtime_data/journal.json"):
+        args.journal_path = runtime_paths["journal_path"]
+    if args.candidate_db_path == os.getenv("POLY_CANDIDATE_DB_PATH", "/tmp/poly_runtime_data/decision_terminal.db"):
+        args.candidate_db_path = runtime_paths["candidate_db_path"]
 
     if args.frontend_dir:
         frontend = Path(args.frontend_dir)

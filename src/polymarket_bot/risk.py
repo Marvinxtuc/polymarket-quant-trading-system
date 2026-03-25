@@ -19,6 +19,11 @@ class RiskState:
     cash_balance_usd: float = 0.0
     positions_value_usd: float = 0.0
     account_snapshot_ts: int = 0
+    trading_mode: str = "NORMAL"
+    trading_mode_reasons: tuple[str, ...] = ()
+    account_state_status: str = "unknown"
+    reconciliation_status: str = "unknown"
+    persistence_status: str = "ok"
 
     @property
     def effective_daily_realized_pnl(self) -> float:
@@ -48,9 +53,11 @@ class RiskManager:
                 "observed_notional": max_notional,
                 "min_sell_notional": 5.0,
                 "allowed": max_notional >= 5.0,
+                "trading_mode": str(state.trading_mode or "NORMAL"),
+                "trading_mode_reasons": list(state.trading_mode_reasons or ()),
             }
             if max_notional < 5:
-                return RiskDecision(False, "sell notional too small", 0.0, snapshot=snapshot)
+                return RiskDecision(False, "sell_notional_too_small", 0.0, snapshot=snapshot)
             return RiskDecision(True, "ok", max_notional, snapshot=snapshot)
 
         daily_limit = self.settings.bankroll_usd * self.settings.daily_max_loss_pct
@@ -72,31 +79,46 @@ class RiskManager:
             "cash_balance_usd": state.cash_balance_usd,
             "positions_value_usd": state.positions_value_usd,
             "account_snapshot_ts": state.account_snapshot_ts,
+            "trading_mode": str(state.trading_mode or "NORMAL"),
+            "trading_mode_reasons": list(state.trading_mode_reasons or ()),
+            "account_state_status": str(state.account_state_status or "unknown"),
+            "reconciliation_status": str(state.reconciliation_status or "unknown"),
+            "persistence_status": str(state.persistence_status or "ok"),
             "price_hint": signal.price_hint,
             "min_price": self.settings.min_price,
             "max_price": self.settings.max_price,
             "observed_notional": float(signal.observed_notional or 0.0),
             "confidence": float(signal.confidence or 0.0),
         }
+        if str(state.trading_mode or "NORMAL").upper() == "HALTED":
+            snapshot["allowed"] = False
+            snapshot["reject_stage"] = "trading_mode"
+            return RiskDecision(False, "system_halted", 0.0, snapshot=snapshot)
+
+        if str(state.trading_mode or "NORMAL").upper() != "NORMAL":
+            snapshot["allowed"] = False
+            snapshot["reject_stage"] = "trading_mode"
+            return RiskDecision(False, "system_reduce_only", 0.0, snapshot=snapshot)
+
         if state.effective_daily_realized_pnl <= -daily_limit:
             snapshot["allowed"] = False
             snapshot["reject_stage"] = "daily_limit"
-            return RiskDecision(False, "daily loss limit reached", 0.0, snapshot=snapshot)
+            return RiskDecision(False, "daily_loss_limit_reached", 0.0, snapshot=snapshot)
 
         if state.effective_open_positions >= self.settings.max_open_positions:
             snapshot["allowed"] = False
             snapshot["reject_stage"] = "max_open_positions"
-            return RiskDecision(False, "max open positions reached", 0.0, snapshot=snapshot)
+            return RiskDecision(False, "max_open_positions_reached", 0.0, snapshot=snapshot)
 
         if state.committed_notional_usd >= self.settings.bankroll_usd:
             snapshot["allowed"] = False
             snapshot["reject_stage"] = "bankroll_committed"
-            return RiskDecision(False, "bankroll fully committed", 0.0, snapshot=snapshot)
+            return RiskDecision(False, "bankroll_fully_committed", 0.0, snapshot=snapshot)
 
         if not (self.settings.min_price <= signal.price_hint <= self.settings.max_price):
             snapshot["allowed"] = False
             snapshot["reject_stage"] = "price_band"
-            return RiskDecision(False, "price outside allowed band", 0.0, snapshot=snapshot)
+            return RiskDecision(False, "price_outside_allowed_band", 0.0, snapshot=snapshot)
 
         base_notional = self.settings.bankroll_usd * self.settings.risk_per_trade_pct
         # Scale by confidence and cap at observed smart-money notional.
@@ -106,7 +128,7 @@ class RiskManager:
         if max_notional < 5:
             snapshot["allowed"] = False
             snapshot["reject_stage"] = "notional_too_small"
-            return RiskDecision(False, "calculated notional too small", 0.0, snapshot=snapshot)
+            return RiskDecision(False, "calculated_notional_too_small", 0.0, snapshot=snapshot)
 
         remaining_capacity = max(0.0, self.settings.bankroll_usd - state.committed_notional_usd)
         snapshot["remaining_capacity_usd"] = remaining_capacity
@@ -115,7 +137,7 @@ class RiskManager:
         if max_notional < 5:
             snapshot["allowed"] = False
             snapshot["reject_stage"] = "bankroll_capacity"
-            return RiskDecision(False, "remaining bankroll capacity too small", 0.0, snapshot=snapshot)
+            return RiskDecision(False, "remaining_bankroll_capacity_too_small", 0.0, snapshot=snapshot)
 
         snapshot["allowed"] = True
         return RiskDecision(True, "ok", max_notional, snapshot=snapshot)

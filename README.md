@@ -135,6 +135,45 @@ Quick stop/restart helper:
 make stop-stack
 ```
 
+## BlockBeats Integration
+
+This workspace now includes a shared `blockbeats-skill` installation for live crypto and prediction-market news context.
+
+- Shared skill source: `/Users/marvin.xa/Desktop/skills/blockbeats-skill`
+- Codex mirror: `/Users/marvin.xa/.codex/skills/blockbeats-skill`
+- OpenClaw shared skill root: `/Users/marvin.xa/Desktop/skills` via `~/.openclaw/openclaw.json`
+- Project helper script: `scripts/blockbeats_query.sh`
+
+Use it when a Polymarket view depends on fresh news catalysts rather than only wallet flow or price action.
+
+`scripts/blockbeats_query.sh` now reads `BLOCKBEATS_API_KEY` from the current shell first and falls back to this repo's `.env`, so the helper can run as soon as the key is added locally.
+It also uses bounded request timeouts, retries via DNS-over-HTTPS when local DNS is unhealthy, and falls back to the public BlockBeats flash feed for `prediction` if the Pro endpoint is unreachable.
+
+Examples:
+
+```bash
+# Quick market overview
+bash scripts/blockbeats_query.sh overview
+
+# Prediction-market specific headlines
+bash scripts/blockbeats_query.sh prediction 1 10 en
+
+# Search a named catalyst or entity
+bash scripts/blockbeats_query.sh search "Trump tariffs" 1 8 en
+
+# Pull important headlines
+bash scripts/blockbeats_query.sh newsflash important 1 10 en
+```
+
+Recommended workflow for news-driven market review:
+
+1. Pull `prediction` headlines first.
+2. Add `important` and `macro` when the market is broad or policy-sensitive.
+3. Run `search` for the exact person, protocol, ETF, or event.
+4. Treat the result as context for thesis updates, not as a trading signal by itself.
+
+If Codex or OpenClaw still cannot invoke the shared skill after you add the key, start a new session so the updated environment is visible to that app process.
+
 ## Dashboard + Bot (One-Click)
 
 - Frontend: `frontend/` (this repo)
@@ -217,6 +256,7 @@ Live execution note:
 - `.env.example` is the safe template; update it when you add new settings.
 - For paper trading, you can leave `PRIVATE_KEY` and `FUNDER_ADDRESS` empty.
 - For live trading, `PRIVATE_KEY` and `FUNDER_ADDRESS` are required.
+- `BLOCKBEATS_API_KEY` is optional for the trading engine, but required for the shared BlockBeats skill. The repo helper `scripts/blockbeats_query.sh` will also use it and can load it from `.env`.
 
 Before switching to live-like testing, run:
 

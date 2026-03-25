@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from polymarket_bot.full_flow_validation import render_full_flow_validation_report, run_full_flow_validation
+from polymarket_bot.i18n import t as i18n_t
 
 
 class FullFlowValidationTests(unittest.TestCase):
@@ -207,8 +208,14 @@ class FullFlowValidationTests(unittest.TestCase):
         self.assertIn("monitor_30m_api", stage_names)
         self.assertIn("reconciliation_api", stage_names)
         text = render_full_flow_validation_report(report)
-        self.assertIn("validation_status: PASS", text)
-        self.assertIn("operational_readiness: OBSERVE", text)
+        self.assertIn(
+            f"{i18n_t('report.fullFlowValidation.field.validationStatus')}: {i18n_t('report.fullFlowValidation.enum.status.pass')}",
+            text,
+        )
+        self.assertIn(
+            f"{i18n_t('report.fullFlowValidation.field.operationalReadiness')}: {i18n_t('report.fullFlowValidation.enum.readiness.observe')}",
+            text,
+        )
 
     def test_run_full_flow_validation_fails_when_monitor_api_is_missing(self):
         report = run_full_flow_validation(

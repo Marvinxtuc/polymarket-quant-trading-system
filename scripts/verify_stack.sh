@@ -4,8 +4,9 @@ set -euo pipefail
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY_BIN="$BASE/.venv/bin/python"
 CURL_BIN="/usr/bin/curl"
-WEB_URL="${1:-http://127.0.0.1:8787/api/state}"
-STATE_PATH="${STATE_PATH:-/tmp/poly_runtime_data/state.json}"
+STACK_WEB_PORT="${STACK_WEB_PORT:-8787}"
+WEB_URL="${1:-http://127.0.0.1:${STACK_WEB_PORT}/api/state}"
+STATE_PATH="${STATE_PATH:-}"
 VERIFY_RETRIES="${VERIFY_RETRIES:-8}"
 VERIFY_RETRY_INTERVAL="${VERIFY_RETRY_INTERVAL_SECONDS:-5}"
 VERIFY_STARTED_AT="${VERIFY_STARTED_AT:-0}"
@@ -17,6 +18,42 @@ if [[ ! -x "$PY_BIN" ]]; then
   echo ".venv/bin/python not found, please create the virtualenv first" >&2
   exit 1
 fi
+
+if [[ -z "${STATE_PATH:-}" ]]; then
+  STATE_PATH="$("$PY_BIN" "$BASE/scripts/runtime_paths.py" state_path)"
+fi
+
+read_dotenv_var() {
+  local key="$1"
+  local dotenv="$BASE/.env"
+  [[ -f "$dotenv" ]] || return 0
+  awk -F= -v key="$key" '
+    $0 ~ "^[[:space:]]*" key "=" {
+      sub(/^[[:space:]]*[^=]+=/, "", $0)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", $0)
+      gsub(/^"|"$/, "", $0)
+      gsub(/^'\''|'\''$/, "", $0)
+      print $0
+      exit
+    }
+  ' "$dotenv"
+}
+
+append_control_token() {
+  local url="$1"
+  local token="${POLY_CONTROL_TOKEN:-$(read_dotenv_var POLY_CONTROL_TOKEN)}"
+  if [[ -z "${token:-}" ]] || [[ "$url" == *"token="* ]]; then
+    printf '%s\n' "$url"
+    return 0
+  fi
+  if [[ "$url" == *"?"* ]]; then
+    printf '%s&token=%s\n' "$url" "$token"
+  else
+    printf '%s?token=%s\n' "$url" "$token"
+  fi
+}
+
+WEB_URL="$(append_control_token "$WEB_URL")"
 
 fetch_state_payload() {
   local payload

@@ -10,6 +10,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from polymarket_bot.i18n import (
+    enum_label as i18n_enum_label,
+    humanize_identifier as i18n_humanize_identifier,
+    label as i18n_label,
+    t as i18n_t,
+)
+
 
 def _safe_float(value: object, default: float = 0.0) -> float:
     try:
@@ -30,6 +37,76 @@ def _utc_day_key(ts: int | None = None) -> str:
     return moment.strftime("%Y-%m-%d")
 
 
+def _report_field_label(field: str) -> str:
+    return i18n_label(
+        "report.reconciliation.field",
+        field,
+        fallback=i18n_humanize_identifier(field),
+    )
+
+
+def _report_section_label(section: str) -> str:
+    return i18n_label(
+        "report.reconciliation.section",
+        section,
+        fallback=i18n_humanize_identifier(section),
+    )
+
+
+def _report_issue_label(issue: str) -> str:
+    raw = str(issue or "").strip()
+    if not raw:
+        return ""
+    return i18n_label(
+        "enum.reason",
+        raw,
+        fallback=i18n_label(
+            "metric",
+            raw,
+            fallback=i18n_humanize_identifier(raw),
+        ),
+    )
+
+
+def _report_recommendation_text(code: str) -> str:
+    raw = str(code or "").strip()
+    if not raw:
+        return ""
+    return i18n_t(
+        f"report.reconciliation.recommendation.{raw}",
+        fallback=i18n_humanize_identifier(raw),
+    )
+
+
+def _report_source_label(source: str) -> str:
+    raw = str(source or "").strip()
+    if not raw:
+        return i18n_t("common.unknown", fallback="Unknown")
+    return i18n_label(
+        "report.reconciliation.source",
+        raw,
+        fallback=i18n_humanize_identifier(raw),
+    )
+
+
+def _report_side_label(side: str) -> str:
+    raw = str(side or "").strip()
+    if not raw:
+        return i18n_t("common.unknown", fallback="Unknown")
+    return i18n_enum_label(
+        "enum.side",
+        raw.lower(),
+        fallback=i18n_humanize_identifier(raw),
+    )
+
+
+def _report_bool_label(value: object) -> str:
+    return i18n_t(
+        "common.enabled" if bool(value) else "common.disabled",
+        fallback="true" if bool(value) else "false",
+    )
+
+
 _SQLITE_LEDGER_SUFFIXES = {".db", ".sqlite", ".sqlite3"}
 
 
@@ -42,6 +119,10 @@ def _ensure_parent_dir(path: str) -> None:
     if str(parent) in {"", "."}:
         return
     parent.mkdir(parents=True, exist_ok=True)
+
+
+def _resolved_path(path: str) -> str:
+    return str(Path(str(path or "").strip()).expanduser())
 
 
 def _ledger_record_from_payload(
@@ -66,7 +147,7 @@ def append_ledger_entry(
     *,
     broker: str = "",
 ) -> None:
-    target = str(path or "").strip()
+    target = _resolved_path(path)
     if not target:
         return
 
@@ -114,10 +195,11 @@ def append_ledger_entry(
 
 
 def load_json_dict(path: str) -> dict[str, object]:
-    if not path:
+    target = _resolved_path(path)
+    if not target:
         return {}
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(target, "r", encoding="utf-8") as f:
             payload = json.load(f)
         if isinstance(payload, dict):
             return payload
@@ -135,9 +217,7 @@ def load_ledger_rows(
     broker: str | None = None,
 ) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
-    if not path:
-        return rows
-    target = str(path or "").strip()
+    target = _resolved_path(path)
     if not target:
         return rows
     if _is_sqlite_ledger_path(target):
@@ -250,7 +330,13 @@ def summarize_ledger(rows: list[dict[str, object]]) -> dict[str, object]:
 
         source_bucket = fill_by_source.setdefault(
             source,
-            {"source": source, "fill_count": 0, "notional": 0.0, "realized_pnl": 0.0},
+            {
+                "source": source,
+                "source_label": _report_source_label(source),
+                "fill_count": 0,
+                "notional": 0.0,
+                "realized_pnl": 0.0,
+            },
         )
         source_bucket["fill_count"] = int(source_bucket["fill_count"]) + 1
         source_bucket["notional"] = float(source_bucket["notional"]) + notional
@@ -258,7 +344,13 @@ def summarize_ledger(rows: list[dict[str, object]]) -> dict[str, object]:
 
         side_bucket = fill_by_side.setdefault(
             side,
-            {"side": side, "fill_count": 0, "notional": 0.0, "realized_pnl": 0.0},
+            {
+                "side": side,
+                "side_label": _report_side_label(side),
+                "fill_count": 0,
+                "notional": 0.0,
+                "realized_pnl": 0.0,
+            },
         )
         side_bucket["fill_count"] = int(side_bucket["fill_count"]) + 1
         side_bucket["notional"] = float(side_bucket["notional"]) + notional
@@ -313,21 +405,23 @@ def build_reconciliation_report(
     broker_closed_pnl_today = _safe_float(reconciliation.get("broker_closed_pnl_today"), _safe_float(summary.get("broker_closed_pnl_today")))
     status = str(reconciliation.get("status") or "ok").lower()
     issues = [str(item) for item in list(reconciliation.get("issues") or []) if str(item).strip()]
+    issue_labels = [_report_issue_label(item) for item in issues]
     startup_ready = bool(startup.get("ready", True))
 
-    recommendations: list[str] = []
+    recommendation_codes: list[str] = []
     if not startup_ready:
-        recommendations.append("Resolve startup readiness failures before trusting any live execution metrics.")
+        recommendation_codes.append("startup_not_ready")
     if status == "fail":
-        recommendations.append("Execution reconciliation is failing. Treat ledger/state drift as a production incident.")
+        recommendation_codes.append("status_fail")
     elif status == "warn":
-        recommendations.append("Execution reconciliation has warnings. Review stale pending orders and sync freshness.")
+        recommendation_codes.append("status_warn")
     else:
-        recommendations.append("Execution reconciliation is aligned for the selected day.")
+        recommendation_codes.append("status_ok")
     if int(ledger_summary.get("fill_count") or 0) <= 0:
-        recommendations.append("No fill entries were recorded for the selected day.")
+        recommendation_codes.append("no_fill_entries")
     if abs(_safe_float(reconciliation.get("internal_vs_ledger_diff"))) > 0.01:
-        recommendations.append("Internal PnL and ledger PnL differ. Reconcile before promoting results.")
+        recommendation_codes.append("internal_ledger_diff")
+    recommendations = [_report_recommendation_text(code) for code in recommendation_codes]
 
     return {
         "report_version": 1,
@@ -337,7 +431,13 @@ def build_reconciliation_report(
         "state_path": state_path,
         "ledger_path": ledger_path,
         "status": status,
+        "status_label": i18n_enum_label(
+            "enum.reportStatus",
+            status,
+            fallback=i18n_humanize_identifier(status),
+        ),
         "issues": issues,
+        "issue_labels": issue_labels,
         "startup": startup,
         "reconciliation": reconciliation,
         "state_summary": {
@@ -361,6 +461,7 @@ def build_reconciliation_report(
             "broker_event_sync_age_seconds": _safe_int(reconciliation.get("broker_event_sync_age_seconds")),
         },
         "ledger_summary": ledger_summary,
+        "recommendation_codes": recommendation_codes,
         "recommendations": recommendations,
     }
 
@@ -393,81 +494,96 @@ def render_reconciliation_report(report: Mapping[str, object]) -> str:
     state_summary = dict(report.get("state_summary") or {}) if isinstance(report.get("state_summary"), dict) else {}
     ledger_summary = dict(report.get("ledger_summary") or {}) if isinstance(report.get("ledger_summary"), dict) else {}
     recommendations = [str(item) for item in list(report.get("recommendations") or []) if str(item).strip()]
-    issues = [str(item) for item in list(report.get("issues") or []) if str(item).strip()]
+    issues = [str(item) for item in list(report.get("issue_labels") or report.get("issues") or []) if str(item).strip()]
+    status_value = str(report.get("status_label") or report.get("status") or "")
 
     lines = [
-        "Polymarket Reconciliation EOD Report",
-        f"generated_at: {report.get('generated_at')}",
-        f"day_key: {report.get('day_key')}",
-        f"status: {report.get('status')}",
-        f"state_path: {report.get('state_path')}",
-        f"ledger_path: {report.get('ledger_path')}",
+        i18n_t("report.reconciliation.title", fallback="Polymarket Reconciliation EOD Report"),
+        f"{_report_field_label('generated_at')}: {report.get('generated_at')}",
+        f"{_report_field_label('day_key')}: {report.get('day_key')}",
+        f"{_report_field_label('status')}: {status_value}",
+        f"{_report_field_label('state_path')}: {report.get('state_path')}",
+        f"{_report_field_label('ledger_path')}: {report.get('ledger_path')}",
         "",
-        "startup:",
-        f"  ready: {startup.get('ready', True)}",
-        f"  warning_count: {startup.get('warning_count', 0)}",
-        f"  failure_count: {startup.get('failure_count', 0)}",
+        f"{_report_section_label('startup')}:",
+        f"  {_report_field_label('ready')}: {_report_bool_label(startup.get('ready', True))}",
+        f"  {_report_field_label('warning_count')}: {startup.get('warning_count', 0)}",
+        f"  {_report_field_label('failure_count')}: {startup.get('failure_count', 0)}",
         "",
-        "state_summary:",
-        f"  open_positions: {state_summary.get('open_positions', 0)}",
-        f"  pending_orders: {state_summary.get('pending_orders', 0)}",
-        f"  tracked_notional_usd: {state_summary.get('tracked_notional_usd', 0.0)}",
-        f"  internal_realized_pnl: {state_summary.get('internal_realized_pnl', 0.0)}",
-        f"  ledger_realized_pnl: {state_summary.get('ledger_realized_pnl', 0.0)}",
-        f"  internal_vs_ledger_diff: {state_summary.get('internal_vs_ledger_diff', 0.0)}",
-        f"  broker_floor_gap_vs_internal: {state_summary.get('broker_floor_gap_vs_internal', 0.0)}",
-        f"  account_snapshot_age_seconds: {state_summary.get('account_snapshot_age_seconds', 0)}",
-        f"  broker_reconcile_age_seconds: {state_summary.get('broker_reconcile_age_seconds', 0)}",
-        f"  broker_event_sync_age_seconds: {state_summary.get('broker_event_sync_age_seconds', 0)}",
+        f"{_report_section_label('state_summary')}:",
+        f"  {_report_field_label('open_positions')}: {state_summary.get('open_positions', 0)}",
+        f"  {_report_field_label('pending_orders')}: {state_summary.get('pending_orders', 0)}",
+        f"  {_report_field_label('tracked_notional_usd')}: {state_summary.get('tracked_notional_usd', 0.0)}",
+        f"  {_report_field_label('internal_realized_pnl')}: {state_summary.get('internal_realized_pnl', 0.0)}",
+        f"  {_report_field_label('ledger_realized_pnl')}: {state_summary.get('ledger_realized_pnl', 0.0)}",
+        f"  {_report_field_label('internal_vs_ledger_diff')}: {state_summary.get('internal_vs_ledger_diff', 0.0)}",
+        f"  {_report_field_label('broker_floor_gap_vs_internal')}: {state_summary.get('broker_floor_gap_vs_internal', 0.0)}",
+        f"  {_report_field_label('account_snapshot_age_seconds')}: {state_summary.get('account_snapshot_age_seconds', 0)}",
+        f"  {_report_field_label('broker_reconcile_age_seconds')}: {state_summary.get('broker_reconcile_age_seconds', 0)}",
+        f"  {_report_field_label('broker_event_sync_age_seconds')}: {state_summary.get('broker_event_sync_age_seconds', 0)}",
         "",
-        "ledger_summary:",
-        f"  total_entries: {ledger_summary.get('total_entries', 0)}",
-        f"  fill_count: {ledger_summary.get('fill_count', 0)}",
-        f"  buy_fill_count: {ledger_summary.get('buy_fill_count', 0)}",
-        f"  sell_fill_count: {ledger_summary.get('sell_fill_count', 0)}",
-        f"  fill_notional: {ledger_summary.get('fill_notional', 0.0)}",
-        f"  realized_pnl: {ledger_summary.get('realized_pnl', 0.0)}",
-        f"  account_sync_count: {ledger_summary.get('account_sync_count', 0)}",
-        f"  startup_checks_count: {ledger_summary.get('startup_checks_count', 0)}",
+        f"{_report_section_label('ledger_summary')}:",
+        f"  {_report_field_label('total_entries')}: {ledger_summary.get('total_entries', 0)}",
+        f"  {_report_field_label('fill_count')}: {ledger_summary.get('fill_count', 0)}",
+        f"  {_report_field_label('buy_fill_count')}: {ledger_summary.get('buy_fill_count', 0)}",
+        f"  {_report_field_label('sell_fill_count')}: {ledger_summary.get('sell_fill_count', 0)}",
+        f"  {_report_field_label('fill_notional')}: {ledger_summary.get('fill_notional', 0.0)}",
+        f"  {_report_field_label('realized_pnl')}: {ledger_summary.get('realized_pnl', 0.0)}",
+        f"  {_report_field_label('account_sync_count')}: {ledger_summary.get('account_sync_count', 0)}",
+        f"  {_report_field_label('startup_checks_count')}: {ledger_summary.get('startup_checks_count', 0)}",
         "",
-        "issues:",
+        f"{_report_section_label('issues')}:",
     ]
     if issues:
         lines.extend(f"  - {item}" for item in issues)
     else:
-        lines.append("  - (none)")
+        lines.append(f"  - {i18n_t('report.reconciliation.none', fallback='(none)')}")
 
     lines.append("")
-    lines.append("recommendations:")
+    lines.append(f"{_report_section_label('recommendations')}:")
     if recommendations:
         lines.extend(f"  - {item}" for item in recommendations)
     else:
-        lines.append("  - (none)")
+        lines.append(f"  - {i18n_t('report.reconciliation.none', fallback='(none)')}")
 
     by_source = list(ledger_summary.get("fill_by_source") or [])
     if by_source:
         lines.append("")
-        lines.append("fill_by_source:")
+        lines.append(f"{_report_section_label('fill_by_source')}:")
         for row in by_source:
             if not isinstance(row, Mapping):
                 continue
             lines.append(
-                "  - "
-                f"{row.get('source')}: count={row.get('fill_count', 0)} "
-                f"notional={row.get('notional', 0.0)} pnl={row.get('realized_pnl', 0.0)}"
+                "  - " + i18n_t(
+                    "report.reconciliation.row.source",
+                    {
+                        "source": row.get("source_label") or _report_source_label(str(row.get("source") or "")),
+                        "count": row.get("fill_count", 0),
+                        "notional": row.get("notional", 0.0),
+                        "pnl": row.get("realized_pnl", 0.0),
+                    },
+                    fallback="",
+                )
             )
 
     fill_by_side = list(ledger_summary.get("fill_by_side") or [])
     if fill_by_side:
         lines.append("")
-        lines.append("fill_by_side:")
+        lines.append(f"{_report_section_label('fill_by_side')}:")
         for row in fill_by_side:
             if not isinstance(row, Mapping):
                 continue
             lines.append(
-                "  - "
-                f"{row.get('side')}: count={row.get('fill_count', 0)} "
-                f"notional={row.get('notional', 0.0)} pnl={row.get('realized_pnl', 0.0)}"
+                "  - " + i18n_t(
+                    "report.reconciliation.row.side",
+                    {
+                        "side": row.get("side_label") or _report_side_label(str(row.get("side") or "")),
+                        "count": row.get("fill_count", 0),
+                        "notional": row.get("notional", 0.0),
+                        "pnl": row.get("realized_pnl", 0.0),
+                    },
+                    fallback="",
+                )
             )
 
     return "\n".join(lines) + "\n"

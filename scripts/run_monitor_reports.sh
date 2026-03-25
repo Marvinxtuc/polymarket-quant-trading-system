@@ -2,25 +2,61 @@
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-LOG_DIR="/tmp/poly_monitor_reports"
+PY_BIN="$BASE/.venv/bin/python"
+LOG_DIR=""
 ROTATE_KEEP="${ROTATE_KEEP:-24}"
-PID_FILE="$LOG_DIR/run_monitor_reports.pid"
+PID_FILE=""
 
 MODE="${1:-both}"
-MONITOR_DAEMON_LOG="${MONITOR_DAEMON_LOG:-/tmp/poly_runtime_data/poly_bot.log}"
-STATE_JSON="${STATE_JSON:-/tmp/poly_runtime_data/state.json}"
+MONITOR_DAEMON_LOG="${MONITOR_DAEMON_LOG:-}"
+STATE_JSON="${STATE_JSON:-}"
 
-MON30M_OUT="/tmp/poly_monitor_30m_report.txt"
-MON30M_JSON="/tmp/poly_monitor_30m_report.json"
-MON30M_LOG="${MON30M_LOG:-$MONITOR_DAEMON_LOG}"
+MON30M_OUT="${MON30M_OUT:-}"
+MON30M_JSON="${MON30M_JSON:-}"
+MON30M_LOG="${MON30M_LOG:-}"
 MON30M_WINDOW="${MON30M_WINDOW_SECONDS:-1800}"
-MON30M_STATE="/tmp/poly_monitor_30m_inconclusive_state"
+MON30M_STATE="${MON30M_STATE:-}"
 
-MON12H_OUT="/tmp/poly_monitor_12h_report.txt"
-MON12H_JSON="/tmp/poly_monitor_12h_report.json"
-MON12H_LOG="${MON12H_LOG:-$MONITOR_DAEMON_LOG}"
+MON12H_OUT="${MON12H_OUT:-}"
+MON12H_JSON="${MON12H_JSON:-}"
+MON12H_LOG="${MON12H_LOG:-}"
 MON12H_WINDOW="${MON12H_WINDOW_SECONDS:-43200}"
-MON12H_STATE="/tmp/poly_monitor_12h_inconclusive_state"
+MON12H_STATE="${MON12H_STATE:-}"
+
+if [[ ! -x "$PY_BIN" ]]; then
+  echo ".venv/bin/python not found, please create venv first" >&2
+  exit 1
+fi
+
+eval "$("$PY_BIN" "$BASE/scripts/runtime_paths.py" --format shell monitor_reports_dir bot_log_path state_path monitor_30m_report_path monitor_30m_json_path monitor_30m_state_path monitor_12h_report_path monitor_12h_json_path monitor_12h_state_path)"
+LOG_DIR="$MONITOR_REPORTS_DIR"
+PID_FILE="$LOG_DIR/run_monitor_reports.pid"
+if [[ -z "${MONITOR_DAEMON_LOG:-}" ]]; then
+  MONITOR_DAEMON_LOG="$BOT_LOG_PATH"
+fi
+if [[ -z "${STATE_JSON:-}" ]]; then
+  STATE_JSON="$STATE_PATH"
+fi
+if [[ -z "${MON30M_OUT:-}" ]]; then
+  MON30M_OUT="$MONITOR_30M_REPORT_PATH"
+fi
+if [[ -z "${MON30M_JSON:-}" ]]; then
+  MON30M_JSON="$MONITOR_30M_JSON_PATH"
+fi
+if [[ -z "${MON30M_STATE:-}" ]]; then
+  MON30M_STATE="$MONITOR_30M_STATE_PATH"
+fi
+if [[ -z "${MON12H_OUT:-}" ]]; then
+  MON12H_OUT="$MONITOR_12H_REPORT_PATH"
+fi
+if [[ -z "${MON12H_JSON:-}" ]]; then
+  MON12H_JSON="$MONITOR_12H_JSON_PATH"
+fi
+if [[ -z "${MON12H_STATE:-}" ]]; then
+  MON12H_STATE="$MONITOR_12H_STATE_PATH"
+fi
+MON30M_LOG="${MON30M_LOG:-$MONITOR_DAEMON_LOG}"
+MON12H_LOG="${MON12H_LOG:-$MONITOR_DAEMON_LOG}"
 
 mkdir -p "$LOG_DIR"
 

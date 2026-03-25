@@ -6,6 +6,7 @@ import logging
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from polymarket_bot.config import Settings
@@ -14,11 +15,14 @@ from polymarket_bot.notifier import Notifier
 
 
 def _safe_write_json(path: str, payload: dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp_path = f"{path}.tmp"
+    resolved_path = str(Path(path).expanduser())
+    parent = Path(resolved_path).parent
+    if str(parent) not in {"", "."}:
+        parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = f"{resolved_path}.tmp"
     with open(tmp_path, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)
-    os.replace(tmp_path, path)
+    os.replace(tmp_path, resolved_path)
 
 
 def _safe_read_json(path: str, fallback: dict[str, Any]) -> dict[str, Any]:
@@ -57,6 +61,14 @@ def _default_wallet_profile_store() -> dict[str, Any]:
 
 def _default_journal_store() -> dict[str, Any]:
     return {"notes": []}
+
+
+def _default_persistence_state() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "failure_count": 0,
+        "last_failure": {},
+    }
 
 
 def _empty_stats_summary() -> dict[str, Any]:
@@ -112,6 +124,141 @@ def _empty_archive_summary() -> dict[str, Any]:
         },
         "updated_ts": 0,
     }
+
+
+def _empty_candidate_observability(*, updated_ts: int = 0) -> dict[str, Any]:
+    return {
+        "updated_ts": int(updated_ts or 0),
+        "candidate_count": 0,
+        "market_metadata": {
+            "hits": 0,
+            "misses": 0,
+            "coverage_pct": 0.0,
+        },
+        "market_time_source": {
+            "metadata": 0,
+            "slug_legacy": 0,
+            "unknown": 0,
+        },
+        "skip_reasons": {},
+        "recent_cycles": {
+            "cycles": 0,
+            "signals": 0,
+            "precheck_skipped": 0,
+            "market_time_source": {
+                "metadata": 0,
+                "slug_legacy": 0,
+                "unknown": 0,
+            },
+            "skip_reasons": {},
+        },
+    }
+
+
+def _boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = str(value or "").strip().lower()
+    return normalized in {"1", "true", "yes", "y", "on"}
+
+
+def _build_candidate_observability(items: list[dict[str, Any]], *, now: int) -> dict[str, Any]:
+    summary = _empty_candidate_observability(updated_ts=now)
+    if not items:
+        return summary
+
+    time_sources: dict[str, int] = {
+        "metadata": 0,
+        "slug_legacy": 0,
+        "unknown": 0,
+    }
+    skip_reasons: dict[str, int] = {}
+    metadata_hits = 0
+    candidate_count = 0
+
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        candidate_count += 1
+        metadata_hit = _boolish(raw.get("market_metadata_hit"))
+        if metadata_hit:
+            metadata_hits += 1
+        time_source = str(raw.get("market_time_source") or "").strip().lower()
+        if not time_source:
+            time_source = "metadata" if metadata_hit else "unknown"
+        time_sources[time_source] = int(time_sources.get(time_source, 0) or 0) + 1
+        skip_reason = str(raw.get("skip_reason") or "").strip()
+        if skip_reason:
+            skip_reasons[skip_reason] = int(skip_reasons.get(skip_reason, 0) or 0) + 1
+
+    metadata_misses = max(0, candidate_count - metadata_hits)
+    coverage_pct = round((metadata_hits / candidate_count) * 100.0, 1) if candidate_count > 0 else 0.0
+    summary["candidate_count"] = candidate_count
+    summary["market_metadata"] = {
+        "hits": metadata_hits,
+        "misses": metadata_misses,
+        "coverage_pct": coverage_pct,
+    }
+    summary["market_time_source"] = dict(
+        sorted(
+            time_sources.items(),
+            key=lambda item: (-int(item[1] or 0), str(item[0] or "")),
+        )
+    )
+    summary["skip_reasons"] = dict(
+        sorted(
+            skip_reasons.items(),
+            key=lambda item: (-int(item[1] or 0), str(item[0] or "")),
+        )
+    )
+    return summary
+
+
+def _build_recent_cycle_candidate_observability(signal_cycles: list[dict[str, Any]]) -> dict[str, Any]:
+    summary = dict((_empty_candidate_observability().get("recent_cycles") or {}))
+    if not signal_cycles:
+        return summary
+
+    time_sources: dict[str, int] = {"metadata": 0, "slug_legacy": 0, "unknown": 0}
+    skip_reasons: dict[str, int] = {}
+    signal_count = 0
+    precheck_skipped = 0
+
+    for cycle in signal_cycles[:6]:
+        if not isinstance(cycle, dict):
+            continue
+        for raw in list(cycle.get("candidates") or []):
+            if not isinstance(raw, dict):
+                continue
+            signal_count += 1
+            final_status = str(raw.get("final_status") or "").strip().lower()
+            decision_snapshot = dict(raw.get("decision_snapshot") or {})
+            skip_reason = str(decision_snapshot.get("skip_reason") or "").strip()
+            if skip_reason:
+                skip_reasons[skip_reason] = int(skip_reasons.get(skip_reason, 0) or 0) + 1
+            time_source = str(decision_snapshot.get("market_time_source") or "").strip().lower()
+            if not time_source:
+                time_source = "metadata" if _boolish(decision_snapshot.get("market_metadata_hit")) else "unknown"
+            time_sources[time_source] = int(time_sources.get(time_source, 0) or 0) + 1
+            if final_status == "precheck_skipped":
+                precheck_skipped += 1
+
+    summary["cycles"] = min(len(signal_cycles), 6)
+    summary["signals"] = signal_count
+    summary["precheck_skipped"] = precheck_skipped
+    summary["market_time_source"] = dict(
+        sorted(
+            time_sources.items(),
+            key=lambda item: (-int(item[1] or 0), str(item[0] or "")),
+        )
+    )
+    summary["skip_reasons"] = dict(
+        sorted(
+            skip_reasons.items(),
+            key=lambda item: (-int(item[1] or 0), str(item[0] or "")),
+        )
+    )
+    return summary
 
 
 def _as_str_list(value: Any) -> list[str]:
@@ -1393,6 +1540,27 @@ def _build_state(
             "broker_event_sync_age_seconds": 0,
         }
     )
+    trading_mode_builder = getattr(trader, "trading_mode_state", None)
+    trading_mode = (
+        dict(trading_mode_builder())
+        if callable(trading_mode_builder)
+        else {
+            "mode": str(getattr(trader, "trading_mode", "NORMAL") or "NORMAL"),
+            "opening_allowed": str(getattr(trader, "trading_mode", "NORMAL") or "NORMAL").upper() == "NORMAL",
+            "reason_codes": list(getattr(trader, "trading_mode_reasons", []) or []),
+            "updated_ts": int(getattr(trader, "trading_mode_updated_ts", 0) or 0),
+            "source": "runner",
+            "account_state_status": str(getattr(trader, "account_state_status", "unknown") or "unknown"),
+            "reconciliation_status": str(getattr(trader, "reconciliation_status", reconciliation.get("status", "unknown")) or "unknown"),
+            "persistence_status": str(getattr(trader, "persistence_status", "ok") or "ok"),
+        }
+    )
+    trading_mode.setdefault("persistence_status", str(getattr(trader, "persistence_status", "ok") or "ok"))
+    persistence_builder = getattr(trader, "persistence_state", None)
+    persistence = dict(persistence_builder()) if callable(persistence_builder) else _default_persistence_state()
+    persistence.setdefault("status", str(getattr(trader, "persistence_status", "ok") or "ok"))
+    persistence.setdefault("failure_count", int(getattr(trader, "persistence_failure_count", 0) or 0))
+    persistence.setdefault("last_failure", dict(getattr(trader, "last_persistence_failure", {}) or {}))
     wallet_metrics = trader.strategy.latest_wallet_metrics()
     scorer = getattr(trader.strategy, "scorer", None)
     history_min_closed_positions = int(getattr(scorer, "min_realized_sample", 5) or 5)
@@ -1608,12 +1776,13 @@ def _build_state(
                     "last_heartbeat_ts": int(raw_pending.get("last_heartbeat_ts") or 0),
                 }
             )
+    recent_signal_cycles = list(getattr(trader, "recent_signal_cycles", []) or [])
     operator_feedback = {
         "last_action": dict(getattr(trader, "last_operator_action", {}) or {}),
     }
     exit_review = _build_exit_review(orders, positions)
     signal_review = _build_signal_review(
-        list(getattr(trader, "recent_signal_cycles", []) or []),
+        recent_signal_cycles,
         list(getattr(trader, "_trace_records", lambda: [])() or []),
         positions,
         orders,
@@ -1667,8 +1836,10 @@ def _build_state(
             "watched": sum(1 for item in candidate_items if str(item.get("status") or "") == "watched"),
             "executed": sum(1 for item in candidate_items if str(item.get("status") or "") == "executed"),
         },
+        "observability": _build_candidate_observability(candidate_items, now=now),
         "items": candidate_items,
     }
+    candidates["observability"]["recent_cycles"] = _build_recent_cycle_candidate_observability(recent_signal_cycles)
     wallet_profiles = {
         "summary": {
             "count": len(wallet_profile_items),
@@ -1681,7 +1852,16 @@ def _build_state(
         "count": len(pending_action_items),
         "items": pending_action_items,
     }
-    notifier = Notifier()
+    notifier = Notifier(
+        local_enabled=bool(getattr(settings, "notify_local_enabled", True)),
+        webhook_url=str(getattr(settings, "notify_webhook_url", "") or ""),
+        webhook_urls=str(getattr(settings, "notify_webhook_urls", "") or ""),
+        telegram_bot_token=str(getattr(settings, "notify_telegram_bot_token", "") or ""),
+        telegram_chat_id=str(getattr(settings, "notify_telegram_chat_id", "") or ""),
+        telegram_api_base=str(getattr(settings, "notify_telegram_api_base", "") or ""),
+        telegram_parse_mode=str(getattr(settings, "notify_telegram_parse_mode", "") or ""),
+        log_path=str(getattr(settings, "notify_log_path", "") or ""),
+    )
     notifier_summary = notifier.summary(limit=5)
     timeline = [
         {
@@ -1859,6 +2039,8 @@ def _build_state(
             "clear_stale_pending_requested_ts": int(getattr(trader.control_state, "clear_stale_pending_requested_ts", 0) or 0),
             "updated_ts": int(trader.control_state.updated_ts),
         },
+        "trading_mode": trading_mode,
+        "persistence": persistence,
         "mode": str(decision_mode.get("mode") or "manual"),
         "decision_mode": decision_mode,
         "startup_ready": bool(getattr(trader, "startup_ready", True)),
@@ -1969,6 +2151,54 @@ def _build_wallet_score_cache(trader) -> dict[str, Any]:
     }
 
 
+def _record_trader_persistence_fault(trader, *, kind: str, path: str, error: object) -> None:
+    recorder = getattr(trader, "record_external_persistence_fault", None)
+    if callable(recorder):
+        recorder(kind, path, error)
+
+
+def _persist_cycle_outputs(
+    trader,
+    settings: Settings,
+    *,
+    state_path: str,
+    payload: dict[str, Any],
+    wallet_score_path: str,
+    log: logging.Logger,
+) -> None:
+    try:
+        _safe_write_json(state_path, payload)
+    except Exception as exc:
+        _record_trader_persistence_fault(trader, kind="daemon_state_write", path=state_path, error=exc)
+        raise
+    try:
+        _safe_write_json(wallet_score_path, _build_wallet_score_cache(trader))
+    except Exception as exc:
+        log.warning("persist_wallet_scores failed path=%s err=%s", wallet_score_path, exc)
+    trader.persist_runtime_state(settings.runtime_state_path)
+
+
+def _prepare_bootstrap_trader_state(trader) -> None:
+    now = int(time.time())
+    control = getattr(trader, "control_state", None)
+    load_control = getattr(trader, "_load_control_state", None)
+    if callable(load_control):
+        control = load_control()
+
+    reconciliation = None
+    reconciliation_builder = getattr(trader, "reconciliation_summary", None)
+    if callable(reconciliation_builder):
+        reconciliation = reconciliation_builder(now=now)
+
+    update_trading_mode = getattr(trader, "_update_trading_mode", None)
+    if callable(update_trading_mode) and control is not None:
+        update_trading_mode(control, now=now, reconciliation=reconciliation)
+
+    refresh_risk_state = getattr(trader, "_refresh_risk_state", None)
+    if callable(refresh_risk_state):
+        refresh_risk_state()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Polymarket runtime daemon")
     parser.add_argument("--state-path", default="/tmp/poly_runtime_data/state.json")
@@ -1994,8 +2224,41 @@ def main() -> None:
     settings = Settings()
     setup_logger(settings.log_level)
     log = logging.getLogger("polybot.daemon")
+    if args.state_path == "/tmp/poly_runtime_data/state.json":
+        args.state_path = settings.runtime_store_path("state.json")
+    if args.decision_mode_path == os.getenv("POLY_DECISION_MODE_PATH", "/tmp/poly_runtime_data/decision_mode.json"):
+        args.decision_mode_path = settings.runtime_store_path("decision_mode.json")
+    if args.candidate_actions_path == os.getenv("POLY_CANDIDATE_ACTIONS_PATH", "/tmp/poly_runtime_data/candidate_actions.json"):
+        args.candidate_actions_path = settings.runtime_store_path("candidate_actions.json")
+    if args.wallet_profiles_path == os.getenv("POLY_WALLET_PROFILES_PATH", "/tmp/poly_runtime_data/wallet_profiles.json"):
+        args.wallet_profiles_path = settings.runtime_store_path("wallet_profiles.json")
+    if args.journal_path == os.getenv("POLY_JOURNAL_PATH", "/tmp/poly_runtime_data/journal.json"):
+        args.journal_path = settings.runtime_store_path("journal.json")
     trader = build_trader(settings)
     try:
+        _prepare_bootstrap_trader_state(trader)
+        bootstrap_payload = _build_state(
+            trader,
+            settings,
+            decision_mode_path=args.decision_mode_path,
+            candidate_actions_path=args.candidate_actions_path,
+            wallet_profiles_path=args.wallet_profiles_path,
+            journal_path=args.journal_path,
+        )
+        _persist_cycle_outputs(
+            trader,
+            settings,
+            state_path=args.state_path,
+            payload=bootstrap_payload,
+            wallet_score_path=settings.wallet_score_path,
+            log=log,
+        )
+        log.info(
+            "state_bootstrap wallets=%d signals=%d orders=%d",
+            len(trader.last_wallets),
+            len(trader.last_signals),
+            len(trader.recent_orders),
+        )
         while True:
             trader.step()
             payload = _build_state(
@@ -2006,15 +2269,14 @@ def main() -> None:
                 wallet_profiles_path=args.wallet_profiles_path,
                 journal_path=args.journal_path,
             )
-            _safe_write_json(args.state_path, payload)
-            try:
-                _safe_write_json(settings.wallet_score_path, _build_wallet_score_cache(trader))
-            except Exception as exc:
-                log.warning("persist_wallet_scores failed path=%s err=%s", settings.wallet_score_path, exc)
-            try:
-                trader.persist_runtime_state(settings.runtime_state_path)
-            except Exception as exc:
-                log.warning("persist_runtime_state failed path=%s err=%s", settings.runtime_state_path, exc)
+            _persist_cycle_outputs(
+                trader,
+                settings,
+                state_path=args.state_path,
+                payload=payload,
+                wallet_score_path=settings.wallet_score_path,
+                log=log,
+            )
             log.info(
                 "state_updated wallets=%d signals=%d orders=%d",
                 len(trader.last_wallets),

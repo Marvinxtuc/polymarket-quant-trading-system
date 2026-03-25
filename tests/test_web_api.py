@@ -7,8 +7,10 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from polymarket_bot.db import PersonalTerminalStore
+from polymarket_bot.i18n import t as i18n_t
 from polymarket_bot.reconciliation_report import append_ledger_entry
 from polymarket_bot.types import Candidate
 from polymarket_bot.web import build_handler
@@ -82,12 +84,36 @@ class WebApiTests(unittest.TestCase):
         Path(frontend_dir.name, "index.html").write_text("ok", encoding="utf-8")
 
         state_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
-        json.dump({"summary": {"open_positions": 1}}, state_file)
+        json.dump(
+            {
+                "summary": {"open_positions": 1},
+                "trading_mode": {
+                    "mode": "REDUCE_ONLY",
+                    "opening_allowed": False,
+                    "reason_codes": ["startup_not_ready"],
+                    "updated_ts": 7,
+                    "source": "runner",
+                },
+            },
+            state_file,
+        )
         state_file.flush()
         state_file.close()
 
         public_state_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
-        json.dump({"summary": {"open_positions": 0}}, public_state_file)
+        json.dump(
+            {
+                "summary": {"open_positions": 0},
+                "trading_mode": {
+                    "mode": "NORMAL",
+                    "opening_allowed": True,
+                    "reason_codes": [],
+                    "updated_ts": 0,
+                    "source": "runner",
+                },
+            },
+            public_state_file,
+        )
         public_state_file.flush()
         public_state_file.close()
 
@@ -156,9 +182,31 @@ class WebApiTests(unittest.TestCase):
         updated_state = json.loads(Path(public_state_file.name).read_text(encoding="utf-8"))
         self.assertEqual(updated_state["summary"]["open_positions"], 1)
         self.assertEqual(state_payload["summary"]["open_positions"], 1)
+        self.assertEqual(state_payload["trading_mode"]["mode"], "REDUCE_ONLY")
+        self.assertFalse(state_payload["control"]["pause_opening"])
+        self.assertIn("observability", state_payload["candidates"])
+        self.assertEqual(state_payload["candidates"]["observability"]["market_metadata"]["hits"], 0)
+        self.assertEqual(state_payload["candidates"]["observability"]["market_time_source"]["unknown"], 0)
+        self.assertEqual(state_payload["candidates"]["observability"]["recent_cycles"]["signals"], 0)
+        self.assertEqual(updated_state["trading_mode"]["mode"], "REDUCE_ONLY")
 
         state_file = Path(state_file.name)
-        state_file.write_text(json.dumps({"summary": {"open_positions": 3}}, ensure_ascii=False), encoding="utf-8")
+        state_file.write_text(
+            json.dumps(
+                {
+                    "summary": {"open_positions": 3},
+                    "trading_mode": {
+                        "mode": "HALTED",
+                        "opening_allowed": False,
+                        "reason_codes": ["operator_emergency_stop"],
+                        "updated_ts": 8,
+                        "source": "runner",
+                    },
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
         state_payload_again = self._dispatch(handler_cls, "/api/state")
         updated_state_again = json.loads(Path(public_state_file.name).read_text(encoding="utf-8"))
 
@@ -172,6 +220,231 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(reconciliation_payload["day_key"], "2026-03-17")
         self.assertEqual(state_payload_again["summary"]["open_positions"], 3)
         self.assertEqual(updated_state_again["summary"]["open_positions"], 3)
+        self.assertEqual(state_payload_again["trading_mode"]["mode"], "HALTED")
+        self.assertEqual(updated_state_again["trading_mode"]["mode"], "HALTED")
+
+    def test_blockbeats_endpoint_serves_cached_dashboard_payload(self):
+        frontend_dir = tempfile.TemporaryDirectory()
+        Path(frontend_dir.name, "index.html").write_text("ok", encoding="utf-8")
+
+        state_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, state_file)
+        state_file.flush()
+        state_file.close()
+
+        control_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, control_file)
+        control_file.flush()
+        control_file.close()
+
+        monitor_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, monitor_file)
+        monitor_file.flush()
+        monitor_file.close()
+
+        monitor12_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, monitor12_file)
+        monitor12_file.flush()
+        monitor12_file.close()
+
+        reconciliation_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, reconciliation_file)
+        reconciliation_file.flush()
+        reconciliation_file.close()
+
+        reconciliation_text_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        reconciliation_text_file.write("")
+        reconciliation_text_file.flush()
+        reconciliation_text_file.close()
+
+        ledger_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        ledger_file.close()
+
+        dashboard_payload = {
+            "updated_ts": 1710000000,
+            "status": "ok",
+            "stale_after_seconds": 180,
+            "prediction": {
+                "source": "pro",
+                "status": "ok",
+                "message": "",
+                "items": [
+                    {
+                        "id": "pred-1",
+                        "title": "Prediction headline",
+                        "content": "prediction detail",
+                        "url": "https://example.com/prediction",
+                        "create_time": 1710000000,
+                        "tags": ["prediction"],
+                    }
+                ],
+            },
+            "important": {
+                "source": "pro",
+                "status": "ok",
+                "message": "",
+                "items": [
+                    {
+                        "id": "imp-1",
+                        "title": "Important headline",
+                        "content": "important detail",
+                        "url": "https://example.com/important",
+                        "create_time": 1710000060,
+                        "tags": ["important"],
+                    }
+                ],
+            },
+            "errors": [],
+        }
+
+        handler_cls = build_handler(
+            frontend_dir.name,
+            state_file.name,
+            control_file.name,
+            "",
+            monitor_file.name,
+            monitor12_file.name,
+            reconciliation_file.name,
+            reconciliation_text_file.name,
+            ledger_file.name,
+        )
+
+        with patch("polymarket_bot.web._fetch_blockbeats_dashboard", return_value=dashboard_payload) as mock_fetch:
+            first_payload = self._dispatch(handler_cls, "/api/blockbeats")
+            second_payload = self._dispatch(handler_cls, "/api/blockbeats")
+            forced_payload = self._dispatch(handler_cls, "/api/blockbeats?force=true")
+
+        frontend_dir.cleanup()
+
+        self.assertEqual(first_payload["status"], "ok")
+        self.assertEqual(len(first_payload["prediction"]["items"]), 1)
+        self.assertEqual(len(second_payload["important"]["items"]), 1)
+        self.assertEqual(first_payload["prediction"]["source"], "pro")
+        self.assertEqual(second_payload["important"]["source"], "pro")
+        self.assertEqual(forced_payload["updated_ts"], 1710000000)
+        self.assertEqual(mock_fetch.call_count, 2)
+
+    def test_static_index_is_served_with_no_store_cache_control(self):
+        frontend_dir = tempfile.TemporaryDirectory()
+        Path(frontend_dir.name, "index.html").write_text(
+            '<!doctype html><title data-i18n="app.title">ok</title>',
+            encoding="utf-8",
+        )
+
+        state_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, state_file)
+        state_file.flush()
+        state_file.close()
+
+        control_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, control_file)
+        control_file.flush()
+        control_file.close()
+
+        monitor_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, monitor_file)
+        monitor_file.flush()
+        monitor_file.close()
+
+        monitor12_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, monitor12_file)
+        monitor12_file.flush()
+        monitor12_file.close()
+
+        reconciliation_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, reconciliation_file)
+        reconciliation_file.flush()
+        reconciliation_file.close()
+
+        reconciliation_text_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        reconciliation_text_file.write("")
+        reconciliation_text_file.flush()
+        reconciliation_text_file.close()
+
+        ledger_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        ledger_file.close()
+
+        handler_cls = build_handler(
+            frontend_dir.name,
+            state_file.name,
+            control_file.name,
+            "",
+            monitor_file.name,
+            monitor12_file.name,
+            reconciliation_file.name,
+            reconciliation_text_file.name,
+            ledger_file.name,
+        )
+
+        status_code, headers, body = self._dispatch_raw(handler_cls, "/")
+        frontend_dir.cleanup()
+
+        self.assertEqual(status_code, 200)
+        self.assertIn("Cache-Control: no-store", headers)
+        self.assertIn('data-i18n="app.title"', body)
+
+    def test_state_endpoint_overlays_latest_control_file(self):
+        frontend_dir = tempfile.TemporaryDirectory()
+        Path(frontend_dir.name, "index.html").write_text("ok", encoding="utf-8")
+
+        state_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump(
+            {
+                "summary": {"open_positions": 0},
+                "control": {"pause_opening": False, "reduce_only": False, "emergency_stop": False},
+            },
+            state_file,
+        )
+        state_file.flush()
+        state_file.close()
+
+        control_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({"pause_opening": True, "reduce_only": True, "emergency_stop": False}, control_file)
+        control_file.flush()
+        control_file.close()
+
+        monitor_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({"report_type": "monitor_30m"}, monitor_file)
+        monitor_file.flush()
+        monitor_file.close()
+
+        monitor12_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({"report_type": "monitor_12h"}, monitor12_file)
+        monitor12_file.flush()
+        monitor12_file.close()
+
+        reconciliation_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, reconciliation_file)
+        reconciliation_file.flush()
+        reconciliation_file.close()
+
+        reconciliation_text_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        reconciliation_text_file.write("report")
+        reconciliation_text_file.flush()
+        reconciliation_text_file.close()
+
+        ledger_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        ledger_file.write("")
+        ledger_file.flush()
+        ledger_file.close()
+
+        handler_cls = build_handler(
+            frontend_dir.name,
+            state_file.name,
+            control_file.name,
+            "",
+            monitor_file.name,
+            monitor12_file.name,
+            reconciliation_file.name,
+            reconciliation_text_file.name,
+            ledger_file.name,
+        )
+
+        payload = self._dispatch(handler_cls, "/api/state")
+        frontend_dir.cleanup()
+
+        self.assertTrue(payload["control"]["pause_opening"])
+        self.assertTrue(payload["control"]["reduce_only"])
 
     def test_operator_endpoint_generates_reconciliation_report(self):
         frontend_dir = tempfile.TemporaryDirectory()
@@ -267,14 +540,35 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(payload["day_key"], "2026-03-17")
         self.assertEqual(generated_json["day_key"], "2026-03-17")
         self.assertEqual(generated_json["ledger_summary"]["fill_count"], 1)
-        self.assertIn("Polymarket Reconciliation EOD Report", generated_text)
+        self.assertIn(i18n_t("report.reconciliation.title"), generated_text)
 
     def test_operator_endpoint_queues_clear_stale_pending_request(self):
         frontend_dir = tempfile.TemporaryDirectory()
         Path(frontend_dir.name, "index.html").write_text("ok", encoding="utf-8")
 
         state_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
-        json.dump({}, state_file)
+        json.dump(
+            {
+                "candidates": {
+                    "observability": {
+                        "recent_cycles": {
+                            "cycles": 3,
+                            "signals": 5,
+                            "precheck_skipped": 2,
+                            "market_time_source": {
+                                "metadata": 4,
+                                "slug_legacy": 1,
+                                "unknown": 0,
+                            },
+                            "skip_reasons": {
+                                "market_not_accepting_orders": 2,
+                            },
+                        }
+                    }
+                }
+            },
+            state_file,
+        )
         state_file.flush()
         state_file.close()
 
@@ -339,7 +633,37 @@ class WebApiTests(unittest.TestCase):
         Path(frontend_dir.name, "index.html").write_text("ok", encoding="utf-8")
 
         state_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
-        json.dump({"candidates": {"summary": {"count": 1}, "items": []}}, state_file)
+        json.dump(
+            {
+                "candidates": {
+                    "summary": {"count": 1},
+                    "items": [],
+                    "observability": {
+                        "recent_cycles": {
+                            "cycles": 3,
+                            "signals": 5,
+                            "precheck_skipped": 2,
+                            "market_time_source": {
+                                "metadata": 4,
+                                "slug_legacy": 1,
+                                "unknown": 0,
+                            },
+                            "skip_reasons": {
+                                "market_not_accepting_orders": 2,
+                            },
+                        }
+                    },
+                },
+                "trading_mode": {
+                    "mode": "REDUCE_ONLY",
+                    "opening_allowed": False,
+                    "reason_codes": ["startup_not_ready"],
+                    "updated_ts": 1,
+                    "source": "runner",
+                },
+            },
+            state_file,
+        )
         state_file.flush()
         state_file.close()
 
@@ -387,6 +711,8 @@ class WebApiTests(unittest.TestCase):
                 side="BUY",
                 confidence=0.8,
                 score=77.0,
+                market_time_source="metadata",
+                market_metadata_hit=True,
                 created_ts=now_ts,
                 expires_ts=now_ts + 3600,
                 updated_ts=now_ts,
@@ -406,6 +732,9 @@ class WebApiTests(unittest.TestCase):
                 confidence=0.5,
                 score=51.0,
                 status="watched",
+                market_time_source="slug_legacy",
+                market_metadata_hit=False,
+                skip_reason="spread_too_wide",
                 created_ts=now_ts + 1,
                 expires_ts=now_ts + 3600,
                 updated_ts=now_ts + 1,
@@ -476,9 +805,21 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(mode_status, 200)
         self.assertTrue(mode_payload["ok"])
         self.assertEqual(mode_payload["decision_mode"]["mode"], "semi_auto")
+        self.assertNotIn("REDUCE_ONLY", json.dumps(mode_payload, ensure_ascii=False))
         self.assertEqual(control_after["decision_mode"], "semi_auto")
         self.assertEqual(candidates_payload["summary"]["count"], 1)
         self.assertEqual(candidates_payload["items"][0]["id"], "cand-1")
+        self.assertEqual(candidates_payload["observability"]["candidate_count"], 1)
+        self.assertEqual(candidates_payload["observability"]["market_metadata"]["hits"], 1)
+        self.assertEqual(candidates_payload["observability"]["market_time_source"]["metadata"], 1)
+        self.assertEqual(candidates_payload["observability"]["skip_reasons"], {})
+        self.assertEqual(candidates_payload["observability"]["recent_cycles"]["cycles"], 3)
+        self.assertEqual(candidates_payload["observability"]["recent_cycles"]["signals"], 5)
+        self.assertEqual(candidates_payload["observability"]["recent_cycles"]["precheck_skipped"], 2)
+        self.assertEqual(
+            candidates_payload["observability"]["recent_cycles"]["skip_reasons"]["market_not_accepting_orders"],
+            2,
+        )
         self.assertEqual(candidates_payload["filters"]["wallet"], "0xabc")
         self.assertEqual(journal_payload["limit"], 1)
         self.assertEqual(len(journal_payload["notes"]), 1)
@@ -494,10 +835,16 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(action_notes[0]["candidate_id"], "cand-1")
         self.assertEqual(len(action_notes), 1)
         self.assertEqual(profiles_status, 400)
-        self.assertEqual(profiles_payload["error"], "unsupported wallet profile fields")
+        self.assertEqual(profiles_payload["error_code"], "walletProfileFieldsUnsupported")
+        self.assertEqual(profiles_payload["error"], i18n_t("web.api.walletProfileFieldsUnsupported"))
         self.assertEqual(profiles_payload["fields"], ["invalid_field"])
         self.assertEqual(invalid_score_status, 400)
-        self.assertEqual(invalid_score_payload["error"], "trust_score must be a number")
+        self.assertEqual(invalid_score_payload["error_code"], "validationFailed")
+        self.assertEqual(invalid_score_payload["error"], i18n_t("web.api.validationFailed"))
+        self.assertEqual(
+            invalid_score_payload["error_detail"],
+            i18n_t("web.api.fieldMustBeNumber", {"field": i18n_t("web.field.trust_score")}),
+        )
 
     def test_candidates_endpoint_supports_search_sort_and_detail_chain(self):
         frontend_dir = tempfile.TemporaryDirectory()
@@ -737,3 +1084,219 @@ class WebApiTests(unittest.TestCase):
         self.assertTrue(any(row["kind"] == "journal" for row in detail_payload["timeline"]))
         self.assertTrue(any(row["kind"] == "trace" for row in detail_payload["timeline"]))
         self.assertTrue(any(row["kind"] == "cycle" for row in detail_payload["timeline"]))
+
+    def test_candidates_endpoint_falls_back_to_runtime_rows_when_store_empty(self):
+        frontend_dir = tempfile.TemporaryDirectory()
+        Path(frontend_dir.name, "index.html").write_text("ok", encoding="utf-8")
+
+        now_ts = int(time.time())
+
+        state_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump(
+            {
+                "candidates": {
+                    "summary": {"count": 1},
+                    "items": [
+                        {
+                            "id": "runtime-only",
+                            "signal_id": "sig-runtime",
+                            "trace_id": "trc-runtime",
+                            "wallet": "0xruntime",
+                            "market_slug": "runtime-market",
+                            "token_id": "runtime-token",
+                            "outcome": "YES",
+                            "side": "BUY",
+                            "score": 99.0,
+                            "status": "pending",
+                            "created_ts": now_ts,
+                            "updated_ts": now_ts,
+                        }
+                    ],
+                }
+            },
+            state_file,
+        )
+        state_file.flush()
+        state_file.close()
+
+        control_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({"decision_mode": "manual", "updated_ts": now_ts}, control_file)
+        control_file.flush()
+        control_file.close()
+
+        monitor_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, monitor_file)
+        monitor_file.flush()
+        monitor_file.close()
+
+        monitor12_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, monitor12_file)
+        monitor12_file.flush()
+        monitor12_file.close()
+
+        reconciliation_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, reconciliation_file)
+        reconciliation_file.flush()
+        reconciliation_file.close()
+
+        reconciliation_text_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        reconciliation_text_file.write("")
+        reconciliation_text_file.flush()
+        reconciliation_text_file.close()
+
+        ledger_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        ledger_file.close()
+
+        db_path = str(Path(tempfile.mkdtemp()) / "terminal.db")
+        store = PersonalTerminalStore(db_path)
+        self.addCleanup(store.close)
+
+        handler_cls = build_handler(
+            frontend_dir.name,
+            state_file.name,
+            control_file.name,
+            "",
+            monitor_file.name,
+            monitor12_file.name,
+            reconciliation_file.name,
+            reconciliation_text_file.name,
+            ledger_file.name,
+            candidate_db_path=db_path,
+        )
+
+        list_payload = self._dispatch(handler_cls, "/api/candidates?limit=5")
+        detail_payload = self._dispatch(handler_cls, "/api/candidates/runtime-only")
+
+        frontend_dir.cleanup()
+
+        self.assertEqual(list_payload["summary"]["count"], 1)
+        self.assertEqual(list_payload["items"][0]["id"], "runtime-only")
+        self.assertEqual(detail_payload["candidate"]["id"], "runtime-only")
+        self.assertEqual(detail_payload["candidate"]["status"], "pending")
+
+    def test_candidates_endpoint_falls_back_to_signal_review_when_store_and_runtime_queue_empty(self):
+        frontend_dir = tempfile.TemporaryDirectory()
+        Path(frontend_dir.name, "index.html").write_text("ok", encoding="utf-8")
+
+        now_ts = int(time.time())
+
+        state_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump(
+            {
+                "candidates": {
+                    "summary": {"count": 0},
+                    "items": [],
+                    "observability": {
+                        "recent_cycles": {
+                            "cycles": 1,
+                            "signals": 1,
+                            "precheck_skipped": 1,
+                            "market_time_source": {"metadata": 1, "slug_legacy": 0, "unknown": 0},
+                            "skip_reasons": {"market_not_accepting_orders": 1},
+                        }
+                    },
+                },
+                "signal_review": {
+                    "cycles": [
+                        {
+                            "cycle_id": "cycle-replay",
+                            "ts": now_ts - 30,
+                            "candidates": [
+                                {
+                                    "signal_id": "sig-replay",
+                                    "trace_id": "trc-replay",
+                                    "title": "demo-replay-market",
+                                    "token_id": "token-replay",
+                                    "outcome": "YES",
+                                    "wallet": "0xabc",
+                                    "side": "BUY",
+                                    "wallet_score": 66.0,
+                                    "wallet_tier": "TRADE",
+                                    "action": "add",
+                                    "action_label": "事件加仓",
+                                    "final_status": "precheck_skipped",
+                                    "candidate_snapshot": {
+                                        "signal_id": "sig-replay",
+                                        "trace_id": "trc-replay",
+                                        "wallet": "0xabc",
+                                        "market_slug": "demo-replay-market",
+                                        "token_id": "token-replay",
+                                        "outcome": "YES",
+                                        "side": "BUY",
+                                        "wallet_score": 66.0,
+                                        "wallet_tier": "TRADE",
+                                        "position_action": "add",
+                                        "position_action_label": "事件加仓",
+                                    },
+                                    "decision_snapshot": {
+                                        "skip_reason": "market_not_accepting_orders",
+                                        "market_time_source": "metadata",
+                                        "market_metadata_hit": True,
+                                    },
+                                }
+                            ],
+                        }
+                    ]
+                },
+            },
+            state_file,
+        )
+        state_file.flush()
+        state_file.close()
+
+        control_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, control_file)
+        control_file.flush()
+        control_file.close()
+
+        monitor_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, monitor_file)
+        monitor_file.flush()
+        monitor_file.close()
+
+        monitor12_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, monitor12_file)
+        monitor12_file.flush()
+        monitor12_file.close()
+
+        reconciliation_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, reconciliation_file)
+        reconciliation_file.flush()
+        reconciliation_file.close()
+
+        reconciliation_text_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        reconciliation_text_file.write("")
+        reconciliation_text_file.flush()
+        reconciliation_text_file.close()
+
+        ledger_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        ledger_file.close()
+
+        db_path = str(Path(tempfile.mkdtemp()) / "terminal.db")
+        handler_cls = build_handler(
+            frontend_dir.name,
+            state_file.name,
+            control_file.name,
+            "",
+            monitor_file.name,
+            monitor12_file.name,
+            reconciliation_file.name,
+            reconciliation_text_file.name,
+            ledger_file.name,
+            candidate_db_path=db_path,
+        )
+
+        list_payload = self._dispatch(handler_cls, "/api/candidates")
+        detail_payload = self._dispatch(handler_cls, "/api/candidates/sig-replay")
+
+        frontend_dir.cleanup()
+
+        self.assertEqual(list_payload["summary"]["count"], 1)
+        self.assertEqual(list_payload["items"][0]["signal_id"], "sig-replay")
+        self.assertEqual(list_payload["items"][0]["status"], "watched")
+        self.assertEqual(list_payload["items"][0]["skip_reason"], "market_not_accepting_orders")
+        self.assertEqual(list_payload["items"][0]["market_time_source"], "metadata")
+        self.assertTrue(list_payload["items"][0]["market_metadata_hit"])
+        self.assertEqual(list_payload["observability"]["recent_cycles"]["signals"], 1)
+        self.assertEqual(detail_payload["candidate"]["signal_id"], "sig-replay")
+        self.assertEqual(detail_payload["candidate"]["skip_reason"], "market_not_accepting_orders")

@@ -11,9 +11,25 @@ from typing import Any
 from urllib import error as urlerror
 from urllib import request as urlrequest
 
+from polymarket_bot.i18n import t as i18n_t
+
 DEFAULT_MONITOR_30M_WINDOW_SECONDS = 1800
 DEFAULT_MONITOR_12H_WINDOW_SECONDS = 43200
 MONITOR_FRESHNESS_GRACE_SECONDS = 600
+
+
+def _ffv_t(key: str, params: Mapping[str, object] | None = None, *, fallback: str = "") -> str:
+    return i18n_t(f"report.fullFlowValidation.{key}", dict(params or {}), fallback=fallback)
+
+
+def _ffv_status_label(value: object) -> str:
+    raw = str(value or "").strip().lower() or "unknown"
+    return _ffv_t(f"enum.status.{raw}", fallback=raw.upper())
+
+
+def _ffv_readiness_label(value: object) -> str:
+    raw = str(value or "").strip().lower() or "unknown"
+    return _ffv_t(f"enum.readiness.{raw}", fallback=raw.upper())
 
 
 def _utc_iso(ts: int | float | None = None) -> str:
@@ -214,7 +230,10 @@ def _fetch_fresh_state_payload(
         elif time.time() >= deadline:
             return {}, {
                 "status": "fail",
-                "message": "state API unavailable or invalid JSON",
+                "message": _ffv_t(
+                    "stage.stateApiUnavailable",
+                    fallback="state API unavailable or invalid JSON",
+                ),
                 "details": {
                     "url": state_url,
                     "status_code": response.get("status_code"),
@@ -349,13 +368,17 @@ def _validate_state_payload(payload: Mapping[str, object], *, now_ts: int | None
     ts = _safe_int(payload.get("ts"))
     poll = _safe_int(config.get("poll_interval_seconds"))
     if ts <= 0:
-        return False, "state timestamp missing", {}
+        return False, _ffv_t("stage.stateTimestampMissing", fallback="state timestamp missing"), {}
     if poll <= 0:
-        return False, "poll interval missing", {}
+        return False, _ffv_t("stage.statePollIntervalMissing", fallback="poll interval missing"), {}
     age = max(0, int(now_ts or time.time()) - ts)
     max_age = max(90, poll * 3)
     if age > max_age:
-        return False, f"state stale: age={age}s max_age={max_age}s", {}
+        return False, _ffv_t(
+            "stage.stateStale",
+            {"age": age, "maxAge": max_age},
+            fallback=f"state stale: age={age}s max_age={max_age}s",
+        ), {}
     details = {
         "timestamp": ts,
         "age_seconds": age,
@@ -367,7 +390,7 @@ def _validate_state_payload(payload: Mapping[str, object], *, now_ts: int | None
         "max_open_positions": _safe_int(summary.get("max_open_positions")),
         "tracked_notional_usd": _safe_float(summary.get("tracked_notional_usd")),
     }
-    return True, "state payload fresh", details
+    return True, _ffv_t("stage.statePayloadFresh", fallback="state payload fresh"), details
 
 
 def _summarize_monitor_payload(payload: Mapping[str, object]) -> dict[str, object]:
@@ -487,7 +510,7 @@ def run_full_flow_validation(
                 _stage(
                     "stack_bootstrap",
                     "pass",
-                    "stack restarted and verified",
+                    _ffv_t("stage.stackBootstrapPass", fallback="stack restarted and verified"),
                     stdout=_tail(result.get("stdout")),
                 )
             )
@@ -496,7 +519,10 @@ def run_full_flow_validation(
                 _stage(
                     "stack_bootstrap",
                     "warn",
-                    "stack bootstrap helper returned non-zero; continuing with direct validation",
+                    _ffv_t(
+                        "stage.stackBootstrapWarn",
+                        fallback="stack bootstrap helper returned non-zero; continuing with direct validation",
+                    ),
                     returncode=result.get("returncode"),
                     stdout=_tail(result.get("stdout")),
                     stderr=_tail(result.get("stderr")),
@@ -509,7 +535,14 @@ def run_full_flow_validation(
         http_client=http_client,
         timeout_seconds=max(30, timeout_seconds),
     )
-    add_stage(_stage("state", str(state_stage.get("status") or "fail"), str(state_stage.get("message") or "state validation failed"), **dict(state_stage.get("details") or {})))
+    add_stage(
+        _stage(
+            "state",
+            str(state_stage.get("status") or "fail"),
+            str(state_stage.get("message") or _ffv_t("stage.stateValidationFailed", fallback="state validation failed")),
+            **dict(state_stage.get("details") or {}),
+        )
+    )
     if not state_payload:
         state_payload = _load_json_dict(state_path)
 
@@ -544,7 +577,7 @@ def run_full_flow_validation(
                 _stage(
                     f"{name}_generation",
                     "pass",
-                    f"{name} report generated",
+                    _ffv_t("stage.monitorReportGenerated", {"name": name}, fallback=f"{name} report generated"),
                     json_path=str(json_path_obj),
                     text_path=str(txt_path),
                     state_path=str(state_cache_obj),
@@ -557,7 +590,11 @@ def run_full_flow_validation(
                 _stage(
                     f"{name}_generation",
                     "fail",
-                    f"{name} report generation failed",
+                    _ffv_t(
+                        "stage.monitorReportGenerationFailed",
+                        {"name": name},
+                        fallback=f"{name} report generation failed",
+                    ),
                     json_path=str(json_path_obj),
                     text_path=str(txt_path),
                     state_path=str(state_cache_obj),
@@ -577,7 +614,7 @@ def run_full_flow_validation(
                 _stage(
                     f"{name}_api",
                     "pass",
-                    f"{name} API returned JSON report",
+                    _ffv_t("stage.monitorApiReturned", {"name": name}, fallback=f"{name} API returned JSON report"),
                     url=api_url,
                     **summary,
                 )
@@ -591,7 +628,11 @@ def run_full_flow_validation(
                 _stage(
                     f"{name}_api",
                     "fail",
-                    f"{name} API unavailable or invalid JSON",
+                    _ffv_t(
+                        "stage.monitorApiUnavailable",
+                        {"name": name},
+                        fallback=f"{name} API unavailable or invalid JSON",
+                    ),
                     url=api_url,
                     status_code=api_resp.get("status_code"),
                     error=api_resp.get("error"),
@@ -611,7 +652,10 @@ def run_full_flow_validation(
             _stage(
                 "reconciliation_generation",
                 "pass",
-                "operator API generated reconciliation report",
+                _ffv_t(
+                    "stage.reconciliationGenerationPass",
+                    fallback="operator API generated reconciliation report",
+                ),
                 url=operator_url,
                 command=str(payload.get("command") or ""),
                 json_path=str(payload.get("json_path") or reconciliation_eod_json_path),
@@ -623,7 +667,10 @@ def run_full_flow_validation(
             _stage(
                 "reconciliation_generation",
                 "fail",
-                "operator API failed to generate reconciliation report",
+                _ffv_t(
+                    "stage.reconciliationGenerationFail",
+                    fallback="operator API failed to generate reconciliation report",
+                ),
                 url=operator_url,
                 status_code=operator_resp.get("status_code"),
                 error=operator_resp.get("error"),
@@ -639,7 +686,7 @@ def run_full_flow_validation(
             _stage(
                 "reconciliation_api",
                 "pass",
-                "reconciliation API returned JSON report",
+                _ffv_t("stage.reconciliationApiPass", fallback="reconciliation API returned JSON report"),
                 url=reconciliation_eod_url,
                 **summary,
             )
@@ -649,7 +696,10 @@ def run_full_flow_validation(
             _stage(
                 "reconciliation_api",
                 "fail",
-                "reconciliation API unavailable or invalid JSON",
+                _ffv_t(
+                    "stage.reconciliationApiFail",
+                    fallback="reconciliation API unavailable or invalid JSON",
+                ),
                 url=reconciliation_eod_url,
                 status_code=reconciliation_resp.get("status_code"),
                 error=reconciliation_resp.get("error"),
@@ -681,7 +731,7 @@ def run_full_flow_validation(
             _stage(
                 "replay_runtime",
                 "pass",
-                "runtime replay completed",
+                _ffv_t("stage.replayRuntimePass", fallback="runtime replay completed"),
                 **_summarize_replay_runtime(replay_runtime_payload),
             )
         )
@@ -690,7 +740,7 @@ def run_full_flow_validation(
             _stage(
                 "replay_runtime",
                 "fail",
-                "runtime replay failed",
+                _ffv_t("stage.replayRuntimeFail", fallback="runtime replay failed"),
                 returncode=replay_runtime_result.get("returncode"),
                 stdout=_tail(replay_runtime_result.get("stdout")),
                 stderr=_tail(replay_runtime_result.get("stderr")),
@@ -722,7 +772,7 @@ def run_full_flow_validation(
             _stage(
                 "replay_calibration",
                 "pass",
-                "replay calibration completed",
+                _ffv_t("stage.replayCalibrationPass", fallback="replay calibration completed"),
                 **_summarize_replay_calibration(replay_calibration_payload),
             )
         )
@@ -731,7 +781,7 @@ def run_full_flow_validation(
             _stage(
                 "replay_calibration",
                 "fail",
-                "replay calibration failed",
+                _ffv_t("stage.replayCalibrationFail", fallback="replay calibration failed"),
                 returncode=replay_calibration_result.get("returncode"),
                 stdout=_tail(replay_calibration_result.get("stdout")),
                 stderr=_tail(replay_calibration_result.get("stderr")),
@@ -764,12 +814,30 @@ def run_full_flow_validation(
     recommendations: list[str] = []
     if validation_status != "pass":
         failed_names = [str(stage.get("name")) for stage in stages if str(stage.get("status")) != "pass"]
-        recommendations.append(f"Fix failed validation stages: {', '.join(failed_names)}.")
+        recommendations.append(
+            _ffv_t(
+                "recommendation.fixFailedStages",
+                {"stages": ", ".join(failed_names)},
+                fallback=f"Fix failed validation stages: {', '.join(failed_names)}.",
+            )
+        )
     else:
-        recommendations.append("Full flow validation passed. APIs, reports, and replay tooling are wired end-to-end.")
+        recommendations.append(
+            _ffv_t(
+                "recommendation.pass",
+                fallback="Full flow validation passed. APIs, reports, and replay tooling are wired end-to-end.",
+            )
+        )
     if readiness.get("level") != "ready":
         recommendations.append(
-            f"Operational readiness is {str(readiness.get('level')).upper()}. Review startup/reconciliation/monitor recommendations before treating results as promotion-ready."
+            _ffv_t(
+                "recommendation.readinessReview",
+                {"level": _ffv_readiness_label(readiness.get("level"))},
+                fallback=(
+                    f"Operational readiness is {str(readiness.get('level')).upper()}. "
+                    "Review startup/reconciliation/monitor recommendations before treating results as promotion-ready."
+                ),
+            )
         )
 
     return {
@@ -803,45 +871,57 @@ def render_full_flow_validation_report(report: Mapping[str, object]) -> str:
     stages = [item for item in list(report.get("stages") or []) if isinstance(item, dict)]
 
     lines = [
-        "Polymarket Full Flow Validation Report",
-        f"generated_at: {report.get('generated_at')}",
-        f"validation_status: {str(report.get('validation_status') or '').upper()}",
-        f"flow_standard_met: {bool(report.get('flow_standard_met'))}",
-        f"operational_readiness: {str(readiness.get('level') or 'unknown').upper()}",
+        _ffv_t("title", fallback="Polymarket Full Flow Validation Report"),
+        f"{_ffv_t('field.generatedAt', fallback='generated_at')}: {report.get('generated_at')}",
+        f"{_ffv_t('field.validationStatus', fallback='validation_status')}: {_ffv_status_label(report.get('validation_status'))}",
+        f"{_ffv_t('field.flowStandardMet', fallback='flow_standard_met')}: {bool(report.get('flow_standard_met'))}",
+        f"{_ffv_t('field.operationalReadiness', fallback='operational_readiness')}: {_ffv_readiness_label(readiness.get('level'))}",
         "",
-        "stages:",
+        f"{_ffv_t('section.stages', fallback='stages')}:",
     ]
 
     for stage in stages:
         name = str(stage.get("name") or "-")
-        status = str(stage.get("status") or "unknown").upper()
+        status = _ffv_status_label(stage.get("status"))
         message = str(stage.get("message") or "")
-        lines.append(f"  [{status}] {name}: {message}")
+        lines.append(
+            _ffv_t(
+                "row.stage",
+                {"status": status, "name": name, "message": message},
+                fallback=f"  [{status}] {name}: {message}",
+            )
+        )
         details = dict(stage.get("details") or {}) if isinstance(stage.get("details"), dict) else {}
         for key in ("url", "execution_mode", "broker_name", "final_recommendation", "status", "recommended_scenario", "json_path"):
             if key in details and str(details.get(key) or "").strip():
-                lines.append(f"    - {key}: {details.get(key)}")
+                lines.append(
+                    _ffv_t(
+                        "row.detail",
+                        {"key": key, "value": details.get(key)},
+                        fallback=f"    - {key}: {details.get(key)}",
+                    )
+                )
 
     lines.extend(
         [
             "",
-            "operational_readiness_detail:",
-            f"  startup_ready: {readiness.get('startup_ready')}",
-            f"  reconciliation_status: {readiness.get('reconciliation_status')}",
-            f"  monitor_30m_recommendation: {readiness.get('monitor_30m_recommendation')}",
-            f"  monitor_12h_recommendation: {readiness.get('monitor_12h_recommendation')}",
-            f"  eod_status: {readiness.get('eod_status')}",
+            f"{_ffv_t('section.operationalReadinessDetail', fallback='operational_readiness_detail')}:",
+            f"  {_ffv_t('field.startupReady', fallback='startup_ready')}: {readiness.get('startup_ready')}",
+            f"  {_ffv_t('field.reconciliationStatus', fallback='reconciliation_status')}: {readiness.get('reconciliation_status')}",
+            f"  {_ffv_t('field.monitor30Recommendation', fallback='monitor_30m_recommendation')}: {readiness.get('monitor_30m_recommendation')}",
+            f"  {_ffv_t('field.monitor12Recommendation', fallback='monitor_12h_recommendation')}: {readiness.get('monitor_12h_recommendation')}",
+            f"  {_ffv_t('field.eodStatus', fallback='eod_status')}: {readiness.get('eod_status')}",
         ]
     )
 
     issues = [str(item) for item in list(readiness.get("issues") or []) if str(item).strip()]
     if issues:
-        lines.append("  issues:")
+        lines.append(f"  {_ffv_t('section.issues', fallback='issues')}:")
         for item in issues:
             lines.append(f"    - {item}")
 
     lines.append("")
-    lines.append("recommendations:")
+    lines.append(f"{_ffv_t('section.recommendations', fallback='recommendations')}:")
     for item in recommendations:
         lines.append(f"  - {item}")
     return "\n".join(lines) + "\n"

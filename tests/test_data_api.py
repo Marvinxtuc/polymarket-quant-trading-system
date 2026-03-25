@@ -115,6 +115,38 @@ class DataApiClientTests(unittest.TestCase):
 
         self.assertEqual(midpoint, 0.503)
 
+    def test_get_market_metadata_parses_gamma_market_flags(self):
+        def responder(base_url: str, path: str, params: dict[str, Any]) -> Any:
+            self.assertEqual(base_url, "https://gamma-api.polymarket.com")
+            self.assertEqual(path, "/markets")
+            self.assertEqual(params["conditionId"], "condition-1")
+            return [
+                {
+                    "conditionId": "condition-1",
+                    "slug": "demo-market",
+                    "endDate": "2026-03-22T12:34:56Z",
+                    "closed": False,
+                    "active": True,
+                    "acceptingOrders": False,
+                    "clobTokenIds": "[\"token-1\",\"token-2\"]",
+                }
+            ]
+
+        client = _StubDataClient(responder)
+
+        metadata = client.get_market_metadata("condition-1")
+
+        self.assertIsNotNone(metadata)
+        assert metadata is not None
+        self.assertEqual(metadata.condition_id, "condition-1")
+        self.assertEqual(metadata.market_slug, "demo-market")
+        self.assertEqual(metadata.end_date, "2026-03-22T12:34:56Z")
+        self.assertEqual(metadata.end_ts, 1774182896)
+        self.assertFalse(metadata.closed)
+        self.assertTrue(metadata.active)
+        self.assertFalse(metadata.accepting_orders)
+        self.assertEqual(metadata.token_ids, ("token-1", "token-2"))
+
     def test_get_accounting_snapshot_parses_zip_payload(self):
         def responder(base_url: str, path: str, params: dict[str, Any]) -> Any:
             self.assertEqual(base_url, "https://data-api.polymarket.com")

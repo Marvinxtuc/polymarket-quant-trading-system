@@ -56,11 +56,14 @@ class PersonalTerminalStore:
             raise RuntimeError("personal terminal store is closed")
         if not self.path:
             raise ValueError("candidate db path is required")
-        parent = Path(self.path).expanduser().parent
+        resolved_path = str(Path(self.path).expanduser())
+        parent = Path(resolved_path).parent
         if str(parent) not in {"", "."}:
             parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(self.path)
+        conn = sqlite3.connect(resolved_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=5000")
         return conn
 
     @contextmanager
@@ -213,6 +216,44 @@ class PersonalTerminalStore:
         payload["updated_ts"] = int(payload.get("updated_ts") or now)
         record = json.dumps(payload, ensure_ascii=False)
         with self.connection() as conn:
+            status = str(payload.get("status") or "pending").strip().lower()
+            normalized_wallet = str(payload.get("wallet") or "").strip().lower()
+            normalized_token_id = str(payload.get("token_id") or "").strip().lower()
+            normalized_market_slug = str(payload.get("market_slug") or "").strip().lower()
+            normalized_side = str(payload.get("side") or "").strip().upper()
+            if status in {"pending", "watched"} and normalized_wallet and normalized_token_id and normalized_side:
+                existing_row = conn.execute(
+                    """
+                    SELECT id, created_ts, expires_ts
+                      FROM candidates
+                     WHERE status IN ('pending', 'watched')
+                       AND LOWER(wallet) = ?
+                       AND LOWER(token_id) = ?
+                       AND UPPER(side) = ?
+                       AND LOWER(market_slug) = ?
+                       AND id <> ?
+                     ORDER BY updated_ts DESC, created_ts DESC, id DESC
+                     LIMIT 1
+                    """,
+                    (
+                        normalized_wallet,
+                        normalized_token_id,
+                        normalized_side,
+                        normalized_market_slug,
+                        str(payload.get("id") or ""),
+                    ),
+                ).fetchone()
+                if existing_row is not None:
+                    payload["id"] = str(existing_row["id"] or payload.get("id") or "")
+                    payload["created_ts"] = min(
+                        int(existing_row["created_ts"] or now),
+                        int(payload.get("created_ts") or now),
+                    )
+                    payload["expires_ts"] = max(
+                        int(existing_row["expires_ts"] or 0),
+                        int(payload.get("expires_ts") or 0),
+                    )
+                    record = json.dumps(payload, ensure_ascii=False)
             conn.execute(
                 """
                 INSERT INTO candidates (

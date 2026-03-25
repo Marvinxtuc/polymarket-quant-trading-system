@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from polymarket_bot.i18n import t as i18n_t
 from polymarket_bot.reconciliation_report import append_ledger_entry, build_reconciliation_report_from_paths, render_reconciliation_report
 
 
@@ -103,13 +104,14 @@ class ReconciliationReportTests(unittest.TestCase):
         self.assertIn("broker_reconcile", source_names)
         self.assertIn("paper", source_names)
         self.assertEqual(report["state_summary"]["pending_orders"], 1)
+        self.assertEqual(report["status_label"], i18n_t("enum.reportStatus.warn"))
 
         text = render_reconciliation_report(report)
 
-        self.assertIn("Polymarket Reconciliation EOD Report", text)
-        self.assertIn("status: warn", text)
-        self.assertIn("fill_by_source:", text)
-        self.assertIn("broker_reconcile", text)
+        self.assertIn(i18n_t("report.reconciliation.title"), text)
+        self.assertIn(f"{i18n_t('report.reconciliation.field.status')}: {i18n_t('enum.reportStatus.warn')}", text)
+        self.assertIn(f"{i18n_t('report.reconciliation.section.fill_by_source')}:", text)
+        self.assertIn(i18n_t("report.reconciliation.source.broker_reconcile"), text)
 
     def test_build_report_from_sqlite_ledger_summarizes_fills(self):
         with tempfile.TemporaryDirectory() as tmpdir:

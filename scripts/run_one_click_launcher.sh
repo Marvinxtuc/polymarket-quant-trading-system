@@ -5,9 +5,15 @@ set -o pipefail
 export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
 
 PROJECT_BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PY_BIN="$PROJECT_BASE/.venv/bin/python"
 LAUNCH_LOG="/tmp/poly_launch.log"
 OPEN_BIN="/usr/bin/open"
 OPEN_URL_BASE="http://127.0.0.1:8787"
+
+if [[ -x "$PY_BIN" ]]; then
+  LAUNCH_LOG="$("$PY_BIN" "$PROJECT_BASE/scripts/runtime_paths.py" runtime_dir 2>/dev/null | awk 'NR==1{print $0"/launch.log"}')"
+fi
+mkdir -p "$(dirname "$LAUNCH_LOG")"
 
 log() {
   printf '%s\n' "$*" | tee -a "$LAUNCH_LOG"

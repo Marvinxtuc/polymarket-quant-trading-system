@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from polymarket_bot.brokers.live_clob import LiveClobBroker
+from polymarket_bot.brokers.live_clob import LiveClobBroker, _configure_sdk_http_timeout
 from polymarket_bot.types import Signal
 
 
@@ -114,6 +114,31 @@ def _signal(side: str, *, price_hint: float = 0.5) -> Signal:
 
 
 class LiveClobTests(unittest.TestCase):
+    def test_configure_sdk_http_timeout_sets_default_timeout(self):
+        import httpx
+        from py_clob_client.http_helpers import helpers as sdk_helpers
+
+        original_client = sdk_helpers._http_client
+        sdk_helpers._http_client = httpx.Client(http2=True)
+        try:
+            _configure_sdk_http_timeout(7.0)
+            configured = sdk_helpers._http_client
+            self.assertIsInstance(configured.timeout, httpx.Timeout)
+            self.assertIsNotNone(configured.timeout.connect)
+            self.assertIsNotNone(configured.timeout.read)
+            self.assertIsNotNone(configured.timeout.write)
+            self.assertIsNotNone(configured.timeout.pool)
+            self.assertLessEqual(float(configured.timeout.connect), 7.0)
+            self.assertLessEqual(float(configured.timeout.read), 7.0)
+            self.assertLessEqual(float(configured.timeout.write), 7.0)
+            self.assertLessEqual(float(configured.timeout.pool), 7.0)
+        finally:
+            try:
+                sdk_helpers._http_client.close()
+            except Exception:
+                pass
+            sdk_helpers._http_client = original_client
+
     def test_create_and_post_order_passes_partial_options_to_create_order(self):
         class _SdkStyleClient(_FakeClient):
             def __init__(self):
@@ -266,6 +291,30 @@ class LiveClobTests(unittest.TestCase):
         self.assertEqual(snapshot.lifecycle_status, "partially_filled")
         self.assertAlmostEqual(snapshot.matched_size, 4.5, places=6)
         self.assertAlmostEqual(snapshot.avg_fill_price, 0.48, places=6)
+
+    def test_get_order_status_accepts_snake_case_size_matched(self):
+        class _SnakeCaseClient(_FakeClient):
+            def get_order(self, order_id):
+                return {
+                    "id": order_id,
+                    "status": "MATCHED",
+                    "original_size": "12",
+                    "size_matched": "12",
+                    "price": "0.084",
+                }
+
+        broker = LiveClobBroker.__new__(LiveClobBroker)
+        broker.client = _SnakeCaseClient()
+
+        snapshot = broker.get_order_status("oid-snake")
+
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot.order_id, "oid-snake")
+        self.assertEqual(snapshot.normalized_status, "matched")
+        self.assertEqual(snapshot.lifecycle_status, "filled")
+        self.assertAlmostEqual(snapshot.matched_size, 12.0, places=6)
+        self.assertAlmostEqual(snapshot.remaining_size, 0.0, places=6)
 
     def test_heartbeat_forwards_pending_order_ids(self):
         broker = LiveClobBroker.__new__(LiveClobBroker)

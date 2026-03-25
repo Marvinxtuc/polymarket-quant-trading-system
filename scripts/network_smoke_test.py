@@ -18,11 +18,17 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from polymarket_bot.clients.data_api import PolymarketDataClient, Position
+from polymarket_bot.config import Settings
+from polymarket_bot.i18n import t as i18n_t
 from polymarket_bot.wallet_scoring import SmartWalletScorer, build_realized_wallet_metrics
 
 
 COOKIE_RESTRICTED_RE = re.compile(r'"restricted"\s*:\s*"(true|false)"', re.IGNORECASE)
 WALLET_RE = re.compile(r"^0x[a-f0-9]{40}$")
+
+
+def _network_t(key: str, params: dict[str, object] | None = None, *, fallback: str = "") -> str:
+    return i18n_t(f"report.networkSmoke.{key}", dict(params or {}), fallback=fallback)
 
 
 def load_env(path: Path) -> dict[str, str]:
@@ -128,20 +134,44 @@ def probe(base: str, path: str, method: str = "GET", params: dict[str, object] |
 
 def evaluate_check(name: str, result: dict[str, object], expected: set[int] | None, allow401: bool = False) -> tuple[str, str]:
     if not result.get("ok"):
-        return "FAIL", f"{name}: request failed ({result.get('reason')})"
+        return "FAIL", _network_t(
+            "summary.requestFailed",
+            {"name": name, "reason": result.get("reason")},
+            fallback=f"{name}: request failed ({result.get('reason')})",
+        )
 
     status = int(result["status"])
     if result.get("restricted"):
-        return "BLOCK", f"{name}: geo-restricted marker detected"
+        return "BLOCK", _network_t(
+            "summary.geoRestricted",
+            {"name": name},
+            fallback=f"{name}: geo-restricted marker detected",
+        )
     if status == 403 or status == 451:
-        return "BLOCK", f"{name}: blocked by policy/status={status}"
+        return "BLOCK", _network_t(
+            "summary.blockedByPolicy",
+            {"name": name, "status": status},
+            fallback=f"{name}: blocked by policy/status={status}",
+        )
 
     if expected is not None and status not in expected:
         if allow401 and status == 401:
-            return "WARN", f"{name}: auth required (401, expected for private endpoint)"
-        return "FAIL", f"{name}: unexpected status={status}"
+            return "WARN", _network_t(
+                "summary.authRequired",
+                {"name": name},
+                fallback=f"{name}: auth required (401, expected for private endpoint)",
+            )
+        return "FAIL", _network_t(
+            "summary.unexpectedStatus",
+            {"name": name, "status": status},
+            fallback=f"{name}: unexpected status={status}",
+        )
 
-    return "PASS", f"{name}: status={status}"
+    return "PASS", _network_t(
+        "summary.statusOk",
+        {"name": name, "status": status},
+        fallback=f"{name}: status={status}",
+    )
 
 
 def run_history_smoke(
@@ -213,19 +243,38 @@ def run_history_smoke(
                 has_data = bool(active_positions or trades or activity or closed_positions)
                 if not has_data:
                     level = "WARN"
-                    summary = f"history_wallet {wallet}: no recent data across active/trades/activity/closed"
+                    summary = _network_t(
+                        "history.noRecentData",
+                        {"wallet": wallet},
+                        fallback=f"history_wallet {wallet}: no recent data across active/trades/activity/closed",
+                    )
                 elif condition_ids and not resolution_map:
                     level = "WARN"
-                    summary = (
-                        f"history_wallet {wallet}: parsed data ok but no resolutions found "
-                        f"for {len(condition_ids)} recent closed markets"
+                    summary = _network_t(
+                        "history.noResolutionFound",
+                        {"wallet": wallet, "count": len(condition_ids)},
+                        fallback=(
+                            f"history_wallet {wallet}: parsed data ok but no resolutions found "
+                            f"for {len(condition_ids)} recent closed markets"
+                        ),
                     )
                 else:
                     level = "PASS"
-                    summary = (
-                        f"history_wallet {wallet}: active={len(active_positions)} "
-                        f"trades={len(trades)} activity={len(activity)} "
-                        f"closed={len(closed_positions)} resolved={len(resolution_map)}"
+                    summary = _network_t(
+                        "history.ok",
+                        {
+                            "wallet": wallet,
+                            "active": len(active_positions),
+                            "trades": len(trades),
+                            "activity": len(activity),
+                            "closed": len(closed_positions),
+                            "resolved": len(resolution_map),
+                        },
+                        fallback=(
+                            f"history_wallet {wallet}: active={len(active_positions)} "
+                            f"trades={len(trades)} activity={len(activity)} "
+                            f"closed={len(closed_positions)} resolved={len(resolution_map)}"
+                        ),
                     )
 
                 results.append(
@@ -265,7 +314,11 @@ def run_history_smoke(
                         "status": 0,
                         "reason": type(exc).__name__,
                         "level": "FAIL",
-                        "summary": f"history_wallet {wallet}: request failed ({type(exc).__name__})",
+                        "summary": _network_t(
+                            "history.requestFailed",
+                            {"wallet": wallet, "reason": type(exc).__name__},
+                            fallback=f"history_wallet {wallet}: request failed ({type(exc).__name__})",
+                        ),
                         "cf_ray": "",
                         "restricted": False,
                         "restricted_raw": None,
@@ -283,8 +336,13 @@ def run_history_smoke(
 def main() -> int:
     env = load_env(Path(".env"))
     example_env = load_env(Path(".env.example"))
-    parser = argparse.ArgumentParser(description="Polymarket network smoke test")
-    parser.add_argument("--wallet", default=env.get("NETWORK_TEST_WALLET", ""), help="Wallet for positions endpoint smoke test")
+    settings = Settings()
+    parser = argparse.ArgumentParser(description=_network_t("cli.description", fallback="Polymarket network smoke test"))
+    parser.add_argument(
+        "--wallet",
+        default=env.get("NETWORK_TEST_WALLET", ""),
+        help=_network_t("cli.wallet", fallback="Wallet for positions endpoint smoke test"),
+    )
     parser.add_argument(
         "--history-wallets",
         default=first_non_empty(
@@ -292,15 +350,46 @@ def main() -> int:
             env.get("WATCH_WALLETS"),
             example_env.get("WATCH_WALLETS"),
         ),
-        help="Comma-separated wallets for real history smoke checks",
+        help=_network_t("cli.historyWallets", fallback="Comma-separated wallets for real history smoke checks"),
     )
-    parser.add_argument("--history-max-wallets", type=int, default=2, help="Max wallets to probe in history smoke")
-    parser.add_argument("--history-limit", type=int, default=8, help="Per-endpoint limit for wallet history smoke")
-    parser.add_argument("--resolution-limit", type=int, default=4, help="Max recent closed markets to resolve per wallet")
-    parser.add_argument("--skip-history", action="store_true", help="Skip real wallet history smoke checks")
-    parser.add_argument("--data-api", default=env.get("POLYMARKET_DATA_API", "https://data-api.polymarket.com"))
-    parser.add_argument("--clob-host", default=env.get("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com"))
-    parser.add_argument("--log-path", default=os.getenv("NETWORK_SMOKE_LOG", "/tmp/poly_network_smoke.jsonl"))
+    parser.add_argument(
+        "--history-max-wallets",
+        type=int,
+        default=2,
+        help=_network_t("cli.historyMaxWallets", fallback="Max wallets to probe in history smoke"),
+    )
+    parser.add_argument(
+        "--history-limit",
+        type=int,
+        default=8,
+        help=_network_t("cli.historyLimit", fallback="Per-endpoint limit for wallet history smoke"),
+    )
+    parser.add_argument(
+        "--resolution-limit",
+        type=int,
+        default=4,
+        help=_network_t("cli.resolutionLimit", fallback="Max recent closed markets to resolve per wallet"),
+    )
+    parser.add_argument(
+        "--skip-history",
+        action="store_true",
+        help=_network_t("cli.skipHistory", fallback="Skip real wallet history smoke checks"),
+    )
+    parser.add_argument(
+        "--data-api",
+        default=env.get("POLYMARKET_DATA_API", "https://data-api.polymarket.com"),
+        help=_network_t("cli.dataApi", fallback="Data API base URL"),
+    )
+    parser.add_argument(
+        "--clob-host",
+        default=env.get("POLYMARKET_CLOB_HOST", "https://clob.polymarket.com"),
+        help=_network_t("cli.clobHost", fallback="CLOB host base URL"),
+    )
+    parser.add_argument(
+        "--log-path",
+        default=os.getenv("NETWORK_SMOKE_LOG", settings.network_smoke_log_path),
+        help=_network_t("cli.logPath", fallback="Append-only log output path"),
+    )
     parser.add_argument("--timeout", type=float, default=12.0)
     args = parser.parse_args()
 
@@ -327,12 +416,18 @@ def main() -> int:
         ("clob_trades", args.clob_host, "/trades", "GET", {"expected": {200}}, True),
     ]
 
-    print("==> Polymarket network smoke test")
-    print(f"wallet={wallet}")
-    print(f"data_api={args.data_api}")
-    print(f"clob_host={args.clob_host}")
+    print(_network_t("section.title", fallback="==> Polymarket network smoke test"))
+    print(_network_t("field.wallet", {"value": wallet}, fallback=f"wallet={wallet}"))
+    print(_network_t("field.dataApi", {"value": args.data_api}, fallback=f"data_api={args.data_api}"))
+    print(_network_t("field.clobHost", {"value": args.clob_host}, fallback=f"clob_host={args.clob_host}"))
     if not args.skip_history:
-        print(f"history_wallets={','.join(history_wallets) if history_wallets else '(none)'}")
+        print(
+            _network_t(
+                "field.historyWallets",
+                {"value": ",".join(history_wallets) if history_wallets else _network_t("common.none", fallback="(none)")},
+                fallback=f"history_wallets={','.join(history_wallets) if history_wallets else '(none)'}",
+            )
+        )
 
     failures = 0
     blocks = 0
@@ -366,9 +461,20 @@ def main() -> int:
             failures += 1
 
         extra = (
-            f"status={result.get('status')} cf_ray={result['headers'].get('cf_ray', '')}"
-            f" restricted={result.get('restricted')}"
-            f" ms={result.get('ms')}"
+            _network_t(
+                "field.checkExtra",
+                {
+                    "status": result.get("status"),
+                    "cfRay": result["headers"].get("cf_ray", ""),
+                    "restricted": result.get("restricted"),
+                    "ms": result.get("ms"),
+                },
+                fallback=(
+                    f"status={result.get('status')} cf_ray={result['headers'].get('cf_ray', '')}"
+                    f" restricted={result.get('restricted')}"
+                    f" ms={result.get('ms')}"
+                ),
+            )
         )
         payload = {
             "check": name,
@@ -389,7 +495,7 @@ def main() -> int:
         print(f"[{mark:5}] {summary} | {extra}")
 
     if not args.skip_history and history_wallets:
-        print("==> Wallet history smoke")
+        print(_network_t("section.history", fallback="==> Wallet history smoke"))
         history_checks = run_history_smoke(
             data_api=args.data_api,
             clob_host=args.clob_host,
@@ -410,26 +516,44 @@ def main() -> int:
                 failures += 1
 
             extra = (
-                f"active={payload.get('active_positions', 0)} "
-                f"trades={payload.get('trades', 0)} "
-                f"closed={payload.get('closed_positions', 0)} "
-                f"resolved={payload.get('resolved_markets', 0)} "
-                f"ms={payload.get('ms')}"
+                _network_t(
+                    "field.historyExtra",
+                    {
+                        "active": payload.get("active_positions", 0),
+                        "trades": payload.get("trades", 0),
+                        "closed": payload.get("closed_positions", 0),
+                        "resolved": payload.get("resolved_markets", 0),
+                        "ms": payload.get("ms"),
+                    },
+                    fallback=(
+                        f"active={payload.get('active_positions', 0)} "
+                        f"trades={payload.get('trades', 0)} "
+                        f"closed={payload.get('closed_positions', 0)} "
+                        f"resolved={payload.get('resolved_markets', 0)} "
+                        f"ms={payload.get('ms')}"
+                    ),
+                )
             )
             per_check.append(payload)
             print(f"[{mark:5}] {payload['summary']} | {extra}")
 
     if blocks:
-        print("BLOCK: network path appears geoblocked/restricted")
+        print(_network_t("result.block", fallback="BLOCK: network path appears geoblocked/restricted"))
         exit_code = 2
     elif failures:
-        print("FAIL: endpoint connectivity not aligned with expectation")
+        print(_network_t("result.fail", fallback="FAIL: endpoint connectivity not aligned with expectation"))
         exit_code = 1
     elif warnings:
-        print(f"WARN: test passed with {warnings} warning(s) (non-fatal)")
+        print(
+            _network_t(
+                "result.warn",
+                {"count": warnings},
+                fallback=f"WARN: test passed with {warnings} warning(s) (non-fatal)",
+            )
+        )
         exit_code = 0
     else:
-        print("PASS: Polymarket endpoints are reachable from this environment")
+        print(_network_t("result.pass", fallback="PASS: Polymarket endpoints are reachable from this environment"))
         exit_code = 0
 
     log_record = {

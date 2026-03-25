@@ -2,13 +2,14 @@
 set -euo pipefail
 
 BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-RUNTIME_DATA="/tmp/poly_runtime_data"
-WEB_PID_FILE="$RUNTIME_DATA/poly_web.pid"
-BOT_PID_FILE="$RUNTIME_DATA/poly_bot.pid"
-WEB_LOG="$RUNTIME_DATA/poly_web.log"
-BOT_LOG="$RUNTIME_DATA/poly_bot.log"
-STATE_PATH="$RUNTIME_DATA/state.json"
-PUBLIC_STATE_PATH="/tmp/poly_public_state.json"
+RUNTIME_DATA=""
+WEB_PID_FILE=""
+BOT_PID_FILE=""
+WEB_LOG=""
+BOT_LOG=""
+STATE_PATH=""
+PUBLIC_STATE_PATH=""
+NETWORK_SMOKE_LOG_PATH=""
 VERIFY_SCRIPT="$BASE/scripts/verify_stack.sh"
 PY_BIN="$BASE/.venv/bin/python"
 CURL_BIN="/usr/bin/curl"
@@ -19,7 +20,7 @@ BOT_LABEL="ai.poly.bot"
 AGENT_DIR="$HOME/Library/LaunchAgents"
 WEB_PLIST="$AGENT_DIR/$WEB_LABEL.plist"
 BOT_PLIST="$AGENT_DIR/$BOT_LABEL.plist"
-STACK_WEB_PORT=8787
+STACK_WEB_PORT="${STACK_WEB_PORT:-8787}"
 
 read_dotenv_var() {
   local key="$1"
@@ -38,12 +39,19 @@ read_dotenv_var() {
 }
 
 CONTROL_TOKEN="${POLY_CONTROL_TOKEN:-$(read_dotenv_var POLY_CONTROL_TOKEN)}"
-WEB_URL="http://127.0.0.1:8787/api/state"
+WEB_URL="http://127.0.0.1:${STACK_WEB_PORT}/api/state"
 if [[ -n "${CONTROL_TOKEN:-}" ]]; then
   WEB_URL="${WEB_URL}?token=${CONTROL_TOKEN}"
 fi
 
-mkdir -p "$RUNTIME_DATA"
+resolve_runtime_paths() {
+  eval "$("$PY_BIN" "$BASE/scripts/runtime_paths.py" --format shell runtime_dir state_path public_state_path web_log_path bot_log_path network_smoke_log_path)"
+  RUNTIME_DATA="$RUNTIME_DIR"
+  WEB_LOG="$WEB_LOG_PATH"
+  BOT_LOG="$BOT_LOG_PATH"
+  WEB_PID_FILE="$RUNTIME_DATA/poly_web.pid"
+  BOT_PID_FILE="$RUNTIME_DATA/poly_bot.pid"
+}
 
 is_running() {
   local pid_file="$1"
@@ -149,7 +157,7 @@ is_expected_process() {
 }
 
 stop_legacy_runtime() {
-  # Clean previous embedded runtime that also used port 8787.
+  # Clean previous embedded runtime that also used the configured web port.
   stop_pid_file_if_stale "$WEB_PID_FILE" "polymarket_bot.web --host 127.0.0.1 --port $STACK_WEB_PORT"
   stop_pid_file_if_stale "$WEB_PID_FILE" "web.py --host 127.0.0.1 --port $STACK_WEB_PORT"
   stop_pid_file_if_stale "$BOT_PID_FILE" "polymarket_bot.daemon"
@@ -160,21 +168,19 @@ stop_legacy_runtime() {
 
   if command -v pgrep >/dev/null 2>&1; then
     # Legacy launch patterns from older snapshot/release.
-    for pid in $(pgrep -af "backend/web.py --port $STACK_WEB_PORT|backend/main.py --config|polymarket_bot.web|web.py --host 127.0.0.1 --port $STACK_WEB_PORT|daemon.py --state-path $STATE_PATH" 2>/dev/null | awk '{print $1}'); do
+    for pid in $(pgrep -af "backend/web.py --port $STACK_WEB_PORT|web.py --host 127.0.0.1 --port $STACK_WEB_PORT|python -m polymarket_bot.web --host 127.0.0.1 --port $STACK_WEB_PORT|python3 -m polymarket_bot.web --host 127.0.0.1 --port $STACK_WEB_PORT|polymarket_bot.daemon --state-path $STATE_PATH|python -m polymarket_bot.daemon --state-path $STATE_PATH|python3 -m polymarket_bot.daemon --state-path $STATE_PATH|daemon.py --state-path $STATE_PATH" 2>/dev/null | awk '{print $1}'); do
       kill "$pid" >/dev/null 2>&1 || true
     done
   fi
-  pkill -f "polymarket_bot.web --host 127.0.0.1 --port 8787" >/dev/null 2>&1 || true
-  pkill -f "web.py --host 127.0.0.1 --port 8787" >/dev/null 2>&1 || true
+  pkill -f "polymarket_bot.web --host 127.0.0.1 --port $STACK_WEB_PORT" >/dev/null 2>&1 || true
+  pkill -f "web.py --host 127.0.0.1 --port $STACK_WEB_PORT" >/dev/null 2>&1 || true
   pkill -f "python -m polymarket_bot.web --host 127.0.0.1 --port $STACK_WEB_PORT" >/dev/null 2>&1 || true
   pkill -f "python3 -m polymarket_bot.web --host 127.0.0.1 --port $STACK_WEB_PORT" >/dev/null 2>&1 || true
   pkill -f "polymarket_bot.web --port $STACK_WEB_PORT" >/dev/null 2>&1 || true
   pkill -f "polymarket_bot.daemon --state-path $STATE_PATH" >/dev/null 2>&1 || true
-  pkill -f "polymarket_bot.daemon" >/dev/null 2>&1 || true
+  pkill -f "python -m polymarket_bot.daemon --state-path $STATE_PATH" >/dev/null 2>&1 || true
   pkill -f "python3 -m polymarket_bot.daemon --state-path $STATE_PATH" >/dev/null 2>&1 || true
   pkill -f "daemon.py --state-path $STATE_PATH" >/dev/null 2>&1 || true
-  pkill -f "PYTHONPATH=.*polymarket_bot.web" >/dev/null 2>&1 || true
-  pkill -f "PYTHONPATH=.*polymarket_bot.daemon" >/dev/null 2>&1 || true
   kill_port_listeners
   sleep 1
 }
@@ -212,7 +218,7 @@ write_web_plist() {
     <string>$PY_BIN</string>
     <string>$BASE/src/polymarket_bot/web.py</string>
     <string>--host</string><string>127.0.0.1</string>
-    <string>--port</string><string>8787</string>
+    <string>--port</string><string>${STACK_WEB_PORT}</string>
     <string>--state-path</string><string>$STATE_PATH</string>
     <string>--public-state-path</string><string>$PUBLIC_STATE_PATH</string>
     <string>--frontend-dir</string><string>$BASE/frontend</string>
@@ -221,6 +227,7 @@ write_web_plist() {
   <dict>
     <key>PYTHONPATH</key><string>$BASE/src</string>
     <key>POLY_CONTROL_TOKEN</key><string>${CONTROL_TOKEN}</string>
+    <key>NETWORK_SMOKE_LOG</key><string>${NETWORK_SMOKE_LOG_PATH}</string>
   </dict>
   <key>StandardOutPath</key><string>$WEB_LOG</string>
   <key>StandardErrorPath</key><string>$WEB_LOG</string>
@@ -250,6 +257,7 @@ write_bot_plist() {
   <dict>
     <key>PYTHONPATH</key><string>$BASE/src</string>
     <key>POLY_CONTROL_TOKEN</key><string>${CONTROL_TOKEN}</string>
+    <key>NETWORK_SMOKE_LOG</key><string>${NETWORK_SMOKE_LOG_PATH}</string>
   </dict>
   <key>StandardOutPath</key><string>$BOT_LOG</string>
   <key>StandardErrorPath</key><string>$BOT_LOG</string>
@@ -283,15 +291,15 @@ start_direct_process() {
     rm -f "$pid_file"
   fi
 
-  nohup env "PYTHONPATH=$BASE/src" "POLY_CONTROL_TOKEN=${CONTROL_TOKEN}" "$@" >>"$log_file" 2>&1 < /dev/null &
+  nohup env "PYTHONPATH=$BASE/src" "POLY_CONTROL_TOKEN=${CONTROL_TOKEN}" "NETWORK_SMOKE_LOG=${NETWORK_SMOKE_LOG_PATH}" "$@" >>"$log_file" 2>&1 < /dev/null &
   local pid=$!
   echo "$pid" >"$pid_file"
 }
 
 start_stack() {
-  local use_launchctl=1
-  if [[ "${START_STACK_DISABLE_LAUNCHCTL:-0}" == "1" ]]; then
-    use_launchctl=0
+  local use_launchctl=0
+  if [[ "${START_STACK_ENABLE_LAUNCHCTL:-0}" == "1" && "${START_STACK_DISABLE_LAUNCHCTL:-0}" != "1" ]]; then
+    use_launchctl=1
   fi
 
   if [[ ! -x "$LAUNCHCTL_BIN" ]]; then
@@ -350,7 +358,7 @@ start_stack() {
       "$WEB_LOG" \
       "$PY_BIN" "$BASE/src/polymarket_bot/web.py" \
       --host 127.0.0.1 \
-      --port 8787 \
+      --port "$STACK_WEB_PORT" \
       --state-path "$STATE_PATH" \
       --public-state-path "$PUBLIC_STATE_PATH" \
       --frontend-dir "$BASE/frontend"
@@ -368,6 +376,8 @@ if [[ ! -x "$PY_BIN" ]]; then
   echo ".venv/bin/python not found, please create venv first" >&2
   exit 1
 fi
+resolve_runtime_paths
+mkdir -p "$RUNTIME_DATA"
 
 RUN_START_TS="$(date +%s)"
 
@@ -423,7 +433,7 @@ if [[ "$ok" -ne 1 ]]; then
 fi
 
 # Make sure the listener belongs to our running web process, not an old runtime.
-if ! is_expected_process "$WEB_PID_FILE" "--host 127.0.0.1 --port 8787"; then
+if ! is_expected_process "$WEB_PID_FILE" "--host 127.0.0.1 --port $STACK_WEB_PORT"; then
   echo "health check passed but polymarket_bot.web process not found"
   exit 1
 fi
@@ -447,4 +457,4 @@ VERIFY_RETRY_INTERVAL_SECONDS="${START_STACK_VERIFY_INTERVAL_SECONDS:-3}" \
 
 echo "web_pid=$(cat "$WEB_PID_FILE" 2>/dev/null || true)"
 echo "bot_pid=$(cat "$BOT_PID_FILE" 2>/dev/null || true)"
-echo "url=http://127.0.0.1:8787"
+echo "url=http://127.0.0.1:${STACK_WEB_PORT}"

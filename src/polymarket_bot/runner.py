@@ -12,9 +12,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from polymarket_bot.brokers.base import Broker
-from polymarket_bot.clients.data_api import AccountingSnapshot, PolymarketDataClient, PriceHistoryPoint
+from polymarket_bot.clients.data_api import AccountingSnapshot, MarketMetadata, PolymarketDataClient, PriceHistoryPoint
 from polymarket_bot.config import Settings
 from polymarket_bot.db import PersonalTerminalStore
+from polymarket_bot.i18n import enum_label as i18n_enum_label, humanize_identifier as i18n_humanize_identifier, label as i18n_label, t as i18n_t
 from polymarket_bot.notifier import Notifier
 from polymarket_bot.reconciliation_report import append_ledger_entry, load_ledger_rows
 from polymarket_bot.risk import RiskManager, RiskState
@@ -42,6 +43,7 @@ _MARKET_WINDOW_SECONDS = {
     "30m": 1800,
     "1h": 3600,
 }
+_MARKET_METADATA_CACHE_TTL_SECONDS = 300
 
 
 @dataclass(slots=True)
@@ -97,12 +99,26 @@ class Trader:
     startup_ready: bool = field(init=False, default=True)
     startup_warning_count: int = field(init=False, default=0)
     startup_failure_count: int = field(init=False, default=0)
+    trading_mode: str = field(init=False, default="NORMAL")
+    trading_mode_reasons: list[str] = field(init=False, default_factory=list)
+    trading_mode_updated_ts: int = field(init=False, default=0)
+    account_state_status: str = field(init=False, default="unknown")
+    reconciliation_status: str = field(init=False, default="unknown")
+    persistence_status: str = field(init=False, default="ok")
+    persistence_failure_count: int = field(init=False, default=0)
+    last_persistence_failure: dict[str, object] = field(init=False, default_factory=dict)
+    _last_trading_mode_signature: tuple[str, tuple[str, ...], str, str, str] = field(
+        init=False,
+        default=("NORMAL", tuple(), "unknown", "unknown", "ok"),
+    )
     last_operator_action: dict[str, object] = field(init=False, default_factory=dict)
     decision_mode: str = field(init=False, default="manual")
     candidate_store: PersonalTerminalStore | None = field(init=False, default=None)
     notifier: Notifier | None = field(init=False, default=None)
     _candidate_notification_watermarks: dict[str, int] = field(init=False, default_factory=dict)
+    _critical_notification_watermarks: dict[str, int] = field(init=False, default_factory=dict)
     _candidate_price_history_cache: dict[str, dict[str, object]] = field(init=False, default_factory=dict)
+    _market_metadata_cache: dict[str, dict[str, object]] = field(init=False, default_factory=dict)
 
     def __post_init__(self) -> None:
         self.state = RiskState()
@@ -134,6 +150,8 @@ class Trader:
         self._maybe_sync_account_state(force=True)
         self._refresh_risk_state()
         self._run_startup_checks()
+        self._update_trading_mode(self.control_state, now=int(time.time()))
+        self._refresh_risk_state()
 
     def _tracked_notional_usd(self) -> float:
         return sum(max(0.0, float(pos.get("notional") or 0.0)) for pos in self.positions_book.values())
@@ -163,6 +181,13 @@ class Trader:
         self.state.pending_entry_notional_usd = self._pending_entry_notional_usd()
         self.state.pending_exit_notional_usd = self._pending_exit_notional_usd()
         self.state.pending_entry_orders = self._pending_entry_orders()
+        self.state.trading_mode = str(self.trading_mode or "NORMAL").upper()
+        self.state.trading_mode_reasons = tuple(
+            str(reason or "") for reason in self.trading_mode_reasons if str(reason or "").strip()
+        )
+        self.state.account_state_status = str(self.account_state_status or "unknown")
+        self.state.reconciliation_status = str(self.reconciliation_status or "unknown")
+        self.state.persistence_status = str(self.persistence_status or "ok")
 
     def _available_notional_usd(self) -> float:
         pending_entry_notional = self._pending_entry_notional_usd()
@@ -181,6 +206,10 @@ class Trader:
     def _actionable_notional_floor_usd() -> float:
         # Keep dust out, but let the bot keep trading or exiting when free cash drops below the old 5 USD floor.
         return 1.0
+
+    @staticmethod
+    def _position_dust_floor_usd() -> float:
+        return 0.01
 
     @staticmethod
     def _condition_exposure_key(
@@ -269,6 +298,93 @@ class Trader:
         self._recent_order_keys[key] = now + ttl
         return False
 
+    def _restore_recent_order_keys(self, payload: object) -> None:
+        if not isinstance(payload, dict):
+            return
+        now = time.time()
+        restored: dict[str, float] = {}
+        for raw_key, raw_expire_ts in payload.items():
+            key = str(raw_key or "").strip()
+            if not key:
+                continue
+            expire_ts = self._safe_float(raw_expire_ts)
+            if expire_ts <= now:
+                continue
+            restored[key] = expire_ts
+        if restored:
+            self._recent_order_keys = restored
+
+    def _pending_order_conflicts_with_signal(
+        self,
+        order: Mapping[str, object],
+        signal: Signal,
+    ) -> bool:
+        if str(signal.side or "").upper() != "BUY":
+            return False
+        if str(order.get("side") or "").upper() != "BUY":
+            return False
+
+        signal_token = str(signal.token_id or "").strip().lower()
+        order_token = str(order.get("token_id") or "").strip().lower()
+        if signal_token and order_token:
+            return signal_token == order_token
+
+        signal_key, _ = self._signal_condition_exposure_key(signal)
+        order_key, _ = self._pending_order_condition_exposure_key(order)
+        return bool(signal_key and order_key and signal_key == order_key)
+
+    def _find_pending_order_duplicate(self, signal: Signal) -> dict[str, object] | None:
+        for order in sorted(self.pending_orders.values(), key=lambda item: int(item.get("ts") or 0), reverse=True):
+            if self._pending_order_conflicts_with_signal(order, signal):
+                return dict(order)
+        return None
+
+    def _find_broker_open_order_duplicate(self, signal: Signal) -> dict[str, object] | None:
+        if self.settings.dry_run:
+            return None
+        list_open_orders = getattr(self.broker, "list_open_orders", None)
+        if not callable(list_open_orders):
+            return None
+        try:
+            broker_open_orders = list_open_orders()
+        except Exception as exc:
+            self.log.warning("Broker open-order duplicate check failed err=%s", exc)
+            return None
+        if not broker_open_orders:
+            return None
+
+        for snapshot in broker_open_orders:
+            if str(getattr(snapshot, "side", "") or "").upper() != "BUY":
+                continue
+            snapshot_token = str(getattr(snapshot, "token_id", "") or "").strip().lower()
+            signal_token = str(signal.token_id or "").strip().lower()
+            if snapshot_token and signal_token and snapshot_token == signal_token:
+                return {
+                    "order_id": str(getattr(snapshot, "order_id", "") or ""),
+                    "token_id": snapshot_token,
+                    "condition_id": str(getattr(snapshot, "condition_id", "") or ""),
+                    "market_slug": str(getattr(snapshot, "market_slug", "") or ""),
+                    "side": "BUY",
+                    "source": "broker_open_orders",
+                }
+
+            signal_key, _ = self._signal_condition_exposure_key(signal)
+            snapshot_key, _ = self._condition_exposure_key(
+                condition_id=getattr(snapshot, "condition_id", ""),
+                market_slug=getattr(snapshot, "market_slug", ""),
+                token_id=getattr(snapshot, "token_id", ""),
+            )
+            if signal_key and snapshot_key and signal_key == snapshot_key:
+                return {
+                    "order_id": str(getattr(snapshot, "order_id", "") or ""),
+                    "token_id": snapshot_token,
+                    "condition_id": str(getattr(snapshot, "condition_id", "") or ""),
+                    "market_slug": str(getattr(snapshot, "market_slug", "") or ""),
+                    "side": "BUY",
+                    "source": "broker_open_orders",
+                }
+        return None
+
     def _safe_float(self, value: object, default: float = 0.0) -> float:
         try:
             return float(value)
@@ -340,12 +456,66 @@ class Trader:
             return None, None, None
         return start_ts, duration_seconds, start_ts + duration_seconds
 
+    @staticmethod
+    def _market_metadata_cache_key(*, condition_id: str = "", market_slug: str = "") -> str:
+        normalized_condition = str(condition_id or "").strip().lower()
+        if normalized_condition:
+            return f"condition:{normalized_condition}"
+        normalized_slug = str(market_slug or "").strip().lower()
+        if normalized_slug:
+            return f"slug:{normalized_slug}"
+        return ""
+
+    def _candidate_market_metadata(self, *, condition_id: str = "", market_slug: str = "") -> MarketMetadata | None:
+        cache_key = self._market_metadata_cache_key(condition_id=condition_id, market_slug=market_slug)
+        if not cache_key:
+            return None
+        now_ts = int(time.time())
+        cached = self._market_metadata_cache.get(cache_key)
+        if isinstance(cached, dict):
+            fetched_ts = int(cached.get("fetched_ts") or 0)
+            if fetched_ts > 0 and (now_ts - fetched_ts) <= _MARKET_METADATA_CACHE_TTL_SECONDS:
+                metadata = cached.get("metadata")
+                return metadata if isinstance(metadata, MarketMetadata) else None
+
+        getter = getattr(self.data_client, "get_market_metadata", None)
+        metadata: MarketMetadata | None = None
+        if callable(getter):
+            try:
+                metadata = getter(str(condition_id or "").strip(), slug=str(market_slug or "").strip() or None)
+            except Exception as exc:
+                self.log.debug(
+                    "Candidate market metadata enrich failed condition=%s slug=%s err=%s",
+                    condition_id,
+                    market_slug,
+                    exc,
+                )
+                metadata = None
+
+        self._market_metadata_cache[cache_key] = {
+            "fetched_ts": now_ts,
+            "metadata": metadata,
+        }
+        if metadata is not None:
+            if metadata.condition_id:
+                self._market_metadata_cache[self._market_metadata_cache_key(condition_id=metadata.condition_id)] = {
+                    "fetched_ts": now_ts,
+                    "metadata": metadata,
+                }
+            if metadata.market_slug:
+                self._market_metadata_cache[self._market_metadata_cache_key(market_slug=metadata.market_slug)] = {
+                    "fetched_ts": now_ts,
+                    "metadata": metadata,
+                }
+        return metadata
+
     def _candidate_market_context(
         self,
         token_id: str,
         *,
         price_hint: float,
         market_slug: str = "",
+        condition_id: str = "",
     ) -> dict[str, object]:
         now_ts = int(time.time())
         book = None
@@ -360,7 +530,19 @@ class Trader:
             self.log.debug("Candidate midpoint enrich failed token=%s err=%s", token_id, exc)
 
         history_points = self._candidate_price_history(token_id, now_ts=now_ts)
-        market_start_ts, market_window_seconds, market_end_ts = self._market_window_bounds(market_slug)
+        market_metadata = self._candidate_market_metadata(condition_id=condition_id, market_slug=market_slug)
+        legacy_market_start_ts, legacy_market_window_seconds, legacy_market_end_ts = self._market_window_bounds(market_slug)
+        market_start_ts = legacy_market_start_ts
+        market_window_seconds = legacy_market_window_seconds
+        market_end_ts = legacy_market_end_ts
+        market_time_source = "unknown"
+        if market_metadata is not None and market_metadata.end_ts is not None and market_metadata.end_ts > 0:
+            market_end_ts = int(market_metadata.end_ts)
+            market_time_source = "metadata"
+            if market_window_seconds is not None:
+                market_start_ts = market_end_ts - int(market_window_seconds)
+        elif market_end_ts is not None:
+            market_time_source = "slug_legacy"
 
         best_bid = float(book.best_bid) if book is not None and float(book.best_bid) > 0.0 else 0.0
         best_ask = float(book.best_ask) if book is not None and float(book.best_ask) > 0.0 else 0.0
@@ -378,10 +560,9 @@ class Trader:
         chase_pct = None
         if chase_ref > 0.0 and price_hint > 0.0:
             chase_pct = ((chase_ref - price_hint) / price_hint) * 100.0
-        market_remaining_seconds = None
+        market_remaining_seconds = market_end_ts - now_ts if market_end_ts is not None else None
         market_elapsed_ratio = None
         if market_start_ts is not None and market_window_seconds is not None and market_end_ts is not None:
-            market_remaining_seconds = market_end_ts - now_ts
             market_age_seconds = max(0, now_ts - market_start_ts)
             market_elapsed_ratio = min(1.0, max(0.0, market_age_seconds / max(1, market_window_seconds)))
 
@@ -398,8 +579,14 @@ class Trader:
             "market_window_seconds": market_window_seconds,
             "market_start_ts": market_start_ts,
             "market_end_ts": market_end_ts,
+            "market_end_date": str(market_metadata.end_date or "") if market_metadata is not None else "",
             "market_remaining_seconds": market_remaining_seconds,
             "market_elapsed_ratio": market_elapsed_ratio,
+            "market_closed": market_metadata.closed if market_metadata is not None else None,
+            "market_active": market_metadata.active if market_metadata is not None else None,
+            "market_accepting_orders": market_metadata.accepting_orders if market_metadata is not None else None,
+            "market_time_source": market_time_source,
+            "market_metadata_hit": market_metadata is not None,
         }
 
     def _candidate_price_history(self, token_id: str, *, now_ts: int) -> list[tuple[int, float]]:
@@ -556,6 +743,8 @@ class Trader:
         )
         has_live_ask = market_context.get("current_best_ask") not in (None, "")
         has_midpoint = market_context.get("current_midpoint") not in (None, "")
+        best_bid = float(market_context.get("current_best_bid") or 0.0)
+        best_ask = float(market_context.get("current_best_ask") or 0.0)
         spread_pct = float(market_context.get("spread_pct") or 0.0)
         chase_pct = float(market_context.get("chase_pct") or 0.0)
         momentum_5m = float(market_context.get("momentum_5m") or 0.0)
@@ -572,12 +761,21 @@ class Trader:
             if market_context.get("market_remaining_seconds") not in (None, "")
             else None
         )
+        market_closed = market_context.get("market_closed")
+        market_active = market_context.get("market_active")
+        market_accepting_orders = market_context.get("market_accepting_orders")
         if signal.side == "BUY" and existing:
             entry_wallet = str(existing.get("entry_wallet") or "").strip().lower()
             signal_wallet = str(signal.wallet or "").strip().lower()
             if entry_wallet and signal_wallet and entry_wallet != signal_wallet:
                 return "existing_position_conflict"
         if signal.side == "BUY":
+            if market_closed is True:
+                return "market_closed"
+            if market_active is False:
+                return "market_inactive"
+            if market_accepting_orders is False:
+                return "market_not_accepting_orders"
             if market_remaining_seconds is not None:
                 if market_remaining_seconds <= 0:
                     return "market_window_elapsed"
@@ -590,9 +788,13 @@ class Trader:
             max_spread_pct = float(self.settings.candidate_buy_max_spread_pct)
             spread_chase_guard_pct = float(self.settings.candidate_buy_spread_chase_guard_pct)
             max_chase_pct = float(self.settings.candidate_buy_max_chase_pct)
+            # Manual candidate review should not be polluted by obviously non-executable books.
+            hard_max_spread_pct = 50.0
+            if best_bid > 0.0 and best_ask > 0.0 and best_bid <= 0.005 and best_ask >= 0.995:
+                return "spread_too_wide"
             if chase_pct >= max_chase_pct:
                 return "chase_too_high"
-            if spread_pct >= max_spread_pct:
+            if spread_pct >= min(max_spread_pct, hard_max_spread_pct):
                 return "spread_too_wide"
             if spread_pct >= 12.0 and chase_pct >= spread_chase_guard_pct:
                 return "spread_too_wide"
@@ -643,41 +845,48 @@ class Trader:
         skip_reason: str | None,
         existing: Mapping[str, object] | None = None,
     ) -> str:
+        action_label = Trader._candidate_action_label(suggested_action, signal.side)
         if skip_reason == "market_data_unavailable":
-            return "当前没有可跟的卖盘，先观察避免撞空簿"
+            return i18n_t("runner.candidateRecommendation.marketDataUnavailable")
         if skip_reason == "market_window_elapsed":
-            return "该短周期市场已结束，旧信号不再跟"
+            return i18n_t("runner.candidateRecommendation.marketWindowElapsed")
         if skip_reason == "market_near_close":
-            return "短周期市场接近结束，先不追最后一段"
+            return i18n_t("runner.candidateRecommendation.marketNearClose")
+        if skip_reason == "market_closed":
+            return i18n_t("runner.candidateRecommendation.marketClosed")
+        if skip_reason == "market_inactive":
+            return i18n_t("runner.candidateRecommendation.marketInactive")
+        if skip_reason == "market_not_accepting_orders":
+            return i18n_t("runner.candidateRecommendation.marketNotAcceptingOrders")
         if skip_reason == "spread_too_wide":
-            return "盘口点差过宽，先观察"
+            return i18n_t("runner.candidateRecommendation.spreadTooWide")
         if skip_reason == "chase_too_high":
-            return "价格已被推远，追价风险偏高"
+            return i18n_t("runner.candidateRecommendation.chaseTooHigh")
         if skip_reason == "momentum_too_weak":
-            return "短线动量转弱，先等更好的入场"
+            return i18n_t("runner.candidateRecommendation.momentumTooWeak")
         if skip_reason == "existing_position_conflict":
-            return "当前同市场已有仓位，先避免重复暴露"
+            return i18n_t("runner.candidateRecommendation.existingPositionConflict")
         if signal.side == "SELL":
             if bool(signal.cross_wallet_exit):
-                return f"{int(signal.exit_wallet_count or 0)} 个钱包共振退出，优先减仓"
+                return i18n_t("runner.candidateRecommendation.sellCrossWalletExit", {"count": int(signal.exit_wallet_count or 0)})
             if float(signal.exit_fraction or 0.0) >= 0.95:
-                return "来源钱包基本清仓，优先跟随退出"
-            return "来源钱包在减仓，适合先减一部分"
+                return i18n_t("runner.candidateRecommendation.sellFullExit")
+            return i18n_t("runner.candidateRecommendation.sellPartialExit")
         if existing and float(existing.get("notional") or 0.0) > 0.0:
-            return "已有仓位在场，先观察是否需要继续加"
+            return i18n_t("runner.candidateRecommendation.existingPositionPresent")
         momentum_5m = float(market_context.get("momentum_5m") or 0.0)
         momentum_30m = float(market_context.get("momentum_30m") or 0.0)
         if signal.side == "BUY" and momentum_5m > 0.0 and momentum_30m > 0.0:
-            return f"5m/30m 动量都在走强，{suggested_action.replace('_', ' ')} 更顺势"
+            return i18n_t("runner.candidateRecommendation.buyMomentumStrong", {"action": action_label})
         if signal.side == "BUY" and momentum_5m < 0.0 and momentum_30m < 0.0:
-            return f"5m/30m 动量偏弱，{suggested_action.replace('_', ' ')} 前先小心"
+            return i18n_t("runner.candidateRecommendation.buyMomentumWeak", {"action": action_label})
         if suggested_action == "follow":
-            return f"分数 {score:.0f}，钱包等级高，可正常跟随"
+            return i18n_t("runner.candidateRecommendation.follow", {"score": f"{score:.0f}"})
         if suggested_action == "buy_normal":
-            return f"分数 {score:.0f}，机会较强，可常规仓位跟随"
+            return i18n_t("runner.candidateRecommendation.buyNormal", {"score": f"{score:.0f}"})
         if suggested_action == "buy_small":
-            return f"分数 {score:.0f}，有跟随价值，但更适合小仓试探"
-        return f"分数 {score:.0f}，先观察更多确认"
+            return i18n_t("runner.candidateRecommendation.buySmall", {"score": f"{score:.0f}"})
+        return i18n_t("runner.candidateRecommendation.watchDefault", {"score": f"{score:.0f}"})
 
     @staticmethod
     def _candidate_reason_factor(
@@ -721,8 +930,8 @@ class Trader:
         factors.append(
             self._candidate_reason_factor(
                 "wallet",
-                "钱包强度",
-                f"{wallet_tier} · {wallet_score:.1f}",
+                i18n_t("runner.candidateFactor.wallet.label"),
+                i18n_t("runner.candidateFactor.walletValue", {"tier": self._wallet_tier_label(wallet_tier), "score": f"{wallet_score:.1f}"}),
                 direction="bullish" if wallet_score >= 70.0 else "neutral",
                 weight=round((wallet_score - 50.0) / 10.0, 2),
                 detail=str(signal.wallet_score_summary or ""),
@@ -732,7 +941,7 @@ class Trader:
             factors.append(
                 self._candidate_reason_factor(
                     "confidence",
-                    "置信度",
+                    i18n_t("runner.candidateFactor.confidence.label"),
                     f"{confidence:.2f}",
                     direction="bullish" if confidence >= 0.75 else "neutral",
                     weight=round((confidence - 0.5) * 10.0, 2),
@@ -746,11 +955,52 @@ class Trader:
             factors.append(
                 self._candidate_reason_factor(
                     "topic",
-                    "题材偏向",
+                    i18n_t("runner.candidateFactor.topic.label"),
                     topic_label,
                     direction=topic_direction,
                     weight=round((float(signal.topic_multiplier or 1.0) - 1.0) * 10.0, 2),
                     detail=str(signal.topic_score_summary or ""),
+                )
+            )
+
+        market_closed = market_context.get("market_closed")
+        market_active = market_context.get("market_active")
+        market_accepting_orders = market_context.get("market_accepting_orders")
+        market_time_source = str(market_context.get("market_time_source") or "").strip()
+        market_remaining_seconds = market_context.get("market_remaining_seconds")
+        if signal.side == "BUY" and (
+            market_closed is True
+            or market_active is False
+            or market_accepting_orders is False
+            or market_time_source == "metadata"
+        ):
+            market_state_parts: list[str] = []
+            direction = "neutral"
+            weight = 0.0
+            if market_closed is True:
+                market_state_parts.append(i18n_t("runner.candidateFactor.marketState.closed"))
+                direction = "bearish"
+                weight = -12.0
+            elif market_active is False:
+                market_state_parts.append(i18n_t("runner.candidateFactor.marketState.inactive"))
+                direction = "bearish"
+                weight = -8.0
+            elif market_accepting_orders is False:
+                market_state_parts.append(i18n_t("runner.candidateFactor.marketState.acceptingOrdersFalse"))
+                direction = "bearish"
+                weight = -10.0
+            if market_time_source == "metadata":
+                market_state_parts.append(i18n_t("runner.candidateFactor.marketState.metadata"))
+            if market_remaining_seconds not in (None, ""):
+                market_state_parts.append(i18n_t("runner.candidateFactor.marketState.remainSeconds", {"seconds": int(market_remaining_seconds)}))
+            factors.append(
+                self._candidate_reason_factor(
+                    "market_state",
+                    i18n_t("runner.candidateFactor.marketState.label"),
+                    self._notification_separator().join(part for part in market_state_parts if part) or i18n_t("runner.candidateFactor.marketState.metadata"),
+                    direction=direction,
+                    weight=weight,
+                    detail=i18n_t("runner.candidateFactor.marketState.detail"),
                 )
             )
 
@@ -759,11 +1009,11 @@ class Trader:
             factors.append(
                 self._candidate_reason_factor(
                     "spread",
-                    "盘口点差",
+                    i18n_t("runner.candidateFactor.spread.label"),
                     f"{spread_pct:.2f}%",
                     direction="bearish" if spread_pct >= 6.0 else "neutral",
                     weight=round(-min(20.0, spread_pct * 1.1), 2),
-                    detail="点差越大，追价性价比越差",
+                    detail=i18n_t("runner.candidateFactor.spread.detail"),
                 )
             )
 
@@ -772,11 +1022,11 @@ class Trader:
             factors.append(
                 self._candidate_reason_factor(
                     "chase",
-                    "追价幅度",
+                    i18n_t("runner.candidateFactor.chase.label"),
                     f"{chase_pct:.2f}%",
                     direction="bearish" if chase_pct >= 4.0 else "neutral",
                     weight=round(-min(18.0, chase_pct * 1.4), 2),
-                    detail="当前买价相对源价格的抬升幅度",
+                    detail=i18n_t("runner.candidateFactor.chase.detail"),
                 )
             )
 
@@ -787,11 +1037,11 @@ class Trader:
             factors.append(
                 self._candidate_reason_factor(
                     "momentum",
-                    "价格动量",
+                    i18n_t("runner.candidateFactor.momentum.label"),
                     f"5m {momentum_5m:+.2f}% / 30m {momentum_30m:+.2f}%",
                     direction="bullish" if momentum_bias > 0.0 else "bearish" if momentum_bias < 0.0 else "neutral",
                     weight=round(momentum_bias * 0.45, 2),
-                    detail="动量用于判断是否顺势或逆势追单",
+                    detail=i18n_t("runner.candidateFactor.momentum.detail"),
                 )
             )
 
@@ -801,11 +1051,11 @@ class Trader:
             factors.append(
                 self._candidate_reason_factor(
                     "existing_position",
-                    "已有仓位",
+                    i18n_t("runner.candidateFactor.existingPosition.label"),
                     f"{current_notional:.2f}U",
                     direction=direction,
                     weight=-6.0 if skip_reason == "existing_position_conflict" else 0.0,
-                    detail=str(existing.get("entry_reason") or existing.get("reason") or "已有仓位在场"),
+                    detail=str(existing.get("entry_reason") or existing.get("reason") or i18n_t("runner.candidateFactor.existingPosition.detailDefault")),
                 )
             )
 
@@ -814,30 +1064,30 @@ class Trader:
             factors.append(
                 self._candidate_reason_factor(
                     "exit",
-                    "退出比例",
+                    i18n_t("runner.candidateFactor.exit.label"),
                     f"{exit_fraction * 100.0:.0f}%",
                     direction="bearish" if exit_fraction >= 0.95 or bool(signal.cross_wallet_exit) else "neutral",
                     weight=round(8.0 + exit_fraction * 10.0, 2),
-                    detail="卖出信号主要反映源钱包减仓或清仓",
+                    detail=i18n_t("runner.candidateFactor.exit.detail"),
                 )
             )
             if bool(signal.cross_wallet_exit):
                 factors.append(
                     self._candidate_reason_factor(
                         "resonance_exit",
-                        "共振退出",
-                        f"{int(signal.exit_wallet_count or 0)} wallets",
+                        i18n_t("runner.candidateFactor.resonanceExit.label"),
+                        i18n_t("runner.candidateFactor.resonanceExit.value", {"count": int(signal.exit_wallet_count or 0)}),
                         direction="bearish",
                         weight=min(10.0, float(signal.exit_wallet_count or 0) * 2.0),
-                        detail="多个钱包同步减仓时，退出优先级更高",
+                        detail=i18n_t("runner.candidateFactor.resonanceExit.detail"),
                     )
                 )
 
         factors.append(
             self._candidate_reason_factor(
                 "decision",
-                "建议动作",
-                suggested_action,
+                i18n_t("runner.candidateFactor.decision.label"),
+                self._candidate_action_label(suggested_action, signal.side),
                 direction="bullish" if suggested_action in {"follow", "buy_normal"} else "neutral",
                 weight=max(-2.0, min(10.0, score / 10.0 - 5.0)),
                 detail=self._candidate_recommendation_reason(
@@ -854,8 +1104,8 @@ class Trader:
             factors.append(
                 self._candidate_reason_factor(
                     "skip_reason",
-                    "忽略原因",
-                    skip_reason,
+                    i18n_t("runner.candidateFactor.skipReason.label"),
+                    self._reason_label(skip_reason),
                     direction="bearish",
                     weight=-10.0,
                     detail=self._candidate_recommendation_reason(
@@ -883,12 +1133,28 @@ class Trader:
     ) -> list[str]:
         notes: list[str] = []
         notes.append(
-            f"钱包 {str(signal.wallet_tier or 'WATCH').upper()} · {float(signal.wallet_score or 0.0):.1f} 分 · 置信度 {float(signal.confidence or 0.0):.2f}"
+            i18n_t(
+                "runner.candidateExplanation.walletSummary",
+                {
+                    "tier": Trader._wallet_tier_label(str(signal.wallet_tier or "WATCH")),
+                    "walletScore": f"{float(signal.wallet_score or 0.0):.1f}",
+                    "confidence": f"{float(signal.confidence or 0.0):.2f}",
+                },
+            )
         )
         topic_label = str(signal.topic_label or signal.topic_key or "").strip()
         if topic_label:
             topic_bias = str(signal.topic_bias or "neutral").strip()
-            notes.append(f"题材 {topic_label} · bias={topic_bias} · multiplier {float(signal.topic_multiplier or 1.0):.2f}")
+            notes.append(
+                i18n_t(
+                    "runner.candidateExplanation.topicSummary",
+                    {
+                        "topic": topic_label,
+                        "bias": i18n_humanize_identifier(topic_bias),
+                        "multiplier": f"{float(signal.topic_multiplier or 1.0):.2f}",
+                    },
+                )
+            )
         spread_pct = market_context.get("spread_pct")
         chase_pct = market_context.get("chase_pct")
         best_ask = market_context.get("current_best_ask")
@@ -897,61 +1163,98 @@ class Trader:
         history_points = int(market_context.get("history_points") or 0)
         market_bits: list[str] = []
         if midpoint not in (None, ""):
-            market_bits.append(f"mid {float(midpoint):.3f}")
+            market_bits.append(i18n_t("runner.candidateExplanation.marketBit.mid", {"value": f"{float(midpoint):.3f}"}))
         if best_ask not in (None, ""):
-            market_bits.append(f"ask {float(best_ask):.3f}")
+            market_bits.append(i18n_t("runner.candidateExplanation.marketBit.ask", {"value": f"{float(best_ask):.3f}"}))
         if best_bid not in (None, ""):
-            market_bits.append(f"bid {float(best_bid):.3f}")
+            market_bits.append(i18n_t("runner.candidateExplanation.marketBit.bid", {"value": f"{float(best_bid):.3f}"}))
         if spread_pct not in (None, ""):
-            market_bits.append(f"spread {float(spread_pct):.2f}%")
+            market_bits.append(i18n_t("runner.candidateExplanation.marketBit.spread", {"value": f"{float(spread_pct):.2f}%"}))
         if chase_pct not in (None, "") and signal.side == "BUY":
-            market_bits.append(f"chase {float(chase_pct):.2f}%")
+            market_bits.append(i18n_t("runner.candidateExplanation.marketBit.chase", {"value": f"{float(chase_pct):.2f}%"}))
         if market_bits:
-            notes.append("盘口 " + " · ".join(market_bits))
+            notes.append(i18n_t("runner.candidateExplanation.marketPrefix", {"bits": self._notification_separator().join(market_bits)}))
+        market_status_bits: list[str] = []
+        if market_context.get("market_closed") is True:
+            market_status_bits.append(i18n_t("runner.candidateExplanation.marketStatusBit.closed"))
+        elif market_context.get("market_active") is False:
+            market_status_bits.append(i18n_t("runner.candidateExplanation.marketStatusBit.inactive"))
+        elif market_context.get("market_accepting_orders") is False:
+            market_status_bits.append(i18n_t("runner.candidateExplanation.marketStatusBit.acceptingOrdersFalse"))
+        market_time_source = str(market_context.get("market_time_source") or "").strip()
+        if market_time_source:
+            market_status_bits.append(i18n_t("runner.candidateExplanation.marketStatusBit.timeSource", {"value": market_time_source}))
+        market_end_date = str(market_context.get("market_end_date") or "").strip()
+        if market_end_date:
+            market_status_bits.append(i18n_t("runner.candidateExplanation.marketStatusBit.endDate", {"value": market_end_date}))
+        market_remaining_seconds = market_context.get("market_remaining_seconds")
+        if market_remaining_seconds not in (None, ""):
+            market_status_bits.append(i18n_t("runner.candidateExplanation.marketStatusBit.remainSeconds", {"seconds": int(market_remaining_seconds)}))
+        if market_status_bits:
+            notes.append(i18n_t("runner.candidateExplanation.marketStatusPrefix", {"bits": self._notification_separator().join(market_status_bits)}))
         if history_points > 0:
             notes.append(
-                f"历史 {history_points} 个点 · 5m {float(market_context.get('momentum_5m') or 0.0):+.2f}%"
-                f" · 30m {float(market_context.get('momentum_30m') or 0.0):+.2f}%"
+                i18n_t(
+                    "runner.candidateExplanation.historyMomentum",
+                    {
+                        "points": history_points,
+                        "momentum5m": f"{float(market_context.get('momentum_5m') or 0.0):+.2f}%",
+                        "momentum30m": f"{float(market_context.get('momentum_30m') or 0.0):+.2f}%",
+                    },
+                )
             )
         momentum_5m = float(market_context.get("momentum_5m") or 0.0)
         momentum_30m = float(market_context.get("momentum_30m") or 0.0)
         if momentum_5m > 0.0 and momentum_30m > 0.0:
-            notes.append("趋势 5m/30m 一致偏强")
+            notes.append(i18n_t("runner.candidateExplanation.trendStrong"))
         elif momentum_5m < 0.0 and momentum_30m < 0.0:
-            notes.append("趋势 5m/30m 一致偏弱")
+            notes.append(i18n_t("runner.candidateExplanation.trendWeak"))
         if existing and float(existing.get("notional") or 0.0) > 0.0:
             notes.append(
-                f"当前已有仓位 {float(existing.get('notional') or 0.0):.2f}U"
-                + (
-                    f" · 来源 {str(existing.get('entry_wallet_tier') or '').upper()}"
-                    if str(existing.get('entry_wallet_tier') or "").strip()
-                    else ""
+                i18n_t(
+                    "runner.candidateExplanation.existingPosition",
+                    {
+                        "notional": f"{float(existing.get('notional') or 0.0):.2f}U",
+                        "sourceSuffix": (
+                            i18n_t(
+                                "runner.candidateExplanation.existingSourceSuffix",
+                                {"tier": Trader._wallet_tier_label(str(existing.get("entry_wallet_tier") or ""))},
+                            )
+                            if str(existing.get("entry_wallet_tier") or "").strip()
+                            else ""
+                        ),
+                    },
                 )
             )
         if bool(signal.cross_wallet_exit):
-            notes.append(f"多钱包共振退出 {int(signal.exit_wallet_count or 0)} 个钱包")
+            notes.append(i18n_t("runner.candidateExplanation.sellCrossWalletExit", {"count": int(signal.exit_wallet_count or 0)}))
         elif signal.side == "SELL" and float(signal.exit_fraction or 0.0) > 0.0:
-            notes.append(f"退出比例 {float(signal.exit_fraction or 0.0) * 100.0:.0f}%")
+            notes.append(i18n_t("runner.candidateExplanation.sellExitFraction", {"fraction": f"{float(signal.exit_fraction or 0.0) * 100.0:.0f}%"}))
         elif signal.side == "BUY":
-            notes.append(f"观察金额 {float(signal.observed_notional or 0.0):.2f}U · 动作 {str(signal.position_action_label or signal.position_action or '')}")
-        if skip_reason:
             notes.append(
-                "建议先不追："
-                + Trader._candidate_recommendation_reason(
-                    signal,
-                    market_context=market_context,
-                    score=score,
-                    suggested_action=suggested_action,
-                    skip_reason=skip_reason,
-                    existing=existing,
+                i18n_t(
+                    "runner.candidateExplanation.buyObservedNotional",
+                    {
+                        "notional": f"{float(signal.observed_notional or 0.0):.2f}U",
+                        "action": str(signal.position_action_label or Trader._candidate_action_label(signal.position_action, signal.side) or ""),
+                    },
                 )
             )
+        if skip_reason:
+            notes.append(i18n_t("runner.candidateExplanation.skipPrefix", {"reason": Trader._candidate_recommendation_reason(
+                signal,
+                market_context=market_context,
+                score=score,
+                suggested_action=suggested_action,
+                skip_reason=skip_reason,
+                existing=existing,
+            )}))
         else:
-            notes.append(f"建议动作 {suggested_action} · 综合分 {score:.0f}")
+            notes.append(i18n_t("runner.candidateExplanation.decisionSummary", {"action": Trader._candidate_action_label(suggested_action, signal.side), "score": f"{score:.0f}"}))
         if signal.side == "BUY" and momentum_5m > 0.0 and momentum_30m > 0.0:
-            notes.append("短线动量一致偏强，追价压力相对更低")
+            notes.append(i18n_t("runner.candidateExplanation.buyMomentumStrong"))
         elif signal.side == "BUY" and momentum_5m < 0.0 and momentum_30m < 0.0:
-            notes.append("短线动量一致偏弱，先别急着追")
+            notes.append(i18n_t("runner.candidateExplanation.buyMomentumWeak"))
         return notes
 
     def _candidate_from_signal(
@@ -969,6 +1272,7 @@ class Trader:
                 signal.token_id,
                 price_hint=float(signal.price_hint or 0.0),
                 market_slug=str(signal.market_slug or ""),
+                condition_id=str(signal.condition_id or ""),
             )
         score = self._candidate_score_from_signal(signal, market_context)
         skip_reason = self._candidate_skip_reason(signal, market_context, existing=existing)
@@ -1008,6 +1312,7 @@ class Trader:
         market_end_ts = market_context.get("market_end_ts")
         if market_end_ts not in (None, ""):
             expires_ts = min(expires_ts, int(market_end_ts))
+        status = "watched" if skip_reason or suggested_action == "watch" else "pending"
         return Candidate(
             id=str(signal.signal_id or ""),
             signal_id=str(signal.signal_id or ""),
@@ -1033,6 +1338,8 @@ class Trader:
             momentum_5m=market_context.get("momentum_5m"),  # type: ignore[arg-type]
             momentum_30m=market_context.get("momentum_30m"),  # type: ignore[arg-type]
             chase_pct=market_context.get("chase_pct"),  # type: ignore[arg-type]
+            market_time_source=str(market_context.get("market_time_source") or "unknown"),
+            market_metadata_hit=bool(market_context.get("market_metadata_hit", False)),
             market_tag=str(signal.topic_label or signal.topic_key or ""),
             resolution_bucket=str(signal.topic_bias or ""),
             confidence=float(signal.confidence or 0.0),
@@ -1045,6 +1352,7 @@ class Trader:
             has_existing_position=existing is not None and float(existing.get("notional") or 0.0) > 0.0,
             existing_position_conflict=skip_reason == "existing_position_conflict",
             existing_position_notional=float((existing or {}).get("notional") or 0.0),
+            status=status,
             created_ts=created_ts,
             expires_ts=expires_ts,
             updated_ts=now,
@@ -1118,6 +1426,7 @@ class Trader:
                 signal.token_id,
                 price_hint=float(signal.price_hint or 0.0),
                 market_slug=str(signal.market_slug or ""),
+                condition_id=str(signal.condition_id or ""),
             )
             refreshed_candidate = self._candidate_from_signal(
                 signal,
@@ -1187,6 +1496,312 @@ class Trader:
             return False
         return True
 
+    def _notifier_channels(self, *, include_local: bool = True) -> list[str]:
+        if self.notifier is None:
+            return []
+        channels: list[str] = []
+        if (
+            include_local
+            and bool(getattr(self.settings, "notify_local_enabled", True))
+            and bool(getattr(self.notifier, "local_available", lambda: False)())
+        ):
+            channels.append("local")
+        if bool(getattr(self.notifier, "webhook_targets", lambda: [])()):
+            channels.append("webhook")
+        if bool(getattr(self.notifier, "telegram_available", lambda: False)()):
+            channels.append("telegram")
+        return channels
+
+    @staticmethod
+    def _notification_i18n_extra(
+        *,
+        title_key: str,
+        title_params: Mapping[str, object] | None = None,
+        body_key: str,
+        body_params: Mapping[str, object] | None = None,
+    ) -> dict[str, object]:
+        return {
+            "i18n": {
+                "title_key": title_key,
+                "title_params": dict(title_params or {}),
+                "body_key": body_key,
+                "body_params": dict(body_params or {}),
+            }
+        }
+
+    @staticmethod
+    def _notification_separator() -> str:
+        return i18n_t("common.separator", fallback=" · ")
+
+    @staticmethod
+    def _wallet_tier_label(value: object) -> str:
+        raw = str(value or "").strip()
+        return i18n_label("enum.walletTier", raw or "unknown", fallback=(raw.upper() if raw else i18n_t("enum.walletTier.unknown")))
+
+    @staticmethod
+    def _candidate_action_label(value: object, side: object | None = None) -> str:
+        raw = str(value or "").strip().lower()
+        if raw == "follow" and str(side or "").strip().upper() == "SELL":
+            raw = "follow_sell"
+        return i18n_enum_label("enum.candidateAction", raw or "default", fallback=i18n_humanize_identifier(raw or "default"))
+
+    @staticmethod
+    def _action_tag_label(value: object) -> str:
+        raw = str(value or "").strip().lower()
+        return i18n_enum_label("enum.actionTag", raw or "event", fallback=i18n_humanize_identifier(raw or "event"))
+
+    @staticmethod
+    def _exit_kind_label(value: object) -> str:
+        raw = str(value or "").strip().lower()
+        return i18n_enum_label("enum.exitKind", raw or "entry", fallback=i18n_humanize_identifier(raw or "entry"))
+
+    @staticmethod
+    def _exit_result_label(value: object) -> str:
+        raw = str(value or "").strip().lower()
+        if raw == "pending":
+            return i18n_t("orders.status.pending")
+        return i18n_enum_label("enum.exitResult", raw or "unknown", fallback=i18n_humanize_identifier(raw or "unknown"))
+
+    @staticmethod
+    def _reason_label(value: object) -> str:
+        raw = str(value or "").strip()
+        if not raw:
+            return ""
+        return i18n_enum_label("enum.reason", raw, fallback=i18n_humanize_identifier(raw))
+
+    def _format_notification_issue(self, issue: object) -> str:
+        raw = str(issue or "").strip()
+        if not raw:
+            return ""
+        match = re.match(r"^([A-Za-z0-9_]+)=(.*)$", raw)
+        if not match:
+            return self._reason_label(raw)
+        metric_name = str(match.group(1) or "").strip()
+        metric_value = str(match.group(2) or "").strip()
+        label = i18n_label("metric", metric_name, fallback=i18n_humanize_identifier(metric_name))
+        translated_value = metric_value
+        normalized_metric = metric_name.lower()
+        if normalized_metric in {"status", "reconciliation_status"}:
+            translated_value = i18n_enum_label("enum.reportStatus", metric_value.lower(), fallback=i18n_humanize_identifier(metric_value))
+        elif normalized_metric in {"reason", "primary_reason"}:
+            translated_value = self._reason_label(metric_value)
+        elif normalized_metric == "reasons":
+            translated_value = self._notification_separator().join(
+                part for part in (self._reason_label(piece) for piece in metric_value.split(",")) if part
+            ) or metric_value
+        return i18n_t(
+            "common.kvInline",
+            {"label": label, "value": translated_value or metric_value},
+            fallback=f"{label}={translated_value or metric_value}",
+        )
+
+    def _format_notification_issues(self, issues: list[object]) -> str:
+        parts = [self._format_notification_issue(item) for item in list(issues or [])[:3] if str(item or "").strip()]
+        return self._notification_separator().join(part for part in parts if part) or i18n_t(
+            "notification.tradingMode.reconciliationProtect.defaultIssues"
+        )
+
+    def _format_reason_codes(self, reasons: set[str]) -> str:
+        parts = [self._reason_label(reason) for reason in sorted(reasons) if str(reason or "").strip()]
+        return self._notification_separator().join(part for part in parts if part) or self._reason_label("unknown")
+
+    def _notify_critical_condition(
+        self,
+        *,
+        key: str,
+        title: str,
+        body: str,
+        extra: Mapping[str, object] | None = None,
+        now: int | None = None,
+    ) -> bool:
+        if self.notifier is None or not bool(getattr(self.settings, "critical_notification_enabled", True)):
+            return False
+        channels = self._notifier_channels()
+        if not channels:
+            return False
+        now_ts = int(now or time.time())
+        cooldown_seconds = max(
+            30,
+            int(getattr(self.settings, "critical_notification_cooldown_seconds", 900) or 900),
+        )
+        last_ts = int(self._critical_notification_watermarks.get(key) or 0)
+        if last_ts > 0 and (now_ts - last_ts) < cooldown_seconds:
+            return False
+        try:
+            self.notifier.notify_all(
+                title=title,
+                body=body,
+                extra=dict(extra or {}),
+                channels=channels,
+            )
+        except Exception as exc:
+            self.log.warning("Failed to send critical notification key=%s err=%s", key, exc)
+            return False
+        self._critical_notification_watermarks[key] = now_ts
+        return True
+
+    def _maybe_notify_trading_mode_alert(
+        self,
+        *,
+        trading_mode_state: Mapping[str, object],
+        reconciliation: Mapping[str, object] | None = None,
+        now: int | None = None,
+    ) -> None:
+        now_ts = int(now or time.time())
+        mode = str(trading_mode_state.get("mode") or "NORMAL").upper() or "NORMAL"
+        reasons = {str(value or "").strip() for value in trading_mode_state.get("reason_codes", []) if str(value or "").strip()}
+        if mode == "NORMAL":
+            return
+
+        reconciliation_payload = dict(reconciliation or {})
+        reconciliation_status = str(reconciliation_payload.get("status") or self.reconciliation_status or "unknown").lower()
+        ambiguous_pending_orders = int(reconciliation_payload.get("ambiguous_pending_orders") or 0)
+        issues = list(reconciliation_payload.get("issues") or [])
+        mode_label = i18n_enum_label("enum.trading_mode", mode.lower(), fallback=mode)
+
+        if "persistence_fault" in reasons:
+            failure = dict(self.last_persistence_failure or {})
+            title_params = {"mode": mode_label}
+            body_params = {
+                "mode": mode_label,
+                "kind": i18n_humanize_identifier(str(failure.get("kind") or "unknown")),
+                "path": str(failure.get("path") or "--"),
+                "error": str(failure.get("message") or i18n_t("notification.tradingMode.persistenceFault.errorUnknown")),
+            }
+            title = i18n_t("notification.tradingMode.persistenceFault.title", title_params)
+            body = i18n_t("notification.tradingMode.persistenceFault.body", body_params)
+            self._notify_critical_condition(
+                key=f"persistence_fault:{str(failure.get('kind') or 'unknown')}",
+                title=title,
+                body=body,
+                extra={
+                    "mode": mode,
+                    "reason_codes": sorted(reasons),
+                    "persistence": self.persistence_state(),
+                    **self._notification_i18n_extra(
+                        title_key="notification.tradingMode.persistenceFault.title",
+                        title_params=title_params,
+                        body_key="notification.tradingMode.persistenceFault.body",
+                        body_params=body_params,
+                    ),
+                },
+                now=now_ts,
+            )
+
+        if "startup_not_ready" in reasons:
+            title_params = {"mode": mode_label}
+            body_params = {
+                "failures": int(self.startup_failure_count or 0),
+                "warnings": int(self.startup_warning_count or 0),
+            }
+            title = i18n_t("notification.tradingMode.startupGateBlocked.title", title_params)
+            body = i18n_t("notification.tradingMode.startupGateBlocked.body", body_params)
+            self._notify_critical_condition(
+                key="startup_gate_blocked",
+                title=title,
+                body=body,
+                extra={
+                    "mode": mode,
+                    "reason_codes": sorted(reasons),
+                    "startup_failure_count": int(self.startup_failure_count or 0),
+                    "startup_warning_count": int(self.startup_warning_count or 0),
+                    **self._notification_i18n_extra(
+                        title_key="notification.tradingMode.startupGateBlocked.title",
+                        title_params=title_params,
+                        body_key="notification.tradingMode.startupGateBlocked.body",
+                        body_params=body_params,
+                    ),
+                },
+                now=now_ts,
+            )
+
+        if "account_state_unknown" in reasons or "account_state_stale" in reasons:
+            title_params = {"mode": mode_label}
+            body_params = {
+                "accountState": i18n_enum_label("enum.accountState", str(self.account_state_status or "unknown"), fallback=i18n_humanize_identifier(str(self.account_state_status or "unknown"))),
+            }
+            title = i18n_t("notification.tradingMode.accountStateProtect.title", title_params)
+            body = i18n_t("notification.tradingMode.accountStateProtect.body", body_params)
+            self._notify_critical_condition(
+                key=f"account_state:{str(self.account_state_status or 'unknown')}",
+                title=title,
+                body=body,
+                extra={
+                    "mode": mode,
+                    "reason_codes": sorted(reasons),
+                    "account_state_status": str(self.account_state_status or "unknown"),
+                    **self._notification_i18n_extra(
+                        title_key="notification.tradingMode.accountStateProtect.title",
+                        title_params=title_params,
+                        body_key="notification.tradingMode.accountStateProtect.body",
+                        body_params=body_params,
+                    ),
+                },
+                now=now_ts,
+            )
+
+        if (
+            "reconciliation_fail" in reasons
+            or "reconciliation_warn" in reasons
+            or ambiguous_pending_orders > 0
+        ):
+            issue_text = self._format_notification_issues(issues)
+            title_params = {"mode": mode_label}
+            body_params = {
+                "status": i18n_enum_label("enum.reportStatus", reconciliation_status or "unknown", fallback=i18n_humanize_identifier(reconciliation_status or "unknown")),
+                "ambiguousPendingOrders": ambiguous_pending_orders,
+                "issues": issue_text,
+            }
+            title = i18n_t("notification.tradingMode.reconciliationProtect.title", title_params)
+            body = i18n_t("notification.tradingMode.reconciliationProtect.body", body_params)
+            self._notify_critical_condition(
+                key=(
+                    "reconciliation:"
+                    f"{reconciliation_status or 'unknown'}:"
+                    f"{1 if ambiguous_pending_orders > 0 else 0}"
+                ),
+                title=title,
+                body=body,
+                extra={
+                    "mode": mode,
+                    "reason_codes": sorted(reasons),
+                    "reconciliation": reconciliation_payload,
+                    **self._notification_i18n_extra(
+                        title_key="notification.tradingMode.reconciliationProtect.title",
+                        title_params=title_params,
+                        body_key="notification.tradingMode.reconciliationProtect.body",
+                        body_params=body_params,
+                    ),
+                },
+                now=now_ts,
+            )
+
+        if mode == "HALTED" and "persistence_fault" not in reasons:
+            primary_reason = next(iter(sorted(reasons)), "unknown")
+            title_params = {}
+            body_params = {
+                "primaryReason": self._reason_label(primary_reason),
+                "reasons": self._format_reason_codes(reasons),
+            }
+            title = i18n_t("notification.tradingMode.haltedTradingStopped.title", title_params)
+            body = i18n_t("notification.tradingMode.haltedTradingStopped.body", body_params)
+            self._notify_critical_condition(
+                key=f"halted:{primary_reason}",
+                title=title,
+                body=body,
+                extra={
+                    "mode": mode,
+                    "reason_codes": sorted(reasons),
+                    **self._notification_i18n_extra(
+                        title_key="notification.tradingMode.haltedTradingStopped.title",
+                        title_params=title_params,
+                        body_key="notification.tradingMode.haltedTradingStopped.body",
+                        body_params=body_params,
+                    ),
+                },
+                now=now_ts,
+            )
+
     def _notify_candidates(self, candidates: list[Candidate]) -> None:
         if not candidates or self.notifier is None:
             return
@@ -1199,19 +1814,33 @@ class Trader:
             last_ts = int(self._candidate_notification_watermarks.get(key) or 0)
             if last_ts > 0 and (now - last_ts) < cooldown_seconds:
                 continue
-            title = f"{candidate.suggested_action.upper()} · {candidate.market_slug or candidate.token_id}"
-            wallet_label = str(candidate.wallet_tag or candidate.wallet_tier or "WATCH").upper()
-            body_parts = [
-                f"{wallet_label} 钱包 {float(candidate.wallet_score or 0.0):.1f} 分",
-                f"{candidate.outcome or '--'} · {float(candidate.observed_notional or 0.0):.2f}U",
-            ]
-            if candidate.spread_pct is not None:
-                body_parts.append(f"spread {float(candidate.spread_pct):.2f}%")
-            if candidate.chase_pct is not None:
-                body_parts.append(f"chase {float(candidate.chase_pct):.2f}%")
-            if candidate.recommendation_reason:
-                body_parts.append(str(candidate.recommendation_reason))
-            body = " | ".join(part for part in body_parts if part)
+            action_value = str(candidate.suggested_action or "").strip().lower()
+            if action_value == "follow" and str(candidate.side or "").upper() == "SELL":
+                action_value = "follow_sell"
+            action_label = i18n_enum_label("enum.candidateAction", action_value, fallback=str(candidate.suggested_action or "").upper())
+            wallet_label = str(candidate.wallet_tag or "").strip() or i18n_label(
+                "enum.walletTier",
+                str(candidate.wallet_tier or "WATCH"),
+                fallback=str(candidate.wallet_tier or "WATCH").upper(),
+            )
+            title_params = {
+                "action": action_label,
+                "market": candidate.market_slug or candidate.token_id or "-",
+            }
+            spread_text = i18n_t("notification.candidate.spread", {"value": f"{float(candidate.spread_pct):.2f}"}) if candidate.spread_pct is not None else ""
+            chase_text = i18n_t("notification.candidate.chase", {"value": f"{float(candidate.chase_pct):.2f}"}) if candidate.chase_pct is not None else ""
+            reason_text = i18n_t("notification.candidate.reason", {"value": str(candidate.recommendation_reason or "")}) if candidate.recommendation_reason else ""
+            body_params = {
+                "walletLabel": wallet_label,
+                "walletScore": f"{float(candidate.wallet_score or 0.0):.1f}",
+                "outcome": candidate.outcome or "--",
+                "notional": f"{float(candidate.observed_notional or 0.0):.2f}",
+                "spread": spread_text,
+                "chase": chase_text,
+                "reason": reason_text,
+            }
+            title = i18n_t("notification.candidate.title", title_params)
+            body = i18n_t("notification.candidate.body", body_params)
             extra = {
                 "candidate_id": candidate.id,
                 "wallet": candidate.wallet,
@@ -1219,20 +1848,21 @@ class Trader:
                 "token_id": candidate.token_id,
                 "suggested_action": candidate.suggested_action,
                 "score": candidate.score,
+                **self._notification_i18n_extra(
+                    title_key="notification.candidate.title",
+                    title_params=title_params,
+                    body_key="notification.candidate.body",
+                    body_params=body_params,
+                ),
             }
+            channels = self._notifier_channels()
+            if not channels:
+                continue
             self.notifier.notify_all(
                 title=title,
                 body=body,
                 extra=extra,
-                channels=[
-                    channel
-                    for channel, enabled in (
-                        ("local", bool(getattr(self.settings, "notify_local_enabled", True))),
-                        ("webhook", bool(getattr(self.notifier, "webhook_targets", lambda: [])())),
-                        ("telegram", bool(getattr(self.notifier, "telegram_available", lambda: False)())),
-                    )
-                    if enabled
-                ],
+                channels=channels,
             )
             self._candidate_notification_watermarks[key] = now
 
@@ -1455,19 +2085,20 @@ class Trader:
         self.state.broker_closed_pnl_today = 0.0
 
     def _append_ledger_entry(self, entry_type: str, payload: dict[str, object]) -> None:
-        path = str(self.settings.ledger_path or "").strip()
+        path = str(Path(str(self.settings.ledger_path or "").strip()).expanduser())
         if not path:
             return
         try:
             append_ledger_entry(path, entry_type, payload, broker=type(self.broker).__name__)
         except Exception as exc:
             self.log.warning("Failed to append ledger path=%s err=%s", path, exc)
+            self._record_persistence_fault(kind="ledger_append", path=path, error=exc)
 
     def _ledger_broker_name(self) -> str:
         return type(self.broker).__name__
 
     def _recover_daily_realized_pnl_from_ledger(self, day_key: str) -> float | None:
-        path = str(self.settings.ledger_path or "").strip()
+        path = str(Path(str(self.settings.ledger_path or "").strip()).expanduser())
         if not path:
             return None
         try:
@@ -1490,7 +2121,7 @@ class Trader:
             return None
 
     def _ledger_day_summary(self, day_key: str) -> dict[str, object]:
-        path = str(self.settings.ledger_path or "").strip()
+        path = str(Path(str(self.settings.ledger_path or "").strip()).expanduser())
         summary = {
             "available": False,
             "path": path,
@@ -1600,6 +2231,37 @@ class Trader:
             return
         self._roll_daily_state_if_needed(ts)
         self.state.daily_realized_pnl += realized_pnl
+
+    def _apply_reconciled_realized_pnl(
+        self,
+        realized_pnl: float,
+        *,
+        fill_ts: int,
+        now: int,
+    ) -> None:
+        if abs(realized_pnl) <= 1e-9:
+            return
+        applied_ts = int(fill_ts or now or time.time())
+        fill_day_key = self._utc_day_key(applied_ts)
+        current_day_key = self._utc_day_key(now)
+        if fill_day_key != current_day_key:
+            self.log.warning(
+                "Late fill reconciled for prior day fill_day=%s current_day=%s realized_pnl=%.6f",
+                fill_day_key,
+                current_day_key,
+                realized_pnl,
+            )
+            self._append_event(
+                "late_fill_prior_day",
+                {
+                    "fill_day_key": fill_day_key,
+                    "current_day_key": current_day_key,
+                    "fill_ts": applied_ts,
+                    "realized_pnl": realized_pnl,
+                },
+            )
+            return
+        self._apply_realized_pnl(realized_pnl, ts=applied_ts)
 
     @staticmethod
     def _is_missing_orderbook_message(message: object) -> bool:
@@ -1757,7 +2419,7 @@ class Trader:
         self._refresh_risk_state()
 
     def _append_event(self, event_type: str, payload: dict[str, object]) -> None:
-        path = self.settings.event_log_path
+        path = str(Path(str(self.settings.event_log_path or "").strip()).expanduser())
         if not path:
             return
 
@@ -1798,7 +2460,10 @@ class Trader:
         return payload
 
     def _network_smoke_startup_check(self) -> dict[str, object]:
-        path = os.getenv("NETWORK_SMOKE_LOG", "/tmp/poly_network_smoke.jsonl")
+        path = os.getenv(
+            "NETWORK_SMOKE_LOG",
+            getattr(self.settings, "network_smoke_log_path", "/tmp/poly_network_smoke.jsonl"),
+        )
         max_age_seconds = max(60, int(getattr(self.settings, "live_network_smoke_max_age_seconds", 43200) or 43200))
         try:
             with open(path, "r", encoding="utf-8") as f:
@@ -1978,6 +2643,11 @@ class Trader:
             for order in self.pending_orders.values()
             if (now_ts - int(order.get("ts") or now_ts)) >= self._pending_timeout_seconds()
         )
+        ambiguous_pending_orders = sum(
+            1
+            for order in self.pending_orders.values()
+            if int(order.get("reconcile_ambiguous_ts") or 0) > 0
+        )
         tolerance_usd = max(0.01, self.settings.bankroll_usd * 0.0025)
         issues: list[str] = []
         status = "ok"
@@ -1991,6 +2661,10 @@ class Trader:
             if status != "fail":
                 status = "warn"
             issues.append(f"stale_pending_orders={stale_pending_orders}")
+        if ambiguous_pending_orders > 0:
+            if status != "fail":
+                status = "warn"
+            issues.append(f"ambiguous_pending_orders={ambiguous_pending_orders}")
         if (
             not self.settings.dry_run
             and account_snapshot_age_seconds > max(600, int(self.settings.account_sync_refresh_seconds) * 2)
@@ -2039,6 +2713,7 @@ class Trader:
             "pending_entry_orders": int(self.state.pending_entry_orders),
             "pending_exit_orders": int(pending_exit_orders),
             "stale_pending_orders": int(stale_pending_orders),
+            "ambiguous_pending_orders": int(ambiguous_pending_orders),
             "open_positions": int(self.state.open_positions),
             "tracked_notional_usd": float(self.state.tracked_notional_usd),
             "ledger_available": bool(ledger_summary.get("available")),
@@ -2046,6 +2721,188 @@ class Trader:
             "broker_reconcile_age_seconds": int(broker_reconcile_age_seconds),
             "broker_event_sync_age_seconds": int(broker_event_sync_age_seconds),
         }
+
+    def _account_state_status(self, *, now: int | None = None) -> str:
+        if self.settings.dry_run:
+            return "fresh"
+        if not str(self.settings.funder_address or "").strip():
+            return "unknown"
+
+        snapshot_ts = int(self.state.account_snapshot_ts or 0)
+        if snapshot_ts <= 0:
+            return "unknown"
+
+        now_ts = int(now or time.time())
+        snapshot_age_seconds = max(0, now_ts - snapshot_ts)
+        stale_after_seconds = max(600, int(self.settings.account_sync_refresh_seconds) * 2)
+        if snapshot_age_seconds > stale_after_seconds:
+            return "stale"
+        return "fresh"
+
+    def persistence_state(self) -> dict[str, object]:
+        return {
+            "status": str(self.persistence_status or "ok"),
+            "failure_count": int(self.persistence_failure_count or 0),
+            "last_failure": dict(self.last_persistence_failure),
+        }
+
+    def _record_persistence_fault(
+        self,
+        *,
+        kind: str,
+        path: str,
+        error: object,
+        now: int | None = None,
+    ) -> dict[str, object]:
+        fault_ts = int(now or time.time())
+        message = str(error or "").strip() or "unknown persistence failure"
+        self.persistence_status = "fault"
+        self.persistence_failure_count = int(self.persistence_failure_count or 0) + 1
+        self.last_persistence_failure = {
+            "kind": str(kind or ""),
+            "path": str(path or ""),
+            "message": message,
+            "ts": fault_ts,
+        }
+        self.log.error(
+            "PERSISTENCE_FAULT kind=%s path=%s err=%s count=%d",
+            kind,
+            path,
+            message,
+            self.persistence_failure_count,
+        )
+        payload = self.persistence_state()
+        self._append_event("persistence_fault", payload)
+        self._update_trading_mode(self.control_state, now=fault_ts)
+        self._refresh_risk_state()
+        return payload
+
+    def record_external_persistence_fault(self, kind: str, path: str, error: object) -> dict[str, object]:
+        return self._record_persistence_fault(kind=kind, path=path, error=error)
+
+    def trading_mode_state(self) -> dict[str, object]:
+        mode = str(self.trading_mode or "NORMAL").upper() or "NORMAL"
+        return {
+            "mode": mode,
+            "opening_allowed": mode == "NORMAL",
+            "reason_codes": list(self.trading_mode_reasons),
+            "updated_ts": int(self.trading_mode_updated_ts or 0),
+            "source": "runner",
+            "account_state_status": str(self.account_state_status or "unknown"),
+            "reconciliation_status": str(self.reconciliation_status or "unknown"),
+            "persistence_status": str(self.persistence_status or "ok"),
+        }
+
+    def _update_trading_mode(
+        self,
+        control: ControlState,
+        *,
+        now: int | None = None,
+        reconciliation: dict[str, object] | None = None,
+    ) -> dict[str, object]:
+        now_ts = int(now or time.time())
+        reconciliation_payload = dict(reconciliation or self.reconciliation_summary(now=now_ts))
+        reconciliation_status = str(reconciliation_payload.get("status") or "unknown").strip().lower() or "unknown"
+        account_state_status = self._account_state_status(now=now_ts)
+
+        reason_codes: list[str] = []
+        if bool(control.emergency_stop):
+            reason_codes.append("operator_emergency_stop")
+        if bool(control.pause_opening):
+            reason_codes.append("operator_pause_opening")
+        if bool(control.reduce_only):
+            reason_codes.append("operator_reduce_only")
+        if not self.startup_ready:
+            reason_codes.append("startup_not_ready")
+        if account_state_status == "unknown":
+            reason_codes.append("account_state_unknown")
+        elif account_state_status == "stale":
+            reason_codes.append("account_state_stale")
+        if reconciliation_status == "fail":
+            reason_codes.append("reconciliation_fail")
+        elif reconciliation_status == "warn":
+            reason_codes.append("reconciliation_warn")
+        if str(self.persistence_status or "ok") != "ok":
+            reason_codes.append("persistence_fault")
+
+        mode = "NORMAL"
+        if reason_codes:
+            mode = "REDUCE_ONLY"
+        if str(self.persistence_status or "ok") != "ok":
+            mode = "HALTED"
+        if bool(control.emergency_stop):
+            mode = "HALTED"
+
+        signature = (
+            mode,
+            tuple(reason_codes),
+            account_state_status,
+            reconciliation_status,
+            str(self.persistence_status or "ok"),
+        )
+        self.trading_mode = mode
+        self.trading_mode_reasons = list(reason_codes)
+        self.trading_mode_updated_ts = now_ts
+        self.account_state_status = account_state_status
+        self.reconciliation_status = reconciliation_status
+        if signature != self._last_trading_mode_signature:
+            self._last_trading_mode_signature = signature
+            trading_mode_state = self.trading_mode_state()
+            self._append_event("trading_mode", trading_mode_state)
+            log_level = self.log.warning if mode != "NORMAL" else self.log.info
+            log_level(
+                "TRADING_MODE mode=%s opening_allowed=%s reasons=%s account_state=%s reconciliation=%s",
+                trading_mode_state["mode"],
+                trading_mode_state["opening_allowed"],
+                ",".join(trading_mode_state["reason_codes"]) or "none",
+                trading_mode_state["account_state_status"],
+                trading_mode_state["reconciliation_status"],
+            )
+            self._maybe_notify_trading_mode_alert(
+                trading_mode_state=trading_mode_state,
+                reconciliation=reconciliation_payload,
+                now=now_ts,
+            )
+        return self.trading_mode_state()
+
+    def _buy_gate_reason(self) -> str:
+        if str(self.trading_mode or "NORMAL").upper() == "NORMAL":
+            return ""
+        for reason in self.trading_mode_reasons:
+            if reason == "operator_pause_opening":
+                return "pause_opening"
+            if reason == "operator_reduce_only":
+                return "reduce_only"
+            if reason == "startup_not_ready":
+                return "startup_not_ready"
+            if reason in {"account_state_unknown", "account_state_stale"}:
+                return reason
+            if reason in {"reconciliation_fail", "reconciliation_warn"}:
+                return reason
+            if reason == "persistence_fault":
+                return "persistence_fault"
+            if reason == "operator_emergency_stop":
+                return "emergency_stop"
+        return "system_halted" if str(self.trading_mode or "").upper() == "HALTED" else "system_reduce_only"
+
+    def _pending_entry_cancel_reason(self, control: ControlState) -> str:
+        if control.emergency_stop:
+            return "emergency_stop_cancel_pending_entry"
+        if control.reduce_only:
+            return "reduce_only_cancel_pending_entry"
+        if not self.pending_orders:
+            return ""
+
+        system_reduce_only_reasons = {
+            "startup_not_ready",
+            "account_state_unknown",
+            "account_state_stale",
+            "reconciliation_fail",
+            "persistence_fault",
+        }
+        if any(reason in system_reduce_only_reasons for reason in self.trading_mode_reasons):
+            return "trading_mode_cancel_pending_entry"
+        return ""
 
     def _new_cycle_id(self, now: int) -> str:
         self._cycle_seq += 1
@@ -2076,10 +2933,10 @@ class Trader:
         if str(signal.position_action or "").strip():
             return (str(signal.position_action), str(signal.position_action_label or signal.position_action))
         if signal.side == "BUY":
-            return ("add", "追加买入") if existing else ("entry", "首次入场")
+            return ("add", self._action_tag_label("add")) if existing else ("entry", self._action_tag_label("entry"))
         if float(signal.exit_fraction or 0.0) >= 0.95:
-            return ("exit", "完全退出")
-        return ("trim", "部分减仓")
+            return ("exit", self._action_tag_label("exit"))
+        return ("trim", self._action_tag_label("trim"))
 
     def _wallet_pool_snapshot(self) -> list[dict[str, object]]:
         latest_metrics = getattr(self.strategy, "latest_wallet_metrics", None)
@@ -2338,8 +3195,9 @@ class Trader:
             updater(metrics, refreshed_ts=refreshed_ts)
 
     def _load_runtime_snapshot(self) -> dict[str, object] | None:
+        path = str(Path(str(self.settings.runtime_state_path or "").strip()).expanduser())
         try:
-            with open(self.settings.runtime_state_path, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 payload = json.load(f)
             if isinstance(payload, dict):
                 return payload
@@ -2348,7 +3206,7 @@ class Trader:
         except Exception as exc:
             self.log.warning(
                 "Load runtime snapshot failed path=%s err=%s",
-                self.settings.runtime_state_path,
+                path,
                 exc,
             )
         return None
@@ -2410,6 +3268,7 @@ class Trader:
         if not wallet:
             return []
 
+        dust_floor = self._position_dust_floor_usd()
         snapshot: AccountingSnapshot | None = None
         try:
             snapshot = self.data_client.get_accounting_snapshot(wallet)
@@ -2419,6 +3278,8 @@ class Trader:
         if snapshot is not None:
             snapshot_position_count = len(tuple(snapshot.positions or ()))
             if snapshot_position_count == 0 and float(snapshot.positions_value) <= 1e-9:
+                return []
+            if float(snapshot.positions_value) <= dust_floor:
                 return []
 
         try:
@@ -2434,7 +3295,7 @@ class Trader:
                 continue
             quantity = self._safe_float(getattr(pos, "size", 0.0))
             notional = self._safe_float(getattr(pos, "notional", 0.0))
-            if quantity <= 0 or notional <= 0:
+            if quantity <= 0 or notional <= dust_floor:
                 continue
 
             opened_ts = int(self._safe_float(getattr(pos, "timestamp", time.time())))
@@ -2458,6 +3319,8 @@ class Trader:
         source = "none"
         positions: list[dict[str, object]] = []
         broker_positions_loaded = False
+        snapshot: dict[str, object] | None = None
+        snapshot_positions_by_token: dict[str, dict[str, object]] = {}
         recovered_risk_state: dict[str, object] | None = None
         recovered_signal_cycles: list[dict[str, object]] = []
         recovered_trace_records: list[dict[str, object]] = []
@@ -2472,37 +3335,109 @@ class Trader:
                 if positions:
                     source = "broker"
 
-        if not positions:
-            snapshot = self._load_runtime_snapshot()
-            if isinstance(snapshot, dict):
-                risk_state_raw = snapshot.get("risk_state")
-                if isinstance(risk_state_raw, dict):
-                    recovered_risk_state = risk_state_raw
-                signal_cycles_raw = snapshot.get("signal_cycles")
-                if isinstance(signal_cycles_raw, list):
-                    recovered_signal_cycles = [row for row in signal_cycles_raw if isinstance(row, dict)]
-                trace_records_raw = snapshot.get("trace_registry")
-                if isinstance(trace_records_raw, list):
-                    recovered_trace_records = [row for row in trace_records_raw if isinstance(row, dict)]
-                pending_orders_raw = snapshot.get("pending_orders")
-                if isinstance(pending_orders_raw, list):
-                    recovered_pending_orders = [row for row in pending_orders_raw if isinstance(row, dict)]
-                operator_action_raw = snapshot.get("last_operator_action")
-                if isinstance(operator_action_raw, dict):
-                    recovered_operator_action = operator_action_raw
-                self._last_broker_event_sync_ts = int(
-                    self._safe_float(
-                        snapshot.get("broker_event_sync_ts"),
-                        self._last_broker_event_sync_ts,
-                    )
+        snapshot = self._load_runtime_snapshot()
+        if isinstance(snapshot, dict):
+            risk_state_raw = snapshot.get("risk_state")
+            if isinstance(risk_state_raw, dict):
+                recovered_risk_state = risk_state_raw
+            signal_cycles_raw = snapshot.get("signal_cycles")
+            if isinstance(signal_cycles_raw, list):
+                recovered_signal_cycles = [row for row in signal_cycles_raw if isinstance(row, dict)]
+            trace_records_raw = snapshot.get("trace_registry")
+            if isinstance(trace_records_raw, list):
+                recovered_trace_records = [row for row in trace_records_raw if isinstance(row, dict)]
+            pending_orders_raw = snapshot.get("pending_orders")
+            if isinstance(pending_orders_raw, list):
+                recovered_pending_orders = [row for row in pending_orders_raw if isinstance(row, dict)]
+            operator_action_raw = snapshot.get("last_operator_action")
+            if isinstance(operator_action_raw, dict):
+                recovered_operator_action = operator_action_raw
+            self._last_broker_event_sync_ts = int(
+                self._safe_float(
+                    snapshot.get("broker_event_sync_ts"),
+                    self._last_broker_event_sync_ts,
                 )
-                recovered = snapshot.get("positions")
-                if (not broker_positions_loaded) and isinstance(recovered, list):
-                    positions = [r for r in recovered if isinstance(r, dict)]
-                    if positions:
-                        source = "snapshot"
+            )
+            self._restore_recent_order_keys(snapshot.get("recent_order_keys"))
+            recovered = snapshot.get("positions")
+            if isinstance(recovered, list):
+                normalized_snapshot_positions: list[dict[str, object]] = []
+                for row in recovered:
+                    if not isinstance(row, dict):
+                        continue
+                    normalized = self._normalize_position(row)
+                    if not normalized:
+                        continue
+                    snapshot_positions_by_token[str(normalized["token_id"])] = normalized
+                    normalized_snapshot_positions.append(normalized)
+                if (not positions) and (not broker_positions_loaded) and normalized_snapshot_positions:
+                    positions = normalized_snapshot_positions
+                    source = "snapshot"
 
         recovered_pending_orders = self._restore_pending_orders_from_broker(recovered_pending_orders)
+
+        if broker_positions_loaded and positions:
+            restored_pending_buys_by_token: dict[str, dict[str, object]] = {}
+            for row in sorted(recovered_pending_orders, key=lambda item: int(self._safe_float(item.get("ts")))):
+                restored_pending = self._restore_pending_order(row)
+                if not restored_pending:
+                    continue
+                if str(restored_pending.get("side") or "").upper() != "BUY":
+                    continue
+                token_id = str(restored_pending.get("token_id") or "")
+                if token_id and token_id not in restored_pending_buys_by_token:
+                    restored_pending_buys_by_token[token_id] = restored_pending
+
+            merged_positions: list[dict[str, object]] = []
+            merged_count = 0
+            scaled_count = 0
+            seeded_from_pending_count = 0
+            for row in positions:
+                normalized = self._normalize_position(row)
+                if not normalized:
+                    continue
+                token_id = str(normalized["token_id"])
+                snapshot_position = snapshot_positions_by_token.get(token_id)
+                if snapshot_position:
+                    merged = self._merge_recovered_position(
+                        normalized,
+                        snapshot_position,
+                        recovery_source="runtime_snapshot",
+                    )
+                    if (
+                        abs(float(normalized.get("quantity") or 0.0) - float(snapshot_position.get("quantity") or 0.0)) > 1e-6
+                        and abs(
+                            float(merged.get("cost_basis_notional") or 0.0)
+                            - float(snapshot_position.get("cost_basis_notional") or snapshot_position.get("notional") or 0.0)
+                        ) > 1e-6
+                    ):
+                        scaled_count += 1
+                    normalized = merged
+                    merged_count += 1
+                else:
+                    pending_buy = restored_pending_buys_by_token.get(token_id)
+                    if pending_buy is not None:
+                        normalized = self._seed_position_from_pending_order(normalized, pending_buy)
+                        seeded_from_pending_count += 1
+                merged_positions.append(normalized)
+            positions = merged_positions
+            if merged_count > 0 or seeded_from_pending_count > 0:
+                source = "broker+snapshot" if merged_count > 0 else "broker+pending"
+                self.log.info(
+                    "Recovered broker positions with startup metadata merged=%d scaled_cost_basis=%d seeded_from_pending=%d",
+                    merged_count,
+                    scaled_count,
+                    seeded_from_pending_count,
+                )
+                self._append_event(
+                    "runtime_reconcile",
+                    {
+                        "source": "broker_startup_merge",
+                        "merged_positions": merged_count,
+                        "scaled_cost_basis": scaled_count,
+                        "seeded_from_pending": seeded_from_pending_count,
+                    },
+                )
 
         if recovered_risk_state is not None:
             recovered_day_key = str(recovered_risk_state.get("day_key") or "").strip()
@@ -2579,7 +3514,10 @@ class Trader:
             self.log.info("No positions found for startup reconcile")
 
     def _reconcile_runtime_with_broker(self) -> None:
-        if self.settings.dry_run:
+        dry_run_pending_reconcile = self._supports_dry_run_pending_reconcile()
+        if self.settings.dry_run and not dry_run_pending_reconcile:
+            return
+        if self.settings.dry_run and dry_run_pending_reconcile and not self.pending_orders:
             return
 
         positions = self._load_broker_positions()
@@ -2598,7 +3536,11 @@ class Trader:
         for token_id, normalized in list(reconciled.items()):
             prev_pos = previous_positions.get(token_id)
             if prev_pos:
-                reconciled[token_id] = self._merge_position_context(normalized, prev_pos)
+                reconciled[token_id] = self._merge_recovered_position(
+                    normalized,
+                    prev_pos,
+                    recovery_source="runtime_previous",
+                )
                 continue
             pending_buy = next(
                 (
@@ -2670,7 +3612,12 @@ class Trader:
 
     def _maybe_reconcile_runtime(self) -> None:
         interval = int(self.settings.runtime_reconcile_interval_seconds)
-        if self.settings.dry_run or interval <= 0:
+        if interval <= 0:
+            return
+        dry_run_pending_reconcile = self._supports_dry_run_pending_reconcile()
+        if self.settings.dry_run and not dry_run_pending_reconcile:
+            return
+        if self.settings.dry_run and dry_run_pending_reconcile and not self.pending_orders:
             return
 
         now = time.time()
@@ -2678,6 +3625,14 @@ class Trader:
             return
         self._last_broker_reconcile_ts = now
         self._reconcile_runtime_with_broker()
+
+    def _supports_dry_run_pending_reconcile(self) -> bool:
+        if not self.settings.dry_run:
+            return False
+        capability = getattr(self.broker, "supports_dry_run_pending_reconcile", None)
+        if not callable(capability):
+            return False
+        return bool(capability())
 
     def _enforce_condition_netting(
         self,
@@ -2989,17 +3944,17 @@ class Trader:
             return cls._order_meta(
                 signal.side,
                 exit_kind="resonance_exit",
-                exit_label="共振退出",
+                exit_label=cls._exit_kind_label("resonance_exit"),
                 exit_summary=str(signal.exit_reason or f"{int(signal.exit_wallet_count or 0)} wallets"),
             )
         if str(signal.wallet or "").strip().lower() == "system-time-exit":
-            return cls._order_meta(signal.side, exit_kind="time_exit", exit_label="时间退出", exit_summary=str(signal.exit_reason or "time-exit"))
+            return cls._order_meta(signal.side, exit_kind="time_exit", exit_label=cls._exit_kind_label("time_exit"), exit_summary=str(signal.exit_reason or "time-exit"))
         if str(signal.wallet or "").strip().lower() == "system-emergency-stop":
-            return cls._order_meta(signal.side, exit_kind="emergency_exit", exit_label="紧急退出", exit_summary=str(signal.exit_reason or "emergency-exit"))
+            return cls._order_meta(signal.side, exit_kind="emergency_exit", exit_label=cls._exit_kind_label("emergency_exit"), exit_summary=str(signal.exit_reason or "emergency-exit"))
         return cls._order_meta(
             signal.side,
             exit_kind="smart_wallet_exit",
-            exit_label="主钱包减仓",
+            exit_label=cls._exit_kind_label("smart_wallet_exit"),
             exit_summary=str(signal.exit_reason or "source wallet exit"),
         )
 
@@ -3281,11 +4236,7 @@ class Trader:
         return ("failed", updated)
 
     def _apply_control_pending_entry_cancels(self, control: ControlState, *, now: int) -> None:
-        action_reason = ""
-        if control.emergency_stop:
-            action_reason = "emergency_stop_cancel_pending_entry"
-        elif control.reduce_only:
-            action_reason = "reduce_only_cancel_pending_entry"
+        action_reason = self._pending_entry_cancel_reason(control)
         if not action_reason:
             return
 
@@ -3327,7 +4278,68 @@ class Trader:
             "matched_notional_hint": float(order.get("matched_notional_hint") or 0.0),
             "matched_size_hint": float(order.get("matched_size_hint") or 0.0),
             "matched_price_hint": float(order.get("matched_price_hint") or 0.0),
+            "reconciled_notional_hint": float(order.get("reconciled_notional_hint") or 0.0),
+            "reconciled_size_hint": float(order.get("reconciled_size_hint") or 0.0),
+            "last_fill_ts_hint": int(order.get("last_fill_ts_hint") or 0),
         }
+
+    @staticmethod
+    def _pending_reconcile_group_key(order: Mapping[str, object]) -> tuple[str, str]:
+        return (
+            str(order.get("token_id") or ""),
+            str(order.get("side") or "").upper(),
+        )
+
+    def _mark_pending_order_reconcile_ambiguous(
+        self,
+        *,
+        order: dict[str, object],
+        now: int,
+        reason: str,
+        fill_ts: int = 0,
+    ) -> None:
+        order["reconcile_ambiguous_ts"] = int(fill_ts or now)
+        order["reconcile_ambiguous_reason"] = str(reason or "ambiguous_pending_reconcile")
+        order["message"] = str(reason or order.get("message") or "ambiguous pending reconcile")
+        order["reason"] = str(reason or order.get("reason") or "ambiguous pending reconcile")
+        self._append_event(
+            "pending_reconcile_ambiguous",
+            {
+                "order_id": str(order.get("order_id") or ""),
+                "token_id": str(order.get("token_id") or ""),
+                "side": str(order.get("side") or "").upper(),
+                "reason": str(order.get("reconcile_ambiguous_reason") or ""),
+                "fill_ts": int(fill_ts or 0),
+            },
+        )
+
+    def _sync_shadow_position_to_actual(
+        self,
+        *,
+        token_id: str,
+        shadow_positions: dict[str, dict[str, object]],
+        next_positions: dict[str, dict[str, object]],
+        position_delta_backed: bool,
+    ) -> None:
+        shadow = shadow_positions.get(token_id)
+        if not position_delta_backed:
+            if shadow is None:
+                next_positions.pop(token_id, None)
+                return
+            next_positions[token_id] = dict(shadow)
+            return
+
+        if shadow is None:
+            return
+
+        current = next_positions.get(token_id)
+        if current is None:
+            next_positions[token_id] = dict(shadow)
+            return
+
+        merged = self._merge_position_context(dict(current), shadow)
+        merged["cost_basis_notional"] = self._position_cost_basis_notional(shadow)
+        next_positions[token_id] = merged
 
     @staticmethod
     def _market_context_fields() -> tuple[str, ...]:
@@ -3452,7 +4464,10 @@ class Trader:
 
         oldest_pending_ts = min(int(order.get("ts") or now) for order in self.pending_orders.values())
         since_ts = max(0, self._last_broker_event_sync_ts - 5) if self._last_broker_event_sync_ts > 0 else max(0, oldest_pending_ts - 3600)
-        events = self.broker.list_order_events(
+        list_order_events = getattr(self.broker, "list_order_events", None)
+        if not callable(list_order_events):
+            return ({}, {}, False)
+        events = list_order_events(
             since_ts=since_ts,
             order_ids=order_ids,
             limit=max(200, len(order_ids) * 20),
@@ -3536,6 +4551,10 @@ class Trader:
             "matched_notional_hint": 0.0,
             "matched_size_hint": 0.0,
             "matched_price_hint": 0.0,
+            "reconciled_notional_hint": 0.0,
+            "reconciled_size_hint": 0.0,
+            "last_fill_ts_hint": 0,
+            "last_fill_tx_hash": "",
             "message": str(result.message or order_reason),
             "reason": str(order_reason or result.message or ""),
             "previous_notional": float(previous.get("notional") or 0.0),
@@ -3559,6 +4578,10 @@ class Trader:
             "cancel_request_count": 0,
             "cancel_last_status": "",
             "cancel_last_message": "",
+            "reconcile_ambiguous_ts": 0,
+            "reconcile_ambiguous_reason": "",
+            "recovery_source": "runtime",
+            "recovery_status": "confirmed",
         }
         record.update(self._market_context_from_result(result))
         self.pending_orders[key] = record
@@ -3593,6 +4616,10 @@ class Trader:
             "matched_notional_hint": float(snapshot.matched_notional),
             "matched_size_hint": float(snapshot.matched_size or 0.0),
             "matched_price_hint": float(snapshot.price or 0.0),
+            "reconciled_notional_hint": 0.0,
+            "reconciled_size_hint": 0.0,
+            "last_fill_ts_hint": 0,
+            "last_fill_tx_hash": "",
             "message": str(snapshot.message or "restored pending order from broker"),
             "reason": str(snapshot.message or "restored pending order from broker"),
             "previous_notional": 0.0,
@@ -3616,6 +4643,10 @@ class Trader:
             "cancel_request_count": 0,
             "cancel_last_status": "",
             "cancel_last_message": "",
+            "reconcile_ambiguous_ts": 0,
+            "reconcile_ambiguous_reason": "",
+            "recovery_source": "broker_open_orders",
+            "recovery_status": "confirmed",
         }
 
     def _restore_pending_orders_from_broker(self, rows: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -3631,6 +4662,28 @@ class Trader:
             order_id = str(restored.get("order_id") or "").strip()
             if order_id:
                 recovered_by_order_id[order_id] = restored
+
+        if not broker_open_orders:
+            if recovered_by_order_id:
+                restored_rows = []
+                for restored in recovered_by_order_id.values():
+                    row = dict(restored)
+                    row["recovery_source"] = str(row.get("recovery_source") or "snapshot")
+                    row["recovery_status"] = "uncertain_empty_broker_open_orders"
+                    restored_rows.append(row)
+                self.log.warning(
+                    "Recovered pending orders from snapshot after empty broker open-order response count=%d",
+                    len(restored_rows),
+                )
+                self._append_event(
+                    "pending_restore",
+                    {
+                        "source": "snapshot_uncertain_empty_broker_open_orders",
+                        "count": len(restored_rows),
+                    },
+                )
+                return restored_rows
+            return []
 
         restored_rows: list[dict[str, object]] = []
         for snapshot in broker_open_orders:
@@ -3666,6 +4719,8 @@ class Trader:
             if str(snapshot.message or "").strip():
                 restored["message"] = str(snapshot.message)
                 restored["reason"] = str(snapshot.message)
+            restored["recovery_source"] = "broker_open_orders"
+            restored["recovery_status"] = "confirmed"
             restored_rows.append(restored)
 
         if broker_open_orders:
@@ -3714,6 +4769,10 @@ class Trader:
             "matched_notional_hint": self._safe_float(row.get("matched_notional_hint")),
             "matched_size_hint": self._safe_float(row.get("matched_size_hint")),
             "matched_price_hint": self._safe_float(row.get("matched_price_hint")),
+            "reconciled_notional_hint": self._safe_float(row.get("reconciled_notional_hint")),
+            "reconciled_size_hint": self._safe_float(row.get("reconciled_size_hint")),
+            "last_fill_ts_hint": int(self._safe_float(row.get("last_fill_ts_hint"))),
+            "last_fill_tx_hash": str(row.get("last_fill_tx_hash") or ""),
             "message": str(row.get("message") or ""),
             "reason": str(row.get("reason") or ""),
             "previous_notional": self._safe_float(row.get("previous_notional")),
@@ -3737,6 +4796,10 @@ class Trader:
             "cancel_request_count": int(self._safe_float(row.get("cancel_request_count"))),
             "cancel_last_status": str(row.get("cancel_last_status") or ""),
             "cancel_last_message": str(row.get("cancel_last_message") or ""),
+            "reconcile_ambiguous_ts": int(self._safe_float(row.get("reconcile_ambiguous_ts"))),
+            "reconcile_ambiguous_reason": str(row.get("reconcile_ambiguous_reason") or ""),
+            "recovery_source": str(row.get("recovery_source") or "snapshot"),
+            "recovery_status": str(row.get("recovery_status") or "restored"),
         }
         for field_name in self._market_context_fields():
             value = row.get(field_name)
@@ -3782,6 +4845,50 @@ class Trader:
                 merged[key] = value
         return merged
 
+    def _merge_recovered_position(
+        self,
+        target: dict[str, object],
+        source: dict[str, object] | None,
+        *,
+        recovery_source: str,
+    ) -> dict[str, object]:
+        if not source:
+            return dict(target)
+
+        merged = self._merge_position_context(target, source)
+        source_qty = max(0.0, float(source.get("quantity") or 0.0))
+        target_qty = max(0.0, float(target.get("quantity") or 0.0))
+        source_cost_basis = self._position_cost_basis_notional(source)
+        token_id = str(target.get("token_id") or source.get("token_id") or "")
+
+        if source_cost_basis > 0.0 and target_qty > 0.0:
+            if source_qty > 0.0 and abs(target_qty - source_qty) > 1e-6:
+                scaled_cost_basis = max(0.0, source_cost_basis * (target_qty / source_qty))
+                merged["cost_basis_notional"] = scaled_cost_basis
+                self.log.warning(
+                    "Recovered position metadata with quantity mismatch token=%s recovery_source=%s source_qty=%.6f target_qty=%.6f source_cost_basis=%.6f scaled_cost_basis=%.6f",
+                    token_id,
+                    recovery_source,
+                    source_qty,
+                    target_qty,
+                    source_cost_basis,
+                    scaled_cost_basis,
+                )
+                self._append_event(
+                    "position_recovery_conflict",
+                    {
+                        "token_id": token_id,
+                        "recovery_source": recovery_source,
+                        "source_qty": source_qty,
+                        "target_qty": target_qty,
+                        "source_cost_basis_notional": source_cost_basis,
+                        "scaled_cost_basis_notional": scaled_cost_basis,
+                    },
+                )
+            else:
+                merged["cost_basis_notional"] = source_cost_basis
+        return merged
+
     def _seed_position_from_pending_order(
         self,
         position: dict[str, object],
@@ -3789,8 +4896,8 @@ class Trader:
     ) -> dict[str, object]:
         seeded = dict(position)
         seeded["condition_id"] = str(position.get("condition_id") or order.get("condition_id") or "")
-        seeded["opened_ts"] = int(position.get("opened_ts") or order.get("ts") or 0)
-        seeded["last_buy_ts"] = int(position.get("last_buy_ts") or order.get("ts") or 0)
+        seeded["opened_ts"] = int(order.get("ts") or position.get("opened_ts") or 0)
+        seeded["last_buy_ts"] = int(order.get("ts") or position.get("last_buy_ts") or position.get("opened_ts") or 0)
         seeded["last_signal_id"] = str(order.get("last_signal_id") or order.get("signal_id") or "")
         seeded["cost_basis_notional"] = max(
             0.0,
@@ -3809,6 +4916,7 @@ class Trader:
         filled_notional: float,
         filled_qty: float,
         fill_price: float,
+        fill_ts: int,
         now: int,
     ) -> tuple[float, float, float]:
         token_id = str(order.get("token_id") or "")
@@ -3816,6 +4924,7 @@ class Trader:
         market_slug = str(order.get("market_slug") or token_id)
         outcome = str(order.get("outcome") or "YES")
         condition_id = str(order.get("condition_id") or "")
+        applied_ts = int(fill_ts or now or time.time())
 
         if filled_notional <= 1e-9:
             current = next_positions.get(token_id) or previous_positions.get(token_id) or {}
@@ -3844,8 +4953,8 @@ class Trader:
                     "price": new_notional / max(0.01, new_qty),
                     "notional": new_notional,
                     "cost_basis_notional": self._position_cost_basis_notional(current) + filled_notional,
-                    "opened_ts": int(current.get("opened_ts") or order.get("ts") or now),
-                    "last_buy_ts": now,
+                    "opened_ts": int(current.get("opened_ts") or applied_ts or order.get("ts") or now),
+                    "last_buy_ts": applied_ts,
                     "last_signal_id": str(order.get("last_signal_id") or order.get("signal_id") or ""),
                 }
             )
@@ -3863,7 +4972,7 @@ class Trader:
         )
         remaining_qty = max(0.0, prev_qty - max(0.0, filled_qty))
         remaining_notional = max(0.0, prev_notional - filled_notional)
-        self._apply_realized_pnl(realized_pnl, ts=now)
+        self._apply_reconciled_realized_pnl(realized_pnl, fill_ts=applied_ts, now=now)
 
         if remaining_notional <= self.settings.stale_position_close_notional_usd or remaining_qty <= 0.0:
             next_positions.pop(token_id, None)
@@ -3879,7 +4988,7 @@ class Trader:
                 "price": observed_price or float(current.get("price") or 0.0),
                 "notional": remaining_notional,
                 "cost_basis_notional": remaining_cost_basis,
-                "last_trim_ts": now,
+                "last_trim_ts": applied_ts,
                 "last_signal_id": str(order.get("last_signal_id") or order.get("signal_id") or ""),
             }
         )
@@ -3888,7 +4997,7 @@ class Trader:
             exit_kind=str(order.get("exit_kind") or ""),
             exit_label=str(order.get("exit_label") or ""),
             exit_summary=str(order.get("exit_summary") or ""),
-            ts=now,
+            ts=applied_ts,
         )
         next_positions[token_id] = current
         return (realized_pnl, remaining_notional, remaining_qty)
@@ -3960,24 +5069,32 @@ class Trader:
 
         timeout_seconds = self._pending_timeout_seconds()
         active_statuses = {"submitted", "posted", "open", "live", "delayed", "partially_filled"}
+        shadow_positions = {token_id: dict(position) for token_id, position in previous_positions.items()}
+        pending_group_counts: dict[tuple[str, str], int] = {}
+        for order in self.pending_orders.values():
+            group_key = self._pending_reconcile_group_key(order)
+            if group_key[0] and group_key[1] in {"BUY", "SELL"}:
+                pending_group_counts[group_key] = pending_group_counts.get(group_key, 0) + 1
         remaining: dict[str, dict[str, object]] = {}
         for key, order in sorted(self.pending_orders.items(), key=lambda item: int(item[1].get("ts") or 0)):
             token_id = str(order.get("token_id") or "")
             side = str(order.get("side") or "").upper()
             order_id = str(order.get("order_id") or "").strip()
-            previous_matched_notional = float(order.get("matched_notional_hint") or 0.0)
-            previous_matched_size = float(order.get("matched_size_hint") or 0.0)
+            previous_reported_notional = float(order.get("matched_notional_hint") or 0.0)
+            previous_reported_size = float(order.get("matched_size_hint") or 0.0)
+            previous_reconciled_notional = float(order.get("reconciled_notional_hint") or 0.0)
+            previous_reconciled_size = float(order.get("reconciled_size_hint") or 0.0)
             status_snapshot = stream_statuses.get(order_id) if order_id else None
             if status_snapshot is None and order_id and not stream_available:
                 status_snapshot = self.broker.get_order_status(order_id)
             if status_snapshot is not None:
                 order["broker_status"] = status_snapshot.lifecycle_status
                 order["matched_notional_hint"] = max(
-                    previous_matched_notional,
+                    previous_reported_notional,
                     float(status_snapshot.matched_notional or 0.0),
                 )
                 order["matched_size_hint"] = max(
-                    previous_matched_size,
+                    previous_reported_size,
                     float(status_snapshot.matched_size or 0.0),
                 )
                 if status_snapshot.avg_fill_price > 0.0:
@@ -3998,10 +5115,16 @@ class Trader:
                 )
                 if float(fill_agg.get("price") or 0.0) > 0.0:
                     order["matched_price_hint"] = float(fill_agg.get("price") or 0.0)
+                order["last_fill_ts_hint"] = max(
+                    int(order.get("last_fill_ts_hint") or 0),
+                    int(fill_agg.get("timestamp") or 0),
+                )
+                if str(fill_agg.get("tx_hash") or "").strip():
+                    order["last_fill_tx_hash"] = str(fill_agg.get("tx_hash") or "")
                 if (
                     str(order.get("broker_status") or "") in active_statuses
                     and float(order.get("matched_notional_hint") or 0.0) > 1e-6
-                    and float(order.get("matched_notional_hint") or 0.0) + 1e-6 < float(order.get("requested_notional") or 0.0)
+                    and float(order.get("reconciled_notional_hint") or 0.0) + 1e-6 < float(order.get("requested_notional") or 0.0)
                 ):
                     order["broker_status"] = "partially_filled"
 
@@ -4010,21 +5133,58 @@ class Trader:
             available_notional = float(delta_notional_map.get(token_id) or 0.0)
             available_qty = float(delta_qty_map.get(token_id) or 0.0)
             requested_notional = float(order.get("requested_notional") or 0.0)
-            requested_remaining = max(0.0, requested_notional - previous_matched_notional)
-            reported_incremental_notional = max(0.0, float(order.get("matched_notional_hint") or 0.0) - previous_matched_notional)
-            reported_incremental_size = max(0.0, float(order.get("matched_size_hint") or 0.0) - previous_matched_size)
-            use_position_delta = available_notional > 1e-6
+            requested_remaining = max(0.0, requested_notional - previous_reconciled_notional)
+            reported_outstanding_notional = max(
+                0.0,
+                float(order.get("matched_notional_hint") or 0.0) - previous_reconciled_notional,
+            )
+            reported_outstanding_size = max(
+                0.0,
+                float(order.get("matched_size_hint") or 0.0) - previous_reconciled_size,
+            )
+            group_size = pending_group_counts.get(self._pending_reconcile_group_key(order), 1)
             matched_notional = 0.0
-            if use_position_delta:
+            use_position_delta = False
+            attribution_source = ""
+            reconcile_source = ""
+            already_reflected_without_delta = False
+            if reported_outstanding_notional > 1e-6:
+                matched_notional = reported_outstanding_notional
+                if requested_remaining > 0.0:
+                    matched_notional = min(matched_notional, requested_remaining)
+                use_position_delta = available_notional > 1e-6
+                reconcile_source = "broker_reconcile" if use_position_delta else "broker_trades"
+                attribution_source = "order_level_fill"
+                if (
+                    not use_position_delta
+                    and side == "BUY"
+                    and token_id in previous_positions
+                    and token_id in next_positions
+                ):
+                    already_reflected_without_delta = True
+                    reconcile_source = "broker_reconcile"
+            elif available_notional > 1e-6:
+                if group_size > 1 and not (status_snapshot is not None and status_snapshot.is_failed):
+                    self._mark_pending_order_reconcile_ambiguous(
+                        order=order,
+                        now=now,
+                        reason=f"multiple_pending_orders_for_token={token_id}:{side}",
+                    )
+                    remaining[key] = order
+                    continue
+                use_position_delta = True
                 matched_notional = min(available_notional, requested_remaining) if requested_remaining > 0.0 else available_notional
-            elif reported_incremental_notional > 1e-6:
-                matched_notional = min(reported_incremental_notional, requested_remaining) if requested_remaining > 0.0 else reported_incremental_notional
+                reconcile_source = "broker_reconcile"
+                attribution_source = "token_position_delta"
             if matched_notional > 1e-6:
                 matched_qty = 0.0
-                if use_position_delta and available_notional > 1e-9 and available_qty > 0.0:
+                if reported_outstanding_notional > 1e-9 and reported_outstanding_size > 0.0:
+                    matched_qty = min(
+                        reported_outstanding_size,
+                        reported_outstanding_size * (matched_notional / reported_outstanding_notional),
+                    )
+                elif use_position_delta and available_notional > 1e-9 and available_qty > 0.0:
                     matched_qty = min(available_qty, available_qty * (matched_notional / available_notional))
-                elif reported_incremental_size > 0.0:
-                    matched_qty = reported_incremental_size
                 observed_price = float(
                     (float(fill_agg.get("price") or 0.0) if fill_agg is not None else 0.0)
                     or (status_snapshot.avg_fill_price if status_snapshot is not None and status_snapshot.avg_fill_price > 0.0 else 0.0)
@@ -4034,64 +5194,87 @@ class Trader:
                 )
                 if matched_qty <= 0.0 and observed_price > 0.0:
                     matched_qty = matched_notional / max(0.01, observed_price)
+                fill_ts = int(order.get("last_fill_ts_hint") or 0) if attribution_source == "order_level_fill" else 0
                 reason = str(order.get("reason") or order.get("message") or "broker reconcile")
                 realized_pnl = 0.0
-                if use_position_delta:
-                    delta_notional_map[token_id] = max(0.0, available_notional - matched_notional)
-                    delta_qty_map[token_id] = max(0.0, available_qty - matched_qty)
-                    if side == "BUY":
-                        next_position = next_positions.get(token_id)
-                        if next_position is not None:
-                            next_position["cost_basis_notional"] = (
-                                self._position_cost_basis_notional(previous_positions.get(token_id)) + matched_notional
-                            )
-                    else:
-                        previous_position = previous_positions.get(token_id)
-                        realized_pnl, remaining_cost_basis = self._realize_position_sell(
-                            previous_position,
-                            sold_qty=matched_qty,
-                            sold_notional=matched_notional,
+                order["reconcile_ambiguous_ts"] = 0
+                order["reconcile_ambiguous_reason"] = ""
+                if already_reflected_without_delta:
+                    next_position = next_positions.get(token_id)
+                    if next_position is not None:
+                        next_position["opened_ts"] = int(next_position.get("opened_ts") or fill_ts or order.get("ts") or now)
+                        next_position["last_buy_ts"] = int(fill_ts or now)
+                        next_position["last_signal_id"] = str(order.get("last_signal_id") or order.get("signal_id") or "")
+                        next_positions[token_id] = self._merge_position_context(
+                            next_position,
+                            self._pending_order_entry_context(order),
                         )
-                        next_position = next_positions.get(token_id)
-                        if next_position is not None:
-                            next_position["cost_basis_notional"] = remaining_cost_basis
-                        self._apply_realized_pnl(realized_pnl, ts=now)
                 else:
                     realized_pnl, _, _ = self._apply_pending_fill_delta(
                         order=order,
-                        previous_positions=previous_positions,
-                        next_positions=next_positions,
+                        previous_positions=shadow_positions,
+                        next_positions=shadow_positions,
                         filled_notional=matched_notional,
                         filled_qty=matched_qty,
                         fill_price=observed_price,
+                        fill_ts=fill_ts,
                         now=now,
                     )
+                    if use_position_delta:
+                        delta_notional_map[token_id] = max(0.0, available_notional - min(available_notional, matched_notional))
+                        delta_qty_map[token_id] = max(0.0, available_qty - min(available_qty, matched_qty))
+                    self._sync_shadow_position_to_actual(
+                        token_id=token_id,
+                        shadow_positions=shadow_positions,
+                        next_positions=next_positions,
+                        position_delta_backed=use_position_delta,
+                    )
 
-                order["matched_notional_hint"] = max(
-                    float(order.get("matched_notional_hint") or 0.0),
-                    previous_matched_notional + matched_notional,
+                order["reconciled_notional_hint"] = max(
+                    float(order.get("reconciled_notional_hint") or 0.0),
+                    previous_reconciled_notional + matched_notional,
                 )
-                order["matched_size_hint"] = max(
-                    float(order.get("matched_size_hint") or 0.0),
-                    previous_matched_size + matched_qty,
+                order["reconciled_size_hint"] = max(
+                    float(order.get("reconciled_size_hint") or 0.0),
+                    previous_reconciled_size + matched_qty,
                 )
                 if observed_price > 0.0:
                     order["matched_price_hint"] = observed_price
+                order["last_fill_ts_hint"] = max(int(order.get("last_fill_ts_hint") or 0), int(fill_ts or now))
 
-                remaining_requested = max(0.0, requested_notional - float(order.get("matched_notional_hint") or 0.0))
-                keep_pending = str(order.get("broker_status") or "") in active_statuses and remaining_requested > 1e-6
-                reconcile_status = "PARTIAL" if keep_pending else "RECONCILED"
-                reconcile_reason = (
-                    "partial fill via broker positions" if use_position_delta and keep_pending else
-                    "reconciled via broker positions" if use_position_delta else
-                    "partial fill via broker trades" if keep_pending else
-                    "reconciled via broker trades"
+                remaining_requested = max(
+                    0.0,
+                    requested_notional - float(order.get("reconciled_notional_hint") or 0.0),
                 )
+                unreconciled_reported = max(
+                    0.0,
+                    float(order.get("matched_notional_hint") or 0.0)
+                    - float(order.get("reconciled_notional_hint") or 0.0),
+                )
+                keep_pending = str(order.get("broker_status") or "") in active_statuses and remaining_requested > 1e-6
+                if unreconciled_reported > 1e-6:
+                    keep_pending = True
+                reconcile_status = "PARTIAL" if keep_pending else "RECONCILED"
+                if attribution_source == "order_level_fill":
+                    reconcile_reason = (
+                        "partial fill via order-level fill + broker positions"
+                        if reconcile_source == "broker_reconcile" and keep_pending
+                        else "reconciled via order-level fill + broker positions"
+                        if reconcile_source == "broker_reconcile"
+                        else "partial fill via order-level fill"
+                        if keep_pending
+                        else "reconciled via order-level fill"
+                    )
+                else:
+                    reconcile_reason = (
+                        "partial fill via broker positions" if keep_pending else "reconciled via broker positions"
+                    )
                 remaining_position = next_positions.get(token_id) or {}
+                applied_ts = int(fill_ts or now)
                 market_context = self._market_context_from_order(order)
                 self.recent_orders.appendleft(
                     {
-                        "ts": now,
+                        "ts": applied_ts,
                         "cycle_id": str(order.get("cycle_id") or ""),
                         "signal_id": str(order.get("signal_id") or ""),
                         "trace_id": str(order.get("trace_id") or ""),
@@ -4103,10 +5286,10 @@ class Trader:
                         "order_id": order_id,
                         "broker_status": str(order.get("broker_status") or ""),
                         "retry_count": 0,
-                        "latency_ms": max(0, (now - int(order.get("ts") or now)) * 1000),
+                        "latency_ms": max(0, (applied_ts - int(order.get("ts") or applied_ts)) * 1000),
                         "reason": f"{reason} | {reconcile_reason}",
                         "source_wallet": str(order.get("wallet") or ""),
-                        "hold_minutes": self._position_hold_minutes(previous_positions.get(token_id), now) if side == "SELL" else 0,
+                        "hold_minutes": self._position_hold_minutes(previous_positions.get(token_id), applied_ts) if side == "SELL" else 0,
                         "notional": matched_notional,
                         "realized_pnl": realized_pnl,
                         "wallet_score": float(order.get("wallet_score") or 0.0),
@@ -4152,15 +5335,16 @@ class Trader:
                         "requested_notional": requested_notional,
                         "filled_notional": matched_notional,
                         "price": observed_price,
+                        "fill_ts": applied_ts,
                         "order_id": str(order.get("order_id") or ""),
                         "broker_status": str(order.get("broker_status") or ""),
-                        "reason": "reconciled_via_positions" if use_position_delta else "reconciled_via_trades",
+                        "reason": attribution_source or ("reconciled_via_positions" if reconcile_source == "broker_reconcile" else "reconciled_via_trades"),
                         "realized_pnl": realized_pnl,
                         **market_context,
                     },
                 )
                 self._record_fill_ledger(
-                    ts=now,
+                    ts=applied_ts,
                     side=side,
                     token_id=token_id,
                     condition_id=str(order.get("condition_id") or ""),
@@ -4174,7 +5358,7 @@ class Trader:
                     order_id=order_id,
                     status=reconcile_status,
                     source_wallet=str(order.get("wallet") or ""),
-                    source="broker_reconcile" if use_position_delta else "broker_trades",
+                    source=reconcile_source or ("broker_reconcile" if use_position_delta else "broker_trades"),
                 )
                 if keep_pending:
                     remaining[key] = order
@@ -4326,18 +5510,18 @@ class Trader:
         remaining_qty: float = 0.0,
     ) -> dict[str, object]:
         if not ok:
-            return {"exit_result": "reject", "exit_result_label": "已拒绝"}
+            return {"exit_result": "reject", "exit_result_label": self._exit_result_label("reject")}
         if str(exit_kind or "") == "emergency_exit":
-            return {"exit_result": "emergency", "exit_result_label": "紧急退出"}
+            return {"exit_result": "emergency", "exit_result_label": self._exit_result_label("emergency")}
         if remaining_notional <= self.settings.stale_position_close_notional_usd or remaining_qty <= 0.0:
-            return {"exit_result": "full_exit", "exit_result_label": "完全退出"}
-        return {"exit_result": "partial_trim", "exit_result_label": "部分减仓"}
+            return {"exit_result": "full_exit", "exit_result_label": self._exit_result_label("full_exit")}
+        return {"exit_result": "partial_trim", "exit_result_label": self._exit_result_label("partial_trim")}
 
     @staticmethod
     def _pending_exit_result_meta(side: str) -> dict[str, object]:
         if str(side).upper() != "SELL":
             return {}
-        return {"exit_result": "pending", "exit_result_label": "待成交"}
+        return {"exit_result": "pending", "exit_result_label": Trader._exit_result_label("pending")}
 
     def _decision_snapshot(
         self,
@@ -4366,6 +5550,7 @@ class Trader:
                 "reduce_only": bool(control.reduce_only),
                 "emergency_stop": bool(control.emergency_stop),
             },
+            "trading_mode": self.trading_mode_state(),
             "existing_position": bool(existing),
             "existing_trace_id": str((existing or {}).get("trace_id") or ""),
             "cooldown_remaining": int(max(0, cooldown_remaining)),
@@ -4462,6 +5647,7 @@ class Trader:
         return f"{reason} | {topic_label} {action} x{float(signal.topic_multiplier or 1.0):.2f}"
 
     def _dump_runtime_state(self) -> dict[str, object]:
+        self._order_cache_cleanup(time.time())
         positions: list[dict[str, object]] = []
         for pos in self.positions_book.values():
             positions.append(
@@ -4497,8 +5683,10 @@ class Trader:
 
         return {
             "ts": int(time.time()),
-            "runtime_version": 6,
+            "runtime_version": 7,
             "broker_event_sync_ts": int(self._last_broker_event_sync_ts),
+            "trading_mode": self.trading_mode_state(),
+            "persistence": self.persistence_state(),
             "startup": {
                 "ready": bool(self.startup_ready),
                 "warning_count": int(self.startup_warning_count),
@@ -4522,6 +5710,7 @@ class Trader:
             },
             "positions": positions,
             "pending_orders": list(self.pending_orders.values()),
+            "recent_order_keys": dict(self._recent_order_keys),
             "last_operator_action": dict(self.last_operator_action),
             "signal_cycles": list(self.recent_signal_cycles),
             "trace_registry": self._trace_records(),
@@ -4529,13 +5718,18 @@ class Trader:
 
     def persist_runtime_state(self, path: str) -> None:
         payload = self._dump_runtime_state()
-        parent = Path(path).expanduser().parent
+        resolved_path = str(Path(path).expanduser())
+        parent = Path(resolved_path).parent
         if str(parent) not in {"", "."}:
             parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = f"{path}.tmp"
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f, ensure_ascii=False)
-        os.replace(tmp_path, path)
+        tmp_path = f"{resolved_path}.tmp"
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(payload, f, ensure_ascii=False)
+            os.replace(tmp_path, resolved_path)
+        except Exception as exc:
+            self._record_persistence_fault(kind="runtime_state_write", path=resolved_path, error=exc)
+            raise
 
     def _load_control_state(self) -> ControlState:
         payload: dict[str, object] = {}
@@ -4684,6 +5878,7 @@ class Trader:
             return
 
         now = int(time.time())
+        emergency_exit_label = self._exit_kind_label("emergency_exit")
         close_notional = self.settings.stale_position_close_notional_usd
         cycle_id = self._new_cycle_id(now)
         wallet_pool_snapshot = self._wallet_pool_snapshot()
@@ -4723,7 +5918,7 @@ class Trader:
                 observed_notional=current_notional,
                 timestamp=datetime.now(tz=timezone.utc),
                 position_action="exit",
-                position_action_label="紧急退出",
+                position_action_label=emergency_exit_label,
             )
             signal_record = self._cycle_candidate_record(
                 sig,
@@ -4761,7 +5956,7 @@ class Trader:
                         "position_action": sig.position_action,
                         "position_action_label": sig.position_action_label,
                         "exit_kind": "emergency_exit",
-                        "exit_label": "紧急退出",
+                        "exit_label": emergency_exit_label,
                         "hold_minutes": self._position_hold_minutes(position, now),
                         "exit_fraction": 1.0,
                         "notional": current_notional,
@@ -4795,7 +5990,7 @@ class Trader:
                         "position_action_label": sig.position_action_label,
                         **entry_context,
                         **self._exit_result_meta(exit_kind="emergency_exit", ok=False),
-                        **self._order_meta("SELL", exit_kind="emergency_exit", exit_label="紧急退出", exit_summary="emergency-exit"),
+                        **self._order_meta("SELL", exit_kind="emergency_exit", exit_label=emergency_exit_label, exit_summary="emergency-exit"),
                     }
                 )
                 signal_record["decision_snapshot"] = dict(base_decision_snapshot)
@@ -4823,7 +6018,7 @@ class Trader:
                     signal=sig,
                     cycle_id=cycle_id,
                     result=result,
-                    order_meta=self._order_meta("SELL", exit_kind="emergency_exit", exit_label="紧急退出", exit_summary="emergency-exit"),
+                    order_meta=self._order_meta("SELL", exit_kind="emergency_exit", exit_label=emergency_exit_label, exit_summary="emergency-exit"),
                     entry_context=entry_context,
                     previous_position=position,
                     order_reason=result.message,
@@ -4841,7 +6036,7 @@ class Trader:
                         "position_action": sig.position_action,
                         "position_action_label": sig.position_action_label,
                         "exit_kind": "emergency_exit",
-                        "exit_label": "紧急退出",
+                        "exit_label": emergency_exit_label,
                         "hold_minutes": self._position_hold_minutes(position, now),
                         "exit_fraction": 1.0,
                         "requested_notional": result.requested_notional,
@@ -4877,7 +6072,7 @@ class Trader:
                         "position_action_label": sig.position_action_label,
                         **entry_context,
                         **self._pending_exit_result_meta(sig.side),
-                        **self._order_meta("SELL", exit_kind="emergency_exit", exit_label="紧急退出", exit_summary="emergency-exit"),
+                        **self._order_meta("SELL", exit_kind="emergency_exit", exit_label=emergency_exit_label, exit_summary="emergency-exit"),
                         **self._pending_order_snapshot(pending_record),
                     }
                 )
@@ -4913,7 +6108,7 @@ class Trader:
             self._apply_position_exit_meta(
                 position,
                 exit_kind="emergency_exit",
-                exit_label="紧急退出",
+                exit_label=emergency_exit_label,
                 exit_summary="emergency-exit",
                 ts=now,
             )
@@ -4930,9 +6125,9 @@ class Trader:
                     "position_action": sig.position_action,
                     "position_action_label": sig.position_action_label,
                     "exit_kind": "emergency_exit",
-                    "exit_label": "紧急退出",
+                    "exit_label": emergency_exit_label,
                     "exit_result": "emergency",
-                    "exit_result_label": "紧急退出",
+                    "exit_result_label": self._exit_result_label("emergency"),
                     "hold_minutes": self._position_hold_minutes(position, now),
                     "exit_fraction": 1.0,
                     "filled_notional": result.filled_notional,
@@ -4976,7 +6171,7 @@ class Trader:
                         remaining_notional=remaining_notional,
                         remaining_qty=remaining_qty,
                     ),
-                    **self._order_meta("SELL", exit_kind="emergency_exit", exit_label="紧急退出", exit_summary="emergency-exit"),
+                    **self._order_meta("SELL", exit_kind="emergency_exit", exit_label=emergency_exit_label, exit_summary="emergency-exit"),
                 }
             )
             position_snapshot = self._position_trace_snapshot(
@@ -5187,6 +6382,8 @@ class Trader:
             return
 
         now = int(time.time())
+        time_exit_label = self._exit_kind_label("time_exit")
+        time_trim_label = self._action_tag_label("trim")
         utilization = 0.0
         if self.settings.max_open_positions > 0:
             utilization = self.state.open_positions / self.settings.max_open_positions
@@ -5251,7 +6448,7 @@ class Trader:
                 observed_notional=target_notional,
                 timestamp=datetime.now(tz=timezone.utc),
                 position_action="exit" if full_close or exit_fraction >= 0.95 else "trim",
-                position_action_label="时间退出" if full_close or exit_fraction >= 0.95 else "时间减仓",
+                position_action_label=time_exit_label if full_close or exit_fraction >= 0.95 else time_trim_label,
             )
             signal_record = self._cycle_candidate_record(
                 sig,
@@ -5314,7 +6511,7 @@ class Trader:
                         "position_action": sig.position_action,
                         "position_action_label": sig.position_action_label,
                         "exit_kind": "time_exit",
-                        "exit_label": "时间退出",
+                        "exit_label": time_exit_label,
                         "hold_minutes": self._position_hold_minutes(position, now),
                         "exit_fraction": float(exit_fraction),
                         "trim_notional": target_notional,
@@ -5352,7 +6549,7 @@ class Trader:
                         **self._order_meta(
                             "SELL",
                             exit_kind="time_exit",
-                            exit_label="时间退出",
+                            exit_label=time_exit_label,
                             exit_summary="time-exit retired" if retired else "time-exit failed",
                         ),
                     }
@@ -5385,7 +6582,7 @@ class Trader:
                     signal=sig,
                     cycle_id=cycle_id,
                     result=result,
-                    order_meta=self._order_meta("SELL", exit_kind="time_exit", exit_label="时间退出", exit_summary="time-exit"),
+                    order_meta=self._order_meta("SELL", exit_kind="time_exit", exit_label=time_exit_label, exit_summary="time-exit"),
                     entry_context=entry_context,
                     previous_position=position,
                     order_reason=result.message,
@@ -5403,7 +6600,7 @@ class Trader:
                         "position_action": sig.position_action,
                         "position_action_label": sig.position_action_label,
                         "exit_kind": "time_exit",
-                        "exit_label": "时间退出",
+                        "exit_label": time_exit_label,
                         "hold_minutes": self._position_hold_minutes(position, now),
                         "exit_fraction": float(exit_fraction),
                         "requested_notional": result.requested_notional,
@@ -5439,7 +6636,7 @@ class Trader:
                         "position_action_label": sig.position_action_label,
                         **entry_context,
                         **self._pending_exit_result_meta(sig.side),
-                        **self._order_meta("SELL", exit_kind="time_exit", exit_label="时间退出", exit_summary="time-exit"),
+                        **self._order_meta("SELL", exit_kind="time_exit", exit_label=time_exit_label, exit_summary="time-exit"),
                         **self._pending_order_snapshot(pending_record),
                     }
                 )
@@ -5476,7 +6673,7 @@ class Trader:
             self._apply_position_exit_meta(
                 position,
                 exit_kind="time_exit",
-                exit_label="时间退出",
+                exit_label=time_exit_label,
                 exit_summary="time-exit trim",
                 ts=now,
             )
@@ -5492,9 +6689,9 @@ class Trader:
                     "position_action": sig.position_action,
                     "position_action_label": sig.position_action_label,
                     "exit_kind": "time_exit",
-                    "exit_label": "时间退出",
+                    "exit_label": time_exit_label,
                     "exit_result": "partial_trim" if remaining_notional > close_notional and remaining_qty > 0.0 else "full_exit",
-                    "exit_result_label": "部分减仓" if remaining_notional > close_notional and remaining_qty > 0.0 else "完全退出",
+                    "exit_result_label": self._exit_result_label("partial_trim") if remaining_notional > close_notional and remaining_qty > 0.0 else self._exit_result_label("full_exit"),
                     "hold_minutes": self._position_hold_minutes(position, now),
                     "exit_fraction": float(exit_fraction),
                     "trim_notional": result.filled_notional,
@@ -5537,7 +6734,7 @@ class Trader:
                         remaining_notional=remaining_notional,
                         remaining_qty=remaining_qty,
                     ),
-                    **self._order_meta("SELL", exit_kind="time_exit", exit_label="时间退出", exit_summary="time-exit trim"),
+                    **self._order_meta("SELL", exit_kind="time_exit", exit_label=time_exit_label, exit_summary="time-exit trim"),
                 }
             )
             position_snapshot = self._position_trace_snapshot(
@@ -5595,10 +6792,13 @@ class Trader:
         self._maybe_reconcile_runtime()
         self._roll_daily_state_if_needed()
         self._maybe_sync_account_state()
-        self._refresh_risk_state()
         control = self._load_control_state()
+        cycle_start_ts = int(time.time())
+        reconciliation = self.reconciliation_summary(now=cycle_start_ts)
+        self._update_trading_mode(control, now=cycle_start_ts, reconciliation=reconciliation)
+        self._refresh_risk_state()
         self._apply_operator_clear_stale_pending(control)
-        self._apply_control_pending_entry_cancels(control, now=int(time.time()))
+        self._apply_control_pending_entry_cancels(control, now=cycle_start_ts)
         processed_sell_tokens: set[str] = set()
         if control.emergency_stop:
             self._apply_emergency_exit()
@@ -5643,9 +6843,17 @@ class Trader:
                     sig.token_id,
                     price_hint=float(sig.price_hint or 0.0),
                     market_slug=str(sig.market_slug or ""),
+                    condition_id=str(sig.condition_id or ""),
                 )
                 skip_reason = self._candidate_skip_reason(sig, market_context, existing=existing)
-                if skip_reason in {"market_data_unavailable", "market_window_elapsed", "market_near_close"}:
+                if skip_reason in {
+                    "market_data_unavailable",
+                    "market_window_elapsed",
+                    "market_near_close",
+                    "market_closed",
+                    "market_inactive",
+                    "market_not_accepting_orders",
+                }:
                     precheck_skipped += 1
                     self.log.info(
                         "DROP wallet=%s slug=%s token=%s reason=%s",
@@ -5666,6 +6874,26 @@ class Trader:
                             "reason": skip_reason,
                         },
                     )
+                    record = self._cycle_candidate_record(
+                        sig,
+                        cycle_id=cycle_id,
+                        wallet_pool_snapshot=wallet_pool_snapshot,
+                    )
+                    decision_snapshot = self._decision_snapshot(
+                        signal=sig,
+                        control=control,
+                        existing=existing,
+                        skip_reason=skip_reason,
+                    )
+                    decision_snapshot["market_time_source"] = str(market_context.get("market_time_source") or "")
+                    decision_snapshot["market_metadata_hit"] = bool(market_context.get("market_metadata_hit", False))
+                    decision_snapshot["market_closed"] = market_context.get("market_closed")
+                    decision_snapshot["market_active"] = market_context.get("market_active")
+                    decision_snapshot["market_accepting_orders"] = market_context.get("market_accepting_orders")
+                    record["decision_snapshot"] = decision_snapshot
+                    record["final_status"] = "precheck_skipped"
+                    signal_records.append(record)
+                    signal_record_by_id[str(sig.signal_id)] = record
                     continue
             prepared_signals.append(sig)
             fresh_candidates.append(
@@ -5780,11 +7008,14 @@ class Trader:
             candidate_origin = str(execution_meta.get("origin") or "runtime")
             order_meta = self._signal_order_meta(sig)
             existing = self.positions_book.get(sig.token_id)
-            if sig.side == "BUY" and control.pause_opening:
+            opening_block_reason = self._buy_gate_reason() if sig.side == "BUY" else ""
+            if opening_block_reason:
                 self.log.info(
-                    "SKIP wallet=%s slug=%s reason=pause opening enabled",
+                    "SKIP wallet=%s slug=%s reason=%s trading_mode=%s",
                     sig.wallet,
                     sig.market_slug,
+                    opening_block_reason,
+                    self.trading_mode,
                 )
                 self._append_event(
                     "signal_skip",
@@ -5792,7 +7023,8 @@ class Trader:
                         "wallet": sig.wallet,
                         "market_slug": sig.market_slug,
                         "token_id": sig.token_id,
-                        "reason": "pause_opening",
+                        "reason": opening_block_reason,
+                        "trading_mode": self.trading_mode_state(),
                     },
                 )
                 finalize_signal(
@@ -5802,7 +7034,7 @@ class Trader:
                         signal=sig,
                         control=control,
                         existing=existing,
-                        skip_reason="pause_opening",
+                        skip_reason=opening_block_reason,
                     ),
                     now_ts=int(time.time()),
                 )
@@ -5811,44 +7043,8 @@ class Trader:
                         candidate_id,
                         action=candidate_action or "ignore",
                         status="skipped",
-                        rationale=candidate_note or "pause_opening",
-                        result_tag="pause_opening",
-                        signal=sig,
-                    )
-                continue
-            if sig.side == "BUY" and control.reduce_only:
-                self.log.info(
-                    "SKIP wallet=%s slug=%s reason=reduce-only mode",
-                    sig.wallet,
-                    sig.market_slug,
-                )
-                self._append_event(
-                    "signal_skip",
-                    {
-                        "wallet": sig.wallet,
-                        "market_slug": sig.market_slug,
-                        "token_id": sig.token_id,
-                        "reason": "reduce_only",
-                    },
-                )
-                finalize_signal(
-                    sig,
-                    final_status="skipped",
-                    decision_snapshot=self._decision_snapshot(
-                        signal=sig,
-                        control=control,
-                        existing=existing,
-                        skip_reason="reduce_only",
-                    ),
-                    now_ts=int(time.time()),
-                )
-                if candidate_id:
-                    self._record_candidate_result(
-                        candidate_id,
-                        action=candidate_action or "ignore",
-                        status="skipped",
-                        rationale=candidate_note or "reduce_only",
-                        result_tag="reduce_only",
+                        rationale=candidate_note or opening_block_reason,
+                        result_tag=opening_block_reason,
                         signal=sig,
                     )
                 continue
@@ -6171,7 +7367,26 @@ class Trader:
                     )
                 continue
 
-            if self._is_order_duplicate(sig, notional_to_use):
+            duplicate_reason = ""
+            duplicate_context: dict[str, object] = {}
+            pending_duplicate = self._find_pending_order_duplicate(sig) if sig.side == "BUY" else None
+            if pending_duplicate is not None:
+                duplicate_reason = "pending_order_duplicate"
+                duplicate_context = {
+                    "duplicate_source": str(pending_duplicate.get("recovery_source") or "pending_orders"),
+                    "duplicate_order_id": str(pending_duplicate.get("order_id") or ""),
+                    "duplicate_key": str(pending_duplicate.get("key") or ""),
+                    "duplicate_recovery_status": str(pending_duplicate.get("recovery_status") or ""),
+                }
+            else:
+                broker_open_order_duplicate = self._find_broker_open_order_duplicate(sig) if sig.side == "BUY" else None
+                if broker_open_order_duplicate is not None:
+                    duplicate_reason = "broker_open_order_duplicate"
+                    duplicate_context = dict(broker_open_order_duplicate)
+                elif self._is_order_duplicate(sig, notional_to_use):
+                    duplicate_reason = "recent_order_duplicate"
+
+            if duplicate_reason:
                 self._append_event(
                     "order_duplicate",
                     {
@@ -6182,14 +7397,17 @@ class Trader:
                         "notional": notional_to_use,
                         "wallet_score": sig.wallet_score,
                         "wallet_tier": sig.wallet_tier,
+                        "reason": duplicate_reason,
+                        **duplicate_context,
                     },
                 )
                 self.log.info(
-                    "SKIP_DUP wallet=%s slug=%s side=%s notional=%.2f",
+                    "SKIP_DUP wallet=%s slug=%s side=%s notional=%.2f reason=%s",
                     sig.wallet,
                     sig.market_slug,
                     sig.side,
                     notional_to_use,
+                    duplicate_reason,
                 )
                 finalize_signal(
                     sig,
@@ -6205,7 +7423,11 @@ class Trader:
                         netting_limited=netting_limited,
                         netting_snapshot=netting_snapshot,
                         duplicate=True,
-                    ),
+                    )
+                    | {
+                        "duplicate_reason": duplicate_reason,
+                        "duplicate_context": dict(duplicate_context),
+                    },
                     now_ts=now,
                 )
                 if candidate_id:
@@ -6213,8 +7435,8 @@ class Trader:
                         candidate_id,
                         action=candidate_action or "ignore",
                         status="duplicate_skipped",
-                        rationale=candidate_note or "duplicate_skipped",
-                        result_tag="duplicate_skipped",
+                        rationale=candidate_note or duplicate_reason,
+                        result_tag=duplicate_reason,
                         signal=sig,
                     )
                 continue
@@ -6420,7 +7642,7 @@ class Trader:
                     )
                     if str(exit_result_meta.get("exit_result") or "") == "full_exit":
                         position_action = "exit"
-                        position_action_label = "完全退出"
+                        position_action_label = self._action_tag_label("exit")
                     if remaining_notional <= self.settings.stale_position_close_notional_usd or remaining_qty <= 0.0:
                         position_snapshot = self._position_trace_snapshot(existing, is_open=False)
                         position_snapshot["notional"] = remaining_notional
@@ -6784,6 +8006,7 @@ class Trader:
     def run(self, once: bool = False) -> None:
         while True:
             self.step()
+            self.persist_runtime_state(self.settings.runtime_state_path)
             if once:
                 return
             time.sleep(self.settings.poll_interval_seconds)

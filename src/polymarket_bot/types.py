@@ -109,6 +109,8 @@ class Candidate:
     momentum_5m: float | None = None
     momentum_30m: float | None = None
     chase_pct: float | None = None
+    market_time_source: str = "unknown"
+    market_metadata_hit: bool = False
     market_tag: str = ""
     resolution_bucket: str = ""
     score: float = 0.0

@@ -21,6 +21,7 @@ from py_clob_client.order_builder.constants import BUY, SELL
 HOST_DEFAULT = "https://clob.polymarket.com"
 CHAIN_ID_DEFAULT = 137
 SIZE_QUANT = Decimal("0.01")
+USD_QUANT = Decimal("0.01")
 
 
 def _load_env() -> None:
@@ -54,6 +55,12 @@ def _ceil_size(value: float) -> float:
 def _floor_size(value: float) -> float:
     quantized = Decimal(str(max(0.0, value))).quantize(SIZE_QUANT, rounding=ROUND_FLOOR)
     return float(quantized)
+
+
+def _ceil_quantized(value: Decimal, quant: Decimal) -> Decimal:
+    if value <= 0:
+        return Decimal("0")
+    return (value / quant).to_integral_value(rounding=ROUND_CEILING) * quant
 
 
 def _floor_to_tick(price: float, tick_size: float) -> float:
@@ -128,6 +135,40 @@ def _order_options(snapshot: dict[str, Any]) -> PartialCreateOrderOptions:
     )
 
 
+def _choose_aggressive_buy_size(price: float, *, min_size: float, target_usd: float, max_usd: float) -> tuple[float, float]:
+    price_dec = Decimal(str(max(0.0, price)))
+    if price_dec <= 0:
+        raise SystemExit("cannot determine an aggressive BUY price from the current book")
+
+    target_notional = Decimal(str(max(0.0, target_usd))).quantize(USD_QUANT, rounding=ROUND_CEILING)
+    max_notional = Decimal(str(max(0.0, max_usd))).quantize(USD_QUANT, rounding=ROUND_FLOOR)
+    if max_notional <= 0 or target_notional <= 0:
+        raise SystemExit("aggressive BUY target/max notional must be positive")
+    if target_notional > max_notional:
+        raise SystemExit(f"aggressive BUY target {float(target_notional):.2f} exceeds cap {float(max_notional):.2f}")
+
+    min_size_dec = _ceil_quantized(Decimal(str(max(0.0, min_size))), SIZE_QUANT)
+    start_size = max(min_size_dec, _ceil_quantized(target_notional / price_dec, SIZE_QUANT))
+    end_size = _ceil_quantized(max_notional / price_dec, SIZE_QUANT)
+    if start_size > end_size:
+        raise SystemExit(
+            f"cannot fit aggressive BUY within ${float(max_notional):.2f} cap at price {float(price_dec):.4f} "
+            f"with min_order_size {float(min_size_dec):.2f}"
+        )
+
+    size = start_size
+    while size <= end_size:
+        maker_notional = price_dec * size
+        if maker_notional == maker_notional.quantize(USD_QUANT):
+            return float(size), float(maker_notional)
+        size += SIZE_QUANT
+
+    raise SystemExit(
+        f"cannot find aggressive BUY size with cent-precision maker amount between ${float(target_notional):.2f} "
+        f"and ${float(max_notional):.2f} at price {float(price_dec):.4f}"
+    )
+
+
 def _select_trade_order_id(row: dict[str, Any], funder: str) -> str:
     direct = str(row.get("orderID") or row.get("orderId") or row.get("order_id") or row.get("id") or "").strip()
     if direct:
@@ -171,6 +212,7 @@ def _matched_size_from_order(payload: dict[str, Any], fallback_price: float = 0.
     size = _as_float(
         payload.get("sizeMatched")
         or payload.get("matchedSize")
+        or payload.get("size_matched")
         or payload.get("filledSize")
         or payload.get("filled_size")
         or 0.0
@@ -194,7 +236,9 @@ def _trade_size(row: dict[str, Any]) -> float:
     size = _as_float(
         row.get("size")
         or row.get("filledSize")
+        or row.get("filled_size")
         or row.get("matchedSize")
+        or row.get("size_matched")
         or row.get("makerAmount")
         or row.get("takerAmount")
         or 0.0
@@ -262,6 +306,61 @@ def _post_limit_order(
     return order_id, posted
 
 
+def _build_aggressive_sell(snapshot: dict[str, Any], filled_buy_size: float) -> tuple[float, float]:
+    aggressive_sell_price = float(snapshot["best_bid"] or snapshot["midpoint"] or 0.0)
+    if aggressive_sell_price <= 0:
+        raise SystemExit("cannot determine an aggressive SELL price from the current book")
+    sell_size = min(filled_buy_size, _floor_size(snapshot["best_bid_size"])) if snapshot["best_bid_size"] > 0 else filled_buy_size
+    sell_size = _floor_size(sell_size)
+    if sell_size <= 0:
+        raise SystemExit("no sellable size available after aggressive BUY")
+    if sell_size < snapshot["min_order_size"]:
+        raise SystemExit(
+            f"aggressive SELL size {sell_size:.2f} is below current min_order_size {snapshot['min_order_size']:.2f}; manual unwind required"
+        )
+    return aggressive_sell_price, sell_size
+
+
+def _is_retryable_sell_error(exc: Exception) -> bool:
+    return "not enough balance / allowance" in str(exc or "").lower()
+
+
+def _post_aggressive_sell_with_retries(
+    client: ClobClient,
+    *,
+    token_id: str,
+    filled_buy_size: float,
+    sleep_seconds: float,
+    attempts: int = 5,
+) -> tuple[str, dict[str, Any], float, float]:
+    last_exc: Exception | None = None
+    for attempt in range(max(1, int(attempts))):
+        snapshot = _book_snapshot(client, token_id)
+        aggressive_sell_price, sell_size = _build_aggressive_sell(snapshot, filled_buy_size)
+        try:
+            aggressive_sell_id, aggressive_sell_post = _post_limit_order(
+                client,
+                token_id=token_id,
+                side=SELL,
+                price=aggressive_sell_price,
+                size=sell_size,
+                order_type=OrderType.FAK,
+                options=_order_options(snapshot),
+            )
+            return aggressive_sell_id, aggressive_sell_post, aggressive_sell_price, sell_size
+        except Exception as exc:
+            if not _is_retryable_sell_error(exc):
+                raise
+            last_exc = exc
+            if attempt >= max(1, int(attempts)) - 1:
+                raise
+            time.sleep(max(1.0, sleep_seconds))
+
+    if last_exc is not None:
+        raise last_exc
+    raise SystemExit("aggressive SELL failed without a captured exception")
+
+
 def _json_dump(label: str, payload: Any) -> None:
     print(f"\n== {label}")
     print(json.dumps(payload, indent=2, sort_keys=True, default=str))
@@ -274,6 +373,7 @@ def main() -> int:
     parser.add_argument("--token-id", required=True, help="Conditional token id to trade.")
     parser.add_argument("--resting-usd", type=float, default=1.0, help="Approx notional for the resting BUY.")
     parser.add_argument("--aggressive-usd", type=float, default=1.0, help="Approx notional for aggressive BUY/SELL.")
+    parser.add_argument("--max-usd", type=float, default=2.0, help="Hard cap for any live smoke leg.")
     parser.add_argument("--sleep-seconds", type=float, default=2.0, help="Sleep between post/cancel/lookups.")
     parser.add_argument("--yes-live", action="store_true", help="Required. This script submits real live orders.")
     args = parser.parse_args()
@@ -368,7 +468,12 @@ def main() -> int:
     aggressive_buy_price = float(snapshot["best_ask"] or snapshot["midpoint"] or 0.0)
     if aggressive_buy_price <= 0:
         raise SystemExit("cannot determine an aggressive BUY price from the current book")
-    aggressive_size = _ceil_size(max(snapshot["min_order_size"], float(args.aggressive_usd) / aggressive_buy_price))
+    aggressive_size, aggressive_buy_notional = _choose_aggressive_buy_size(
+        aggressive_buy_price,
+        min_size=float(snapshot["min_order_size"]),
+        target_usd=float(args.aggressive_usd),
+        max_usd=float(args.max_usd),
+    )
     if snapshot["best_ask_size"] > 0 and aggressive_size > snapshot["best_ask_size"]:
         raise SystemExit(
             f"requested aggressive BUY size {aggressive_size:.2f} exceeds current best-ask size {snapshot['best_ask_size']:.2f}; lower --aggressive-usd"
@@ -389,6 +494,7 @@ def main() -> int:
         {
             "price": aggressive_buy_price,
             "size": aggressive_size,
+            "notional_usd": aggressive_buy_notional,
             "response": aggressive_buy_post,
         },
     )
@@ -406,28 +512,12 @@ def main() -> int:
     if filled_buy_size <= 0:
         raise SystemExit("aggressive BUY did not fill; aborting SELL leg")
 
-    snapshot = _book_snapshot(client, token_id)
-    aggressive_sell_price = float(snapshot["best_bid"] or snapshot["midpoint"] or 0.0)
-    if aggressive_sell_price <= 0:
-        raise SystemExit("cannot determine an aggressive SELL price from the current book")
-    sell_size = min(filled_buy_size, _floor_size(snapshot["best_bid_size"])) if snapshot["best_bid_size"] > 0 else filled_buy_size
-    sell_size = _floor_size(sell_size)
-    if sell_size <= 0:
-        raise SystemExit("no sellable size available after aggressive BUY")
-    if sell_size < snapshot["min_order_size"]:
-        raise SystemExit(
-            f"aggressive SELL size {sell_size:.2f} is below current min_order_size {snapshot['min_order_size']:.2f}; manual unwind required"
-        )
-
     aggressive_sell_started = int(time.time())
-    aggressive_sell_id, aggressive_sell_post = _post_limit_order(
+    aggressive_sell_id, aggressive_sell_post, aggressive_sell_price, sell_size = _post_aggressive_sell_with_retries(
         client,
         token_id=token_id,
-        side=SELL,
-        price=aggressive_sell_price,
-        size=sell_size,
-        order_type=OrderType.FAK,
-        options=_order_options(snapshot),
+        filled_buy_size=filled_buy_size,
+        sleep_seconds=float(args.sleep_seconds),
     )
     _json_dump(
         "aggressive_sell_post",

@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timezone
 import time
 
-from polymarket_bot.clients.data_api import ActivityEvent, Position, TradeFill
+from polymarket_bot.clients.data_api import ActivityEvent, MarketMetadata, Position, TradeFill
 from polymarket_bot.strategies.wallet_follower import (
     PositionState,
     RawWalletEvent,
@@ -470,6 +470,160 @@ class WalletFollowerEventSignalTests(unittest.TestCase):
             [
                 make_candidate("token-late", f"eth-updown-5m-{market_start}", 95.0),
                 make_candidate("token-valid", "macro-market", 85.0),
+            ]
+        )
+        signals = strategy._select_live_signals(ranked_signals)
+
+        self.assertEqual([signal.token_id for signal in signals], ["token-valid"])
+
+    def test_select_live_signals_skips_market_not_accepting_orders_from_metadata(self):
+        wallet = "0x00000000000000000000000000000000000000c1"
+        now = datetime.now(tz=timezone.utc)
+
+        class _Book:
+            def __init__(self, best_bid: float, best_ask: float) -> None:
+                self.best_bid = best_bid
+                self.best_ask = best_ask
+
+        class _Client:
+            def get_order_book(self, _token_id: str):
+                return _Book(0.54, 0.55)
+
+            def get_market_metadata(self, condition_id: str = "", *, slug: str | None = None):
+                if condition_id == "condition-token-blocked":
+                    return MarketMetadata(
+                        condition_id="condition-token-blocked",
+                        market_slug="metadata-blocked-market",
+                        end_ts=int(time.time()) + 3600,
+                        end_date="2026-03-22T12:00:00Z",
+                        closed=False,
+                        active=True,
+                        accepting_orders=False,
+                    )
+                return None
+
+        def make_candidate(token_id: str, condition_id: str, market_slug: str, wallet_score: float) -> WalletCandidateContext:
+            return WalletCandidateContext(
+                wallet=wallet,
+                token_id=token_id,
+                condition_id=condition_id,
+                market_slug=market_slug,
+                outcome="YES",
+                side="BUY",
+                trigger_type="new_open",
+                confidence=0.82,
+                price_hint=0.52,
+                observed_size=200.0,
+                observed_notional=104.0,
+                timestamp=now,
+                wallet_score=wallet_score,
+                wallet_tier="CORE",
+                wallet_score_summary=f"score-{wallet_score}",
+                topic_key="macro",
+                topic_label="Macro",
+                topic_sample_count=4,
+                topic_win_rate=0.6,
+                topic_roi=0.1,
+                topic_resolved_win_rate=0.6,
+                topic_score_summary="macro summary",
+                position_action="entry",
+                position_action_label="首次入场",
+            )
+
+        strategy = WalletFollowerStrategy(
+            client=_Client(),
+            min_increase_usd=100.0,
+            min_decrease_usd=80.0,
+            max_signals_per_cycle=2,
+            min_active_positions=1,
+            min_unique_markets=1,
+            min_total_notional_usd=0.0,
+            max_top_market_share=1.0,
+            min_wallet_score=0.0,
+            signal_source="positions",
+        )
+
+        ranked_signals = strategy.rank_candidates(
+            [
+                make_candidate("token-blocked", "condition-token-blocked", "metadata-blocked-market", 95.0),
+                make_candidate("token-valid", "condition-token-valid", "macro-market", 85.0),
+            ]
+        )
+        signals = strategy._select_live_signals(ranked_signals)
+
+        self.assertEqual([signal.token_id for signal in signals], ["token-valid"])
+
+    def test_select_live_signals_skips_elapsed_market_from_metadata(self):
+        wallet = "0x00000000000000000000000000000000000000c1"
+        now = datetime.now(tz=timezone.utc)
+
+        class _Book:
+            def __init__(self, best_bid: float, best_ask: float) -> None:
+                self.best_bid = best_bid
+                self.best_ask = best_ask
+
+        class _Client:
+            def get_order_book(self, _token_id: str):
+                return _Book(0.54, 0.55)
+
+            def get_market_metadata(self, condition_id: str = "", *, slug: str | None = None):
+                if condition_id == "condition-token-expired":
+                    return MarketMetadata(
+                        condition_id="condition-token-expired",
+                        market_slug="metadata-expired-market",
+                        end_ts=int(time.time()) - 5,
+                        end_date="2026-03-20T23:59:00Z",
+                        closed=False,
+                        active=True,
+                        accepting_orders=True,
+                    )
+                return None
+
+        def make_candidate(token_id: str, condition_id: str, market_slug: str, wallet_score: float) -> WalletCandidateContext:
+            return WalletCandidateContext(
+                wallet=wallet,
+                token_id=token_id,
+                condition_id=condition_id,
+                market_slug=market_slug,
+                outcome="YES",
+                side="BUY",
+                trigger_type="new_open",
+                confidence=0.82,
+                price_hint=0.52,
+                observed_size=200.0,
+                observed_notional=104.0,
+                timestamp=now,
+                wallet_score=wallet_score,
+                wallet_tier="CORE",
+                wallet_score_summary=f"score-{wallet_score}",
+                topic_key="macro",
+                topic_label="Macro",
+                topic_sample_count=4,
+                topic_win_rate=0.6,
+                topic_roi=0.1,
+                topic_resolved_win_rate=0.6,
+                topic_score_summary="macro summary",
+                position_action="entry",
+                position_action_label="首次入场",
+            )
+
+        strategy = WalletFollowerStrategy(
+            client=_Client(),
+            min_increase_usd=100.0,
+            min_decrease_usd=80.0,
+            max_signals_per_cycle=2,
+            min_active_positions=1,
+            min_unique_markets=1,
+            min_total_notional_usd=0.0,
+            max_top_market_share=1.0,
+            min_wallet_score=0.0,
+            signal_source="positions",
+        )
+
+        ranked_signals = strategy.rank_candidates(
+            [
+                make_candidate("token-expired", "condition-token-expired", "metadata-expired-market", 95.0),
+                make_candidate("token-valid", "condition-token-valid", "macro-market", 85.0),
             ]
         )
         signals = strategy._select_live_signals(ranked_signals)

@@ -11,6 +11,16 @@ from polymarket_bot.types import Candidate, JournalEntry, WalletProfile
 
 
 class PersonalTerminalStoreTests(unittest.TestCase):
+    def test_connection_enables_wal_and_busy_timeout(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            store = PersonalTerminalStore(str(Path(tmpdir) / "terminal.db"))
+            with store.connection() as conn:
+                journal_mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+                busy_timeout = int(conn.execute("PRAGMA busy_timeout").fetchone()[0])
+
+            self.assertEqual(journal_mode, "wal")
+            self.assertEqual(busy_timeout, 5000)
+
     def test_close_marks_store_unusable_until_reentered(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             store = PersonalTerminalStore(str(Path(tmpdir) / "terminal.db"))
@@ -203,6 +213,59 @@ class PersonalTerminalStoreTests(unittest.TestCase):
                 self.assertEqual(detail["summary"]["related_journal_count"], 1)
                 self.assertEqual(detail["related_actions"][0]["action"], "follow")
                 self.assertEqual(detail["related_journal"][0]["action"], "follow")
+
+    def test_upsert_candidate_folds_active_duplicate_pending_rows(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with PersonalTerminalStore(str(Path(tmpdir) / "terminal.db")) as store:
+                now = int(time.time())
+
+                store.upsert_candidate(
+                    Candidate(
+                        id="cand-first",
+                        signal_id="sig-first",
+                        trace_id="trc-first",
+                        wallet="0xdup",
+                        market_slug="dup-market",
+                        token_id="dup-token",
+                        outcome="YES",
+                        side="BUY",
+                        confidence=0.8,
+                        score=61.0,
+                        suggested_action="buy_small",
+                        status="pending",
+                        created_ts=now,
+                        expires_ts=now + 300,
+                        updated_ts=now,
+                    )
+                )
+                store.upsert_candidate(
+                    Candidate(
+                        id="cand-second",
+                        signal_id="sig-second",
+                        trace_id="trc-second",
+                        wallet="0xdup",
+                        market_slug="dup-market",
+                        token_id="dup-token",
+                        outcome="YES",
+                        side="BUY",
+                        confidence=0.82,
+                        score=64.0,
+                        suggested_action="buy_small",
+                        status="pending",
+                        created_ts=now + 10,
+                        expires_ts=now + 900,
+                        updated_ts=now + 10,
+                    )
+                )
+
+                pending = store.list_candidates(statuses=["pending"], include_expired=True, limit=10)
+
+                self.assertEqual(len(pending), 1)
+                self.assertEqual(pending[0]["id"], "cand-first")
+                self.assertEqual(pending[0]["signal_id"], "sig-second")
+                self.assertEqual(pending[0]["trace_id"], "trc-second")
+                self.assertEqual(int(pending[0]["created_ts"] or 0), now)
+                self.assertEqual(int(pending[0]["expires_ts"] or 0), now + 900)
 
     def test_candidates_expire_when_short_market_window_has_ended(self):
         with tempfile.TemporaryDirectory() as tmpdir:

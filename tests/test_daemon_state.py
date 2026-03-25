@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import time
 import tempfile
 import unittest
@@ -9,7 +10,13 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from polymarket_bot.config import Settings
-from polymarket_bot.daemon import _build_state, _build_wallet_score_cache
+from polymarket_bot.daemon import (
+    _build_state,
+    _build_wallet_score_cache,
+    _persist_cycle_outputs,
+    _prepare_bootstrap_trader_state,
+    _safe_write_json,
+)
 from polymarket_bot.notifier import Notifier
 
 
@@ -115,7 +122,7 @@ class DaemonStateTests(unittest.TestCase):
         notifier_dir = tempfile.TemporaryDirectory()
         self.addCleanup(notifier_dir.cleanup)
         notifier_log = str(Path(notifier_dir.name) / "notifier.jsonl")
-        with patch.dict("os.environ", {"POLY_NOTIFIER_LOG_PATH": notifier_log}):
+        with patch.dict("os.environ", {"NOTIFY_LOG_PATH": notifier_log}):
             Notifier(log_path=notifier_log).notify_local(title="Ops", body="check queue")
         pending_candidate = {
             "id": "cand-live",
@@ -123,6 +130,9 @@ class DaemonStateTests(unittest.TestCase):
             "suggested_action": "watch",
             "market_slug": "will-btc-close-above-100k",
             "wallet": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "market_time_source": "metadata",
+            "market_metadata_hit": True,
+            "skip_reason": "market_not_accepting_orders",
         }
         skipped_candidate = {
             "id": "cand-skipped",
@@ -461,6 +471,15 @@ class DaemonStateTests(unittest.TestCase):
                 {"name": "network_smoke", "status": "FAIL", "message": "network smoke indicates geoblock/restriction"},
                 {"name": "user_stream", "status": "WARN", "message": "websocket-client missing"},
             ],
+            trading_mode_state=lambda: {
+                "mode": "REDUCE_ONLY",
+                "opening_allowed": False,
+                "reason_codes": ["startup_not_ready", "reconciliation_warn"],
+                "updated_ts": int(time.time()) - 15,
+                "source": "runner",
+                "account_state_status": "fresh",
+                "reconciliation_status": "warn",
+            },
             reconciliation_summary=lambda now=None: {
                 "day_key": "2026-03-17",
                 "status": "warn",
@@ -494,7 +513,7 @@ class DaemonStateTests(unittest.TestCase):
         with patch.dict(
             "os.environ",
             {
-                "POLY_NOTIFIER_LOG_PATH": notifier_log,
+                "NOTIFY_LOG_PATH": notifier_log,
                 "WALLET_EXIT_FOLLOW_ENABLED": "1",
                 "POLY_WALLET_EXIT_FOLLOW_ENABLED": "true",
             },
@@ -559,6 +578,9 @@ class DaemonStateTests(unittest.TestCase):
         self.assertAlmostEqual(payload["available_notional_usd"], payload["summary"]["available_notional_usd"], places=4)
         self.assertEqual(payload["open_positions"], payload["summary"]["open_positions"])
         self.assertEqual(payload["mode"], payload["decision_mode"]["mode"])
+        self.assertEqual(payload["trading_mode"]["mode"], "REDUCE_ONLY")
+        self.assertFalse(payload["trading_mode"]["opening_allowed"])
+        self.assertEqual(payload["trading_mode"]["reason_codes"], ["startup_not_ready", "reconciliation_warn"])
         self.assertFalse(payload["startup_ready"])
         self.assertEqual(payload["reconciliation_status"], payload["reconciliation"]["status"])
         self.assertEqual(
@@ -591,6 +613,11 @@ class DaemonStateTests(unittest.TestCase):
         self.assertEqual(payload["candidates"]["summary"]["count"], 1)
         self.assertEqual(payload["candidates"]["summary"]["pending"], 1)
         self.assertEqual([item["id"] for item in payload["candidates"]["items"]], ["cand-live"])
+        self.assertEqual(payload["candidates"]["observability"]["candidate_count"], 1)
+        self.assertEqual(payload["candidates"]["observability"]["market_metadata"]["hits"], 1)
+        self.assertEqual(payload["candidates"]["observability"]["market_metadata"]["misses"], 0)
+        self.assertEqual(payload["candidates"]["observability"]["market_time_source"]["metadata"], 1)
+        self.assertEqual(payload["candidates"]["observability"]["skip_reasons"]["market_not_accepting_orders"], 1)
         self.assertEqual(payload["attribution_review"]["summary"]["available_orders"], 3)
         self.assertEqual(payload["attribution_review"]["windows"]["24h"]["summary"]["order_count"], 3)
         self.assertEqual(payload["attribution_review"]["windows"]["24h"]["summary"]["rejected_count"], 1)
@@ -632,6 +659,118 @@ class DaemonStateTests(unittest.TestCase):
         self.assertEqual(cache_payload["wallets"][0]["closed_positions"], 16)
         self.assertAlmostEqual(cache_payload["wallets"][0]["win_rate"], 0.6875, places=4)
         self.assertEqual(cache_payload["wallets"][0]["discovery_priority_rank"], 1)
+
+    def test_build_state_surfaces_recent_cycle_skip_observability_without_active_candidates(self):
+        trader = SimpleNamespace(
+            broker=SimpleNamespace(),
+            strategy=SimpleNamespace(latest_wallet_metrics=lambda: {}),
+            _cached_wallet_activity_counts={},
+            _cached_wallet_selection_context={},
+            _cached_wallets_ts=time.time(),
+            positions_book={},
+            pending_orders={},
+            recent_orders=deque(maxlen=16),
+            last_signals=[],
+            last_wallets=["0xabc"],
+            recent_signal_cycles=deque(
+                [
+                    {
+                        "cycle_id": "cyc-skip",
+                        "ts": int(time.time()) - 15,
+                        "wallets": ["0xabc"],
+                        "wallet_pool_snapshot": [],
+                        "decision_mode": "manual",
+                        "candidates": [
+                            {
+                                "signal_id": "sig-skip",
+                                "trace_id": "trc-skip",
+                                "wallet": "0xabc",
+                                "market_slug": "demo-market",
+                                "token_id": "token-1",
+                                "outcome": "YES",
+                                "side": "BUY",
+                                "candidate_snapshot": {
+                                    "signal_id": "sig-skip",
+                                    "trace_id": "trc-skip",
+                                    "wallet": "0xabc",
+                                    "market_slug": "demo-market",
+                                    "token_id": "token-1",
+                                    "outcome": "YES",
+                                    "side": "BUY",
+                                },
+                                "decision_snapshot": {
+                                    "skip_reason": "market_not_accepting_orders",
+                                    "market_time_source": "metadata",
+                                    "market_metadata_hit": True,
+                                },
+                                "final_status": "precheck_skipped",
+                            }
+                        ],
+                    }
+                ],
+                maxlen=6,
+            ),
+            _trace_records=lambda: [],
+            state=SimpleNamespace(
+                daily_realized_pnl=0.0,
+                broker_closed_pnl_today=0.0,
+                open_positions=0,
+                tracked_notional_usd=0.0,
+                pending_entry_notional_usd=0.0,
+                pending_exit_notional_usd=0.0,
+                pending_entry_orders=0,
+                equity_usd=0.0,
+                cash_balance_usd=0.0,
+                positions_value_usd=0.0,
+                account_snapshot_ts=0,
+            ),
+            control_state=SimpleNamespace(
+                decision_mode="manual",
+                pause_opening=False,
+                reduce_only=False,
+                emergency_stop=False,
+                clear_stale_pending_requested_ts=0,
+                updated_ts=0,
+            ),
+            last_operator_action={},
+            startup_ready=True,
+            startup_warning_count=0,
+            startup_failure_count=0,
+            startup_checks=[],
+            trading_mode_state=lambda: {
+                "mode": "NORMAL",
+                "opening_allowed": True,
+                "reason_codes": [],
+                "updated_ts": int(time.time()),
+                "source": "runner",
+                "account_state_status": "fresh",
+                "reconciliation_status": "ok",
+                "persistence_status": "ok",
+            },
+            reconciliation_summary=lambda now=None: {"status": "ok", "issues": [], "day_key": "2026-03-20"},
+            candidate_store=None,
+            list_candidates=lambda **_: [],
+            list_wallet_profiles=lambda **_: [],
+            list_journal_entries=lambda **_: [],
+            journal_summary=lambda **_: {},
+            pending_candidate_actions=lambda **_: [],
+        )
+
+        payload = _build_state(trader, Settings(_env_file=None))
+
+        self.assertEqual(payload["candidates"]["summary"]["count"], 0)
+        self.assertEqual(payload["candidates"]["observability"]["candidate_count"], 0)
+        self.assertEqual(payload["candidates"]["observability"]["recent_cycles"]["cycles"], 1)
+        self.assertEqual(payload["candidates"]["observability"]["recent_cycles"]["signals"], 1)
+        self.assertEqual(payload["candidates"]["observability"]["recent_cycles"]["precheck_skipped"], 1)
+        self.assertEqual(
+            payload["candidates"]["observability"]["recent_cycles"]["skip_reasons"]["market_not_accepting_orders"],
+            1,
+        )
+        self.assertEqual(
+            payload["candidates"]["observability"]["recent_cycles"]["market_time_source"]["metadata"],
+            1,
+        )
 
     def test_notifier_summary_reports_multiple_channels_and_delivery_stats(self):
         notifier_dir = tempfile.TemporaryDirectory()
@@ -705,6 +844,216 @@ class DaemonStateTests(unittest.TestCase):
         self.assertEqual(settings.notify_webhook_url_list, [])
         self.assertFalse(settings.notify_telegram_enabled)
         self.assertEqual(settings.notify_telegram_api_base, "https://api.telegram.org")
+
+    def test_build_state_notifier_summary_uses_settings_notification_config(self):
+        trader = SimpleNamespace(
+            broker=SimpleNamespace(),
+            strategy=SimpleNamespace(latest_wallet_metrics=lambda: {}),
+            positions_book={},
+            pending_orders={},
+            recent_orders=deque(),
+            last_signals=[],
+            last_wallets=["0xabc"],
+            recent_signal_cycles=deque(),
+            _trace_records=lambda: [],
+            _cached_wallets_ts=time.time(),
+            state=SimpleNamespace(open_positions=0, tracked_notional_usd=0.0, daily_realized_pnl=0.0),
+            control_state=SimpleNamespace(
+                pause_opening=False,
+                reduce_only=False,
+                emergency_stop=False,
+                clear_stale_pending_requested_ts=0,
+                updated_ts=0,
+            ),
+            last_operator_action={},
+            startup_ready=True,
+            startup_warning_count=0,
+            startup_failure_count=0,
+            startup_checks=[],
+            trading_mode_state=lambda: {
+                "mode": "NORMAL",
+                "opening_allowed": True,
+                "reason_codes": [],
+                "updated_ts": int(time.time()),
+                "source": "runner",
+                "account_state_status": "fresh",
+                "reconciliation_status": "ok",
+                "persistence_status": "ok",
+            },
+            reconciliation_summary=lambda now=None: {"status": "ok", "issues": [], "day_key": "2026-03-20"},
+            candidate_store=None,
+            list_candidates=lambda **_: [],
+            list_wallet_profiles=lambda **_: [],
+            list_journal_entries=lambda **_: [],
+            journal_summary=lambda **_: {},
+            pending_candidate_actions=lambda **_: [],
+        )
+
+        with patch.dict(
+            "os.environ",
+            {
+                "POLY_NOTIFY_WEBHOOK_URL": "",
+                "POLY_NOTIFY_WEBHOOK_URLS": "",
+                "POLY_NOTIFY_TELEGRAM_BOT_TOKEN": "",
+                "POLY_NOTIFY_TELEGRAM_CHAT_ID": "",
+            },
+            clear=False,
+        ):
+            settings = Settings(
+                _env_file=None,
+                notify_local_enabled=False,
+                notify_webhook_url="https://hooks.example.local/ops",
+                notify_log_path=str(Path(tempfile.gettempdir()) / "daemon-state-notifier.jsonl"),
+            )
+            payload = _build_state(trader, settings)
+
+        self.assertTrue(payload["notifier"]["webhook_configured"])
+        channels = {row["name"]: row for row in payload["notifier"]["channels"]}
+        self.assertFalse(channels["local"]["configured"])
+        self.assertEqual(channels["webhook"]["target_count"], 1)
+
+    def test_build_state_includes_persistence_snapshot(self):
+        trader = SimpleNamespace(
+            broker=SimpleNamespace(),
+            strategy=SimpleNamespace(latest_wallet_metrics=lambda: {}),
+            _cached_wallet_activity_counts={},
+            _cached_wallet_selection_context={},
+            _cached_wallets_ts=time.time(),
+            positions_book={},
+            pending_orders={},
+            recent_orders=deque(maxlen=16),
+            last_signals=[],
+            last_wallets=[],
+            recent_signal_cycles=deque(maxlen=4),
+            state=SimpleNamespace(
+                daily_realized_pnl=0.0,
+                broker_closed_pnl_today=0.0,
+                open_positions=0,
+                tracked_notional_usd=0.0,
+                pending_entry_notional_usd=0.0,
+                pending_exit_notional_usd=0.0,
+                pending_entry_orders=0,
+                equity_usd=0.0,
+                cash_balance_usd=0.0,
+                positions_value_usd=0.0,
+                account_snapshot_ts=0,
+            ),
+            control_state=SimpleNamespace(
+                decision_mode="auto",
+                pause_opening=False,
+                reduce_only=False,
+                emergency_stop=False,
+                clear_stale_pending_requested_ts=0,
+                updated_ts=0,
+            ),
+            last_operator_action={},
+            startup_ready=True,
+            startup_warning_count=0,
+            startup_failure_count=0,
+            startup_checks=[],
+            trading_mode_state=lambda: {
+                "mode": "HALTED",
+                "opening_allowed": False,
+                "reason_codes": ["persistence_fault"],
+                "updated_ts": int(time.time()),
+                "source": "runner",
+                "account_state_status": "fresh",
+                "reconciliation_status": "ok",
+                "persistence_status": "fault",
+            },
+            persistence_state=lambda: {
+                "status": "fault",
+                "failure_count": 2,
+                "last_failure": {"kind": "runtime_state_write", "path": "/tmp/runtime.json", "message": "disk full", "ts": 1},
+            },
+            reconciliation_summary=lambda now=None: {"status": "ok", "issues": [], "day_key": "2026-03-20"},
+        )
+
+        payload = _build_state(trader, Settings(_env_file=None))
+
+        self.assertEqual(payload["trading_mode"]["mode"], "HALTED")
+        self.assertEqual(payload["trading_mode"]["persistence_status"], "fault")
+        self.assertEqual(payload["persistence"]["status"], "fault")
+        self.assertEqual(payload["persistence"]["failure_count"], 2)
+        self.assertEqual(payload["persistence"]["last_failure"]["kind"], "runtime_state_write")
+
+    def test_persist_cycle_outputs_records_state_write_fault_and_raises(self):
+        settings = Settings(_env_file=None)
+        payload = {"summary": {"open_positions": 0}}
+        errors: list[tuple[str, str, str]] = []
+        trader = SimpleNamespace(
+            strategy=SimpleNamespace(latest_wallet_metrics=lambda: {}),
+            record_external_persistence_fault=lambda kind, path, error: errors.append((kind, path, str(error))),
+            persist_runtime_state=lambda path: None,
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = str(Path(tmpdir) / "state.json")
+            wallet_score_path = str(Path(tmpdir) / "wallet_scores.json")
+            with patch("polymarket_bot.daemon._safe_write_json", side_effect=OSError("disk full")):
+                with self.assertRaises(OSError):
+                    _persist_cycle_outputs(
+                        trader,
+                        settings,
+                        state_path=state_path,
+                        payload=payload,
+                        wallet_score_path=wallet_score_path,
+                        log=SimpleNamespace(warning=lambda *args, **kwargs: None),
+                    )
+
+        self.assertEqual(errors, [("daemon_state_write", state_path, "disk full")])
+
+    def test_prepare_bootstrap_trader_state_loads_control_before_updating_trading_mode(self):
+        call_order: list[str] = []
+        loaded_control = SimpleNamespace(
+            decision_mode="manual",
+            pause_opening=True,
+            reduce_only=False,
+            emergency_stop=False,
+            clear_stale_pending_requested_ts=0,
+            updated_ts=123,
+        )
+        captured: dict[str, object] = {}
+        trader = SimpleNamespace(
+            control_state=SimpleNamespace(
+                decision_mode="auto",
+                pause_opening=False,
+                reduce_only=False,
+                emergency_stop=False,
+                clear_stale_pending_requested_ts=0,
+                updated_ts=0,
+            ),
+            _load_control_state=lambda: call_order.append("load_control") or loaded_control,
+            reconciliation_summary=lambda now=None: call_order.append("reconciliation") or {"status": "ok", "day_key": "2026-03-20"},
+            _update_trading_mode=lambda control, now=None, reconciliation=None: (
+                call_order.append("update_mode"),
+                captured.update({"control": control, "reconciliation": reconciliation, "now": now}),
+            ),
+            _refresh_risk_state=lambda: call_order.append("refresh_risk"),
+        )
+
+        with patch("polymarket_bot.daemon.time.time", return_value=1700000100):
+            _prepare_bootstrap_trader_state(trader)
+
+        self.assertEqual(call_order, ["load_control", "reconciliation", "update_mode", "refresh_risk"])
+        self.assertIs(captured["control"], loaded_control)
+        self.assertEqual(captured["reconciliation"], {"status": "ok", "day_key": "2026-03-20"})
+        self.assertEqual(captured["now"], 1700000100)
+
+    def test_safe_write_json_supports_home_and_bare_filename_paths(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            prev_cwd = os.getcwd()
+            os.chdir(tmpdir)
+            try:
+                _safe_write_json("state.json", {"ok": True})
+            finally:
+                os.chdir(prev_cwd)
+            self.assertTrue((Path(tmpdir) / "state.json").exists())
+
+        with tempfile.TemporaryDirectory() as home_dir:
+            with patch.dict("os.environ", {"HOME": home_dir}):
+                _safe_write_json("~/daemon-state.json", {"ok": True})
+            self.assertTrue((Path(home_dir) / "daemon-state.json").exists())
 
 
 if __name__ == "__main__":
