@@ -122,7 +122,10 @@ class Candidate:
     has_existing_position: bool = False
     existing_position_conflict: bool = False
     existing_position_notional: float = 0.0
+    block_reason: str = ""
+    block_layer: str = ""
     status: str = "pending"
+    lifecycle_state: str = "active"
     selected_action: str = ""
     created_ts: int = 0
     expires_ts: int = 0

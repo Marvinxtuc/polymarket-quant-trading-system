@@ -1,0 +1,41 @@
+[BLOCK-007 Validation]
+Date: 2026-03-27
+Workspace: /Users/marvin.xa/Desktop/Polymarket
+
+Validation round scope:
+- /api/state signer_security 增加 allowlist 过滤（最小字段导出，去除 signer_url/secret_path/token 等敏感键）。
+- 补充 identity mismatch fail-close 证明测试（启动期 signer/api/funder 一致性）。
+- 复跑 BLOCK-007 全部门禁。
+- runbook 明确记录 /api/state signer_security allowlist 语义。
+
+Commands and outcomes:
+1) PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -p 'test_live_mode_rejects_raw_private_key.py'
+   -> PASS (Ran 2 tests)
+2) PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -p 'test_signer_required_in_live_mode.py'
+   -> PASS (Ran 2 tests)
+3) PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -p 'test_signer_failure_blocks_startup.py'
+   -> PASS (Ran 2 tests)
+4) PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -p 'test_signer_signs_without_exposing_key.py'
+   -> PASS (Ran 4 tests)
+5) PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -p 'test_hot_wallet_balance_cap_enforced.py'
+   -> PASS (Ran 2 tests)
+6) PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -p 'test_live_clob.py'
+   -> PASS (Ran 23 tests)
+7) PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -p 'test_web_api.py'
+   -> PASS (Ran 12 tests)
+8) PYTHONPATH=src .venv/bin/python scripts/verify_signer_required_live.py
+   -> PASS
+9) PYTHONPATH=src .venv/bin/python scripts/verify_no_raw_key_in_live_mode.py
+   -> PASS
+10) bash scripts/gates/gate_static.sh BLOCK-007
+    -> PASS
+11) bash scripts/gates/gate_tests.sh BLOCK-007
+    -> PASS
+12) bash scripts/gates/gate_behavior.sh BLOCK-007
+    -> PASS
+13) bash scripts/gates/gate_docs.sh BLOCK-007
+    -> PASS
+14) bash scripts/gates/gate_block_item.sh BLOCK-007
+    -> PASS (static=0 tests=0 behavior=0 docs=0 overall=0)
+
+Result: BLOCK-007 validation evidence complete.

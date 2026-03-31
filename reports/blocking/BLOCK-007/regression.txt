@@ -1,0 +1,14 @@
+[BLOCK-007 Regression]
+Date: 2026-03-27
+
+Executed regression commands:
+- PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -p 'test_live_mode_rejects_raw_private_key.py' -> PASS
+- PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -p 'test_signer_required_in_live_mode.py' -> PASS
+- PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -p 'test_signer_failure_blocks_startup.py' -> PASS
+- PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -p 'test_signer_signs_without_exposing_key.py' -> PASS
+- PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -p 'test_hot_wallet_balance_cap_enforced.py' -> PASS
+- PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -p 'test_live_clob.py' -> PASS
+- PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -p 'test_web_api.py' -> PASS
+- bash scripts/gates/gate_block_item.sh BLOCK-007 -> PASS
+
+Regression result: PASS.

@@ -30,6 +30,19 @@ _MARKET_WINDOW_SECONDS = {
     "1h": 3600,
 }
 
+_ACTIVE_CANDIDATE_STATUSES = {"pending", "watched", "approved", "queued", "requested", "submitted"}
+
+
+def _candidate_lifecycle_state(status: str) -> str:
+    normalized = str(status or "").strip().lower()
+    if normalized == "expired":
+        return "expired_discarded"
+    if normalized in {"executed", "submitted"}:
+        return "executed"
+    if normalized in {"ignored", "skipped", "risk_rejected", "duplicate_skipped", "rejected", "manual_required"}:
+        return "skipped"
+    return "active"
+
 
 def _candidate_market_end_ts(market_slug: str) -> int:
     normalized = str(market_slug or "").strip().lower()
@@ -211,6 +224,7 @@ class PersonalTerminalStore:
         payload = self._payload_dict(candidate)
         now = int(time.time())
         payload.setdefault("status", "pending")
+        payload.setdefault("lifecycle_state", _candidate_lifecycle_state(str(payload.get("status") or "pending")))
         payload.setdefault("selected_action", "")
         payload.setdefault("created_ts", now)
         payload["updated_ts"] = int(payload.get("updated_ts") or now)
@@ -333,6 +347,9 @@ class PersonalTerminalStore:
         payload["created_ts"] = int(row["created_ts"] or payload.get("created_ts") or 0)
         payload["expires_ts"] = int(row["expires_ts"] or payload.get("expires_ts") or 0)
         payload["updated_ts"] = int(row["updated_ts"] or payload.get("updated_ts") or 0)
+        payload["lifecycle_state"] = str(
+            payload.get("lifecycle_state") or _candidate_lifecycle_state(payload.get("status") or "pending")
+        )
         return payload
 
     @staticmethod
@@ -388,41 +405,43 @@ class PersonalTerminalStore:
     def expire_candidates(self, now: int | None = None) -> int:
         current_ts = int(now or time.time())
         with self.connection() as conn:
-            cursor = conn.execute(
-                """
-                UPDATE candidates
-                   SET status = 'expired', updated_ts = ?
-                 WHERE status IN ('pending', 'watched', 'approved')
-                   AND expires_ts > 0
-                   AND expires_ts < ?
-                """,
-                (current_ts, current_ts),
-            )
-            updated = int(cursor.rowcount or 0)
             rows = conn.execute(
                 """
-                SELECT id, market_slug, expires_ts
+                SELECT *
                   FROM candidates
-                 WHERE status IN ('pending', 'watched', 'approved')
+                 WHERE status IN ('pending', 'watched', 'approved', 'queued', 'requested', 'submitted')
                 """
             ).fetchall()
-            for row in rows:
-                market_end_ts = _candidate_market_end_ts(str(row["market_slug"] or ""))
-                if market_end_ts <= 0 or market_end_ts >= current_ts:
-                    continue
-                next_expiry = int(row["expires_ts"] or 0)
-                if next_expiry <= 0 or market_end_ts < next_expiry:
-                    next_expiry = market_end_ts
-                expire_cursor = conn.execute(
-                    """
-                    UPDATE candidates
-                       SET status = 'expired', expires_ts = ?, updated_ts = ?
-                     WHERE id = ?
-                    """,
-                    (next_expiry, current_ts, str(row["id"] or "")),
-                )
-                updated += int(expire_cursor.rowcount or 0)
-            return updated
+
+        updated = 0
+        for row in rows:
+            payload = self._candidate_row_to_dict(row)
+            if payload is None:
+                continue
+            candidate_id = str(payload.get("id") or "")
+            if not candidate_id:
+                continue
+            next_expiry = int(payload.get("expires_ts") or 0)
+            market_end_ts = _candidate_market_end_ts(str(payload.get("market_slug") or ""))
+            if market_end_ts > 0 and (next_expiry <= 0 or market_end_ts < next_expiry):
+                next_expiry = market_end_ts
+            if next_expiry <= 0 or next_expiry >= current_ts:
+                continue
+            previous_status = str(payload.get("status") or "").strip().lower()
+            result = self.update_candidate_status(
+                candidate_id,
+                status="expired",
+                note="candidate_lifecycle:expired",
+                result_tag="candidate_lifetime_expired",
+                block_reason="candidate_lifetime_expired",
+                block_layer="candidate",
+                lifecycle_state="expired_discarded",
+                expires_ts=next_expiry,
+                updated_ts=current_ts,
+            )
+            if result is not None and previous_status != "expired":
+                updated += 1
+        return updated
 
     def list_candidates(
         self,
@@ -608,6 +627,10 @@ class PersonalTerminalStore:
         selected_action: str | None = None,
         note: str | None = None,
         result_tag: str | None = None,
+        block_reason: str | None = None,
+        block_layer: str | None = None,
+        lifecycle_state: str | None = None,
+        expires_ts: int | None = None,
         updated_ts: int | None = None,
     ) -> dict[str, Any] | None:
         payload = self.get_candidate(candidate_id)
@@ -621,6 +644,26 @@ class PersonalTerminalStore:
             payload["note"] = str(note)
         if result_tag is not None:
             payload["result_tag"] = str(result_tag)
+        next_block_reason = str(
+            block_reason
+            if block_reason is not None
+            else payload.get("block_reason") or ""
+        ).strip()
+        next_block_layer = str(
+            block_layer
+            if block_layer is not None
+            else payload.get("block_layer") or ""
+        ).strip()
+        if str(payload.get("status") or "").strip().lower() == "expired":
+            if not next_block_reason:
+                next_block_reason = str(payload.get("result_tag") or "candidate_lifetime_expired").strip()
+            if not next_block_layer:
+                next_block_layer = "candidate"
+        payload["block_reason"] = next_block_reason
+        payload["block_layer"] = next_block_layer
+        if expires_ts is not None:
+            payload["expires_ts"] = int(expires_ts)
+        payload["lifecycle_state"] = str(lifecycle_state or _candidate_lifecycle_state(payload.get("status") or "pending"))
         payload["updated_ts"] = now
         self.upsert_candidate(payload)
         return payload
@@ -711,6 +754,58 @@ class PersonalTerminalStore:
 
     def list_pending_actions(self, *, limit: int = 50) -> list[dict[str, Any]]:
         return self.list_candidates(statuses=["approved", "watched"], limit=limit)
+
+    def candidate_lifecycle_summary(self, *, limit: int = 5000) -> dict[str, Any]:
+        candidates = self.list_candidates(limit=limit, include_expired=True)
+        summary = {
+            "updated_ts": int(time.time()),
+            "active_count": 0,
+            "expired_discarded_count": 0,
+            "executed_count": 0,
+            "skipped_count": 0,
+            "by_status": {},
+            "block_reasons": {},
+            "block_layers": {},
+            "reason_layer_counts": {},
+        }
+        for row in candidates:
+            status = str(row.get("status") or "").strip().lower()
+            lifecycle_state = str(row.get("lifecycle_state") or _candidate_lifecycle_state(status))
+            summary["by_status"][status or "unknown"] = int(summary["by_status"].get(status or "unknown") or 0) + 1
+            if lifecycle_state == "expired_discarded":
+                summary["expired_discarded_count"] = int(summary.get("expired_discarded_count") or 0) + 1
+            elif lifecycle_state == "executed":
+                summary["executed_count"] = int(summary.get("executed_count") or 0) + 1
+            elif lifecycle_state == "skipped":
+                summary["skipped_count"] = int(summary.get("skipped_count") or 0) + 1
+            else:
+                summary["active_count"] = int(summary.get("active_count") or 0) + 1
+            reason = str(row.get("block_reason") or "").strip()
+            layer = str(row.get("block_layer") or "").strip()
+            if reason:
+                summary["block_reasons"][reason] = int(summary["block_reasons"].get(reason) or 0) + 1
+            if layer:
+                summary["block_layers"][layer] = int(summary["block_layers"].get(layer) or 0) + 1
+            if reason:
+                per_reason = dict(summary["reason_layer_counts"].get(reason) or {})
+                layer_key = layer or "unknown"
+                per_reason[layer_key] = int(per_reason.get(layer_key) or 0) + 1
+                summary["reason_layer_counts"][reason] = per_reason
+        summary["by_status"] = dict(sorted(summary["by_status"].items()))
+        summary["block_reasons"] = dict(
+            sorted(summary["block_reasons"].items(), key=lambda item: (-int(item[1] or 0), str(item[0] or "")))
+        )
+        summary["block_layers"] = dict(
+            sorted(summary["block_layers"].items(), key=lambda item: (-int(item[1] or 0), str(item[0] or "")))
+        )
+        summary["reason_layer_counts"] = {
+            str(reason): dict(sorted(dict(layer_counts).items()))
+            for reason, layer_counts in sorted(
+                summary["reason_layer_counts"].items(),
+                key=lambda item: str(item[0] or ""),
+            )
+        }
+        return summary
 
     def list_candidate_actions(
         self,

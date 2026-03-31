@@ -7,7 +7,7 @@ from polymarket_bot.types import BrokerOrderEvent, ExecutionResult, OpenOrderSna
 
 class Broker(ABC):
     @abstractmethod
-    def execute(self, signal: Signal, notional_usd: float) -> ExecutionResult:
+    def execute(self, signal: Signal, notional_usd: float, *, strategy_order_uuid: str | None = None) -> ExecutionResult:
         raise NotImplementedError
 
     def supports_dry_run_pending_reconcile(self) -> bool:
@@ -50,6 +50,9 @@ class Broker(ABC):
         return None
 
     def startup_checks(self) -> list[dict[str, object]] | None:
+        return None
+
+    def security_summary(self) -> dict[str, object] | None:
         return None
 
     def close(self) -> None:

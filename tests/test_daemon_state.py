@@ -174,6 +174,17 @@ class DaemonStateTests(unittest.TestCase):
                     "recent_summary": {"candidate_count": 2, "action_count": 1, "journal_count": 1, "day_count": 1, "updated_ts": int(time.time()), "window_start_ts": 0, "days": 7},
                     "updated_ts": int(time.time()),
                 },
+                candidate_lifecycle_summary=lambda **_: {
+                    "updated_ts": int(time.time()),
+                    "active_count": 0,
+                    "expired_discarded_count": 1,
+                    "executed_count": 0,
+                    "skipped_count": 0,
+                    "by_status": {"expired": 1},
+                    "block_reasons": {"candidate_lifetime_expired": 1},
+                    "block_layers": {"candidate": 1},
+                    "reason_layer_counts": {"candidate_lifetime_expired": {"candidate": 1}},
+                },
             ),
             positions_book={
                 "token-a": {
@@ -195,12 +206,27 @@ class DaemonStateTests(unittest.TestCase):
                     "trace_id": "trc-1",
                     "origin_signal_id": "sig-1",
                     "last_signal_id": "sig-2",
-                    "last_exit_kind": "resonance_exit",
-                    "last_exit_label": "共振退出",
-                    "last_exit_summary": "multi-wallet exit resonance | 2 wallets trimming",
-                    "last_exit_ts": int(time.time()) - 60,
-                }
-            },
+                "last_exit_kind": "resonance_exit",
+                "last_exit_label": "共振退出",
+                "last_exit_summary": "multi-wallet exit resonance | 2 wallets trimming",
+                "last_exit_ts": int(time.time()) - 60,
+                "time_exit_state": {
+                    "stage": "retry",
+                    "attempt_count": 2,
+                    "consecutive_failures": 1,
+                    "priority": 30,
+                    "priority_reason": "failures=1 | volatility=800.0bps",
+                    "market_volatility_bps": 800.0,
+                    "last_attempt_ts": int(time.time()) - 30,
+                    "last_failure_ts": int(time.time()) - 30,
+                    "last_success_ts": 0,
+                    "next_retry_ts": int(time.time()) + 300,
+                    "force_exit_armed_ts": 0,
+                    "last_result": "failed",
+                    "last_error": "no liquidity",
+                },
+            }
+        },
             recent_orders=deque(
                 [
                     {
@@ -540,6 +566,9 @@ class DaemonStateTests(unittest.TestCase):
         self.assertEqual(payload["wallets"][0]["topic_profiles"][0]["label"], "加密")
         self.assertEqual(payload["positions"][0]["last_exit_kind"], "resonance_exit")
         self.assertEqual(payload["positions"][0]["last_exit_label"], "共振退出")
+        self.assertEqual(payload["positions"][0]["time_exit_state"]["stage"], "retry")
+        self.assertEqual(payload["positions"][0]["time_exit_state"]["consecutive_failures"], 1)
+        self.assertEqual(payload["config"]["time_exit_retry_limit"], 2)
         self.assertIn(payload["positions"][0]["suggested_action"], {"hold", "close_partial", "close_all"})
         self.assertTrue(str(payload["positions"][0]["suggested_reason"]).strip())
         self.assertGreaterEqual(int(payload["positions"][0]["hold_minutes"]), 0)
@@ -700,6 +729,8 @@ class DaemonStateTests(unittest.TestCase):
                                 },
                                 "decision_snapshot": {
                                     "skip_reason": "market_not_accepting_orders",
+                                    "block_reason": "market_not_accepting_orders",
+                                    "block_layer": "candidate",
                                     "market_time_source": "metadata",
                                     "market_metadata_hit": True,
                                 },
@@ -748,7 +779,21 @@ class DaemonStateTests(unittest.TestCase):
                 "persistence_status": "ok",
             },
             reconciliation_summary=lambda now=None: {"status": "ok", "issues": [], "day_key": "2026-03-20"},
-            candidate_store=None,
+            candidate_store=SimpleNamespace(
+                candidate_lifecycle_summary=lambda **_: {
+                    "updated_ts": int(time.time()),
+                    "active_count": 0,
+                    "expired_discarded_count": 1,
+                    "executed_count": 0,
+                    "skipped_count": 0,
+                    "by_status": {"expired": 1},
+                    "block_reasons": {"candidate_lifetime_expired": 1},
+                    "block_layers": {"candidate": 1},
+                    "reason_layer_counts": {"candidate_lifetime_expired": {"candidate": 1}},
+                },
+                stats_summary=lambda **_: {},
+                archive_summary=lambda **_: {},
+            ),
             list_candidates=lambda **_: [],
             list_wallet_profiles=lambda **_: [],
             list_journal_entries=lambda **_: [],
@@ -771,6 +816,14 @@ class DaemonStateTests(unittest.TestCase):
             payload["candidates"]["observability"]["recent_cycles"]["market_time_source"]["metadata"],
             1,
         )
+        self.assertEqual(payload["candidates"]["observability"]["lifecycle"]["expired_discarded_count"], 1)
+        self.assertEqual(
+            payload["candidates"]["observability"]["lifecycle"]["block_reasons"]["candidate_lifetime_expired"],
+            1,
+        )
+        replay_candidate = payload["signal_review"]["cycles"][0]["candidates"][0]
+        self.assertEqual(replay_candidate["block_reason"], "market_not_accepting_orders")
+        self.assertEqual(replay_candidate["block_layer"], "candidate")
 
     def test_notifier_summary_reports_multiple_channels_and_delivery_stats(self):
         notifier_dir = tempfile.TemporaryDirectory()

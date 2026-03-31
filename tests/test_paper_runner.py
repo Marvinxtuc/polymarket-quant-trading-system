@@ -11,6 +11,7 @@ from unittest.mock import patch
 from polymarket_bot.brokers.paper import PaperBroker
 from polymarket_bot.config import Settings
 from polymarket_bot.runner import ControlState, Trader
+from polymarket_bot.state_store import StateStore
 from polymarket_bot.types import BrokerOrderEvent, ExecutionResult, OrderFillSnapshot, RiskDecision, Signal
 
 
@@ -60,7 +61,7 @@ class _CapabilityBroker:
     def supports_dry_run_pending_reconcile(self) -> bool:
         return True
 
-    def execute(self, signal, notional_usd):
+    def execute(self, signal, notional_usd, *, strategy_order_uuid=None):
         price = max(0.01, float(signal.price_hint or 0.5))
         size = notional_usd / price
         order_id = f"cap-{signal.token_id}"
@@ -156,7 +157,7 @@ def _make_settings(control_path: str, **kwargs: object) -> Settings:
     if candidate_db_path is None:
         candidate_db_path = str(Path(tempfile.mkdtemp()) / "terminal.db")
 
-    return Settings(
+    settings = Settings(
         _env_file=None,
         dry_run=True,
         decision_mode="auto",
@@ -177,6 +178,32 @@ def _make_settings(control_path: str, **kwargs: object) -> Settings:
         bankroll_usd=float(kwargs.get("bankroll_usd", 5000.0)),
         max_signals_per_cycle=1,
     )
+    try:
+        with open(control_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, dict):
+            control_keys = {
+                "decision_mode",
+                "pause_opening",
+                "reduce_only",
+                "emergency_stop",
+                "clear_stale_pending_requested_ts",
+                "updated_ts",
+            }
+            if any(key in payload for key in control_keys):
+                normalized = {
+                    "decision_mode": settings.decision_mode,
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "clear_stale_pending_requested_ts": 0,
+                    "updated_ts": 0,
+                }
+                normalized.update(payload)
+                StateStore(settings.state_store_path).save_control_state(normalized)
+    except Exception:
+        pass
+    return settings
 
 
 class PaperRunnerTests(unittest.TestCase):

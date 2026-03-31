@@ -1,0 +1,22 @@
+BLOCK-008 validation rerun (evidence supplementation)
+Date: 2026-03-27
+Workspace: /Users/marvin.xa/Desktop/Polymarket
+
+Commands:
+1) PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_metrics_exposed.py'
+   Result: PASS (3 tests)
+
+2) PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_heartbeat_updates_and_stale_detection.py'
+   Result: PASS (3 tests)
+
+3) PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_api_state_and_metrics_consistent.py'
+   Result: PASS (1 test)
+
+4) PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_alert_conditions_derived_from_runtime_state.py'
+   Result: PASS (2 tests)
+
+5) PYTHONPATH=src .venv/bin/python scripts/verify_metrics_and_alerts.py
+   Result: PASS (verify_metrics_and_alerts: ok)
+
+6) PYTHONPATH=src .venv/bin/python scripts/verify_heartbeat_staleness_alert.py
+   Result: PASS (verify_heartbeat_staleness_alert: ok)

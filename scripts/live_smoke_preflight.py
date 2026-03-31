@@ -64,18 +64,32 @@ def build_report(settings: Settings, *, now_ts: int | None = None) -> tuple[dict
     if bool(settings.dry_run):
         add_blocker("dryRunTrue")
 
-    private_key_ready = bool(str(settings.private_key or "").strip())
+    raw_private_key_present = bool(str(settings.private_key or "").strip())
     funder_ready = bool(str(settings.funder_address or "").strip())
+    signer_ready = bool(str(getattr(settings, "signer_url", "") or "").strip())
+    api_creds_ready = bool(
+        str(getattr(settings, "clob_api_key", "") or "").strip()
+        and str(getattr(settings, "clob_api_secret", "") or "").strip()
+        and str(getattr(settings, "clob_api_passphrase", "") or "").strip()
+    )
     checks.append(
         _check(
             "live_secrets",
-            private_key_ready and funder_ready,
-            _preflight_t("check.liveSecrets", fallback="PRIVATE_KEY and FUNDER_ADDRESS must both be configured"),
+            funder_ready and signer_ready and api_creds_ready and not raw_private_key_present,
+            _preflight_t(
+                "check.liveSecrets",
+                fallback="FUNDER_ADDRESS + signer endpoint + CLOB API creds required, and PRIVATE_KEY must be empty in live mode",
+            ),
             message_code="liveSecrets",
-            details={"private_key_ready": private_key_ready, "funder_ready": funder_ready},
+            details={
+                "raw_private_key_present": raw_private_key_present,
+                "funder_ready": funder_ready,
+                "signer_ready": signer_ready,
+                "api_creds_ready": api_creds_ready,
+            },
         )
     )
-    if not (private_key_ready and funder_ready):
+    if not (funder_ready and signer_ready and api_creds_ready and not raw_private_key_present):
         add_blocker("liveSecretsMissing")
 
     live_flags_ok = bool(settings.live_allowance_ready and settings.live_geoblock_ready and settings.live_account_ready)

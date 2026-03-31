@@ -1,0 +1,26 @@
+BLOCK-005 regression
+Date: 2026-03-26
+
+Command:
+- bash scripts/gates/gate_tests.sh BLOCK-005
+
+Result:
+- PASS
+- Included suites:
+  - test_kill_switch_requires_broker_terminal.py
+  - test_reduce_only_cancels_pending_buy_and_waits_terminal.py
+  - test_cancel_requested_is_not_safe.py
+  - test_emergency_stop_latched_until_broker_safe.py
+  - test_restart_preserves_kill_switch_inflight_state.py
+  - test_runner_control.py
+  - test_web_api.py
+  - test_paper_runner.py
+  - test_paper_broker.py
+
+Acceptance gate rerun (2026-03-26)
+- bash scripts/gates/gate_static.sh BLOCK-005 -> PASS
+- bash scripts/gates/gate_tests.sh BLOCK-005 -> PASS
+- bash scripts/gates/gate_behavior.sh BLOCK-005 -> PASS
+- bash scripts/gates/gate_docs.sh BLOCK-005 -> PASS
+- bash scripts/gates/gate_block_item.sh BLOCK-005 -> PASS
+- gate rerun confirms all pass: static/tests/behavior/docs/block-item

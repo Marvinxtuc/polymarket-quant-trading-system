@@ -10,6 +10,13 @@ from pathlib import Path
 from typing import Any
 
 from polymarket_bot.config import Settings
+from polymarket_bot.locks import (
+    FileLock,
+    SINGLE_WRITER_CONFLICT_EXIT_CODE,
+    SINGLE_WRITER_CONFLICT_REASON,
+    SingleWriterLockError,
+    derive_writer_scope,
+)
 from polymarket_bot.main import build_trader, setup_logger
 from polymarket_bot.notifier import Notifier
 
@@ -130,6 +137,17 @@ def _empty_candidate_observability(*, updated_ts: int = 0) -> dict[str, Any]:
     return {
         "updated_ts": int(updated_ts or 0),
         "candidate_count": 0,
+        "lifecycle": {
+            "updated_ts": int(updated_ts or 0),
+            "active_count": 0,
+            "expired_discarded_count": 0,
+            "executed_count": 0,
+            "skipped_count": 0,
+            "by_status": {},
+            "block_reasons": {},
+            "block_layers": {},
+            "reason_layer_counts": {},
+        },
         "market_metadata": {
             "hits": 0,
             "misses": 0,
@@ -1108,9 +1126,27 @@ def _position_decision_advice(position: dict[str, Any], *, now: int, settings: S
     notional = max(0.0, float(position.get("notional") or 0.0))
     last_exit_kind = str(position.get("last_exit_kind") or "").strip().lower()
     last_exit_ts = int(position.get("last_exit_ts") or 0)
+    time_exit_state = dict(position.get("time_exit_state") or {})
+    time_exit_stage = str(time_exit_state.get("stage") or "").strip().lower()
+    time_exit_failures = int(time_exit_state.get("consecutive_failures") or 0)
+    time_exit_priority = int(time_exit_state.get("priority") or 0)
     stale_minutes = max(1, int(settings.stale_position_minutes))
     congested_threshold_pct = float(settings.congested_utilization_threshold) * 100.0
 
+    if time_exit_stage == "force_exit":
+        return {
+            "action": "close_all",
+            "label": "强退",
+            "urgency": "high",
+            "reason": f"time-exit 已升级强退（失败 {time_exit_failures} 次，优先级 {time_exit_priority}）",
+        }
+    if time_exit_stage == "retry":
+        return {
+            "action": "close_partial",
+            "label": "重试退出",
+            "urgency": "high",
+            "reason": f"time-exit 正在重试（失败 {time_exit_failures} 次，优先级 {time_exit_priority}）",
+        }
     if hold_minutes >= stale_minutes * 2 or (notional > 0.0 and notional <= float(settings.stale_position_close_notional_usd)):
         return {
             "action": "close_all",
@@ -1211,7 +1247,9 @@ def _build_signal_review(
                     "action": action,
                     "action_label": action_label,
                     "final_status": final_status,
-                    "decision_reason": str(decision_snapshot.get("skip_reason") or decision_snapshot.get("risk_reason") or ""),
+                    "decision_reason": str(decision_snapshot.get("block_reason") or decision_snapshot.get("skip_reason") or decision_snapshot.get("risk_reason") or ""),
+                    "block_reason": str(decision_snapshot.get("block_reason") or decision_snapshot.get("skip_reason") or decision_snapshot.get("risk_reason") or ""),
+                    "block_layer": str(decision_snapshot.get("block_layer") or ""),
                     "sized_notional": float(decision_snapshot.get("sized_notional") or 0.0),
                     "final_notional": float(decision_snapshot.get("final_notional") or 0.0),
                     "budget_limited": bool(decision_snapshot.get("budget_limited", False)),
@@ -1288,6 +1326,8 @@ def _build_signal_review(
                     "topic_score_summary": str(topic_snapshot.get("topic_score_summary") or ""),
                     "risk_reason": str(decision_snapshot.get("risk_reason") or ""),
                     "skip_reason": str(decision_snapshot.get("skip_reason") or ""),
+                    "block_reason": str(decision_snapshot.get("block_reason") or decision_snapshot.get("skip_reason") or decision_snapshot.get("risk_reason") or ""),
+                    "block_layer": str(decision_snapshot.get("block_layer") or ""),
                     "duplicate": bool(decision_snapshot.get("duplicate", False)),
                     "budget_limited": bool(decision_snapshot.get("budget_limited", False)),
                     "cooldown_remaining": int(decision_snapshot.get("cooldown_remaining") or 0),
@@ -1561,6 +1601,24 @@ def _build_state(
     persistence.setdefault("status", str(getattr(trader, "persistence_status", "ok") or "ok"))
     persistence.setdefault("failure_count", int(getattr(trader, "persistence_failure_count", 0) or 0))
     persistence.setdefault("last_failure", dict(getattr(trader, "last_persistence_failure", {}) or {}))
+    heartbeat_builder = getattr(trader, "runner_heartbeat_state", None)
+    runner_heartbeat = (
+        dict(heartbeat_builder()) if callable(heartbeat_builder) else {"last_seen_ts": 0, "cycle_seq": 0, "loop_status": "idle", "writer_active": False}
+    )
+    buy_blocked_builder = getattr(trader, "buy_blocked_state", None)
+    buy_blocked = (
+        dict(buy_blocked_builder(now_ts=now))
+        if callable(buy_blocked_builder)
+        else {
+            "active": not bool(trading_mode.get("opening_allowed", True)),
+            "reason_code": "admission_gate_blocked" if not bool(trading_mode.get("opening_allowed", True)) else "",
+            "since_ts": int(trading_mode.get("updated_ts") or 0),
+            "duration_seconds": max(0, now - int(trading_mode.get("updated_ts") or 0))
+            if not bool(trading_mode.get("opening_allowed", True))
+            else 0,
+            "updated_ts": now,
+        }
+    )
     wallet_metrics = trader.strategy.latest_wallet_metrics()
     scorer = getattr(trader.strategy, "scorer", None)
     history_min_closed_positions = int(getattr(scorer, "min_realized_sample", 5) or 5)
@@ -1688,6 +1746,21 @@ def _build_state(
                 "last_exit_label": last_exit_label,
                 "last_exit_summary": last_exit_summary,
                 "last_exit_ts": last_exit_ts,
+                "time_exit_state": {
+                    "stage": str((pos.get("time_exit_state") or {}).get("stage") or "idle"),
+                    "attempt_count": int((pos.get("time_exit_state") or {}).get("attempt_count") or 0),
+                    "consecutive_failures": int((pos.get("time_exit_state") or {}).get("consecutive_failures") or 0),
+                    "priority": int((pos.get("time_exit_state") or {}).get("priority") or 0),
+                    "priority_reason": str((pos.get("time_exit_state") or {}).get("priority_reason") or ""),
+                    "market_volatility_bps": float((pos.get("time_exit_state") or {}).get("market_volatility_bps") or 0.0),
+                    "last_attempt_ts": int((pos.get("time_exit_state") or {}).get("last_attempt_ts") or 0),
+                    "last_failure_ts": int((pos.get("time_exit_state") or {}).get("last_failure_ts") or 0),
+                    "last_success_ts": int((pos.get("time_exit_state") or {}).get("last_success_ts") or 0),
+                    "next_retry_ts": int((pos.get("time_exit_state") or {}).get("next_retry_ts") or 0),
+                    "force_exit_armed_ts": int((pos.get("time_exit_state") or {}).get("force_exit_armed_ts") or 0),
+                    "last_result": str((pos.get("time_exit_state") or {}).get("last_result") or ""),
+                    "last_error": str((pos.get("time_exit_state") or {}).get("last_error") or ""),
+                },
                 "entry_wallet": str(pos.get("entry_wallet") or ""),
                 "entry_wallet_score": float(pos.get("entry_wallet_score") or 0.0),
                 "entry_wallet_tier": str(pos.get("entry_wallet_tier") or "LOW"),
@@ -1728,6 +1801,12 @@ def _build_state(
         order["position_action"] = str(order.get("position_action") or "")
         order["position_action_label"] = str(order.get("position_action_label") or "")
         order["hold_minutes"] = int(order.get("hold_minutes") or 0)
+        order["time_exit_stage"] = str(order.get("time_exit_stage") or "")
+        order["time_exit_failure_count"] = int(order.get("time_exit_failure_count") or 0)
+        order["exit_priority"] = int(order.get("exit_priority") or 0)
+        order["exit_priority_reason"] = str(order.get("exit_priority_reason") or "")
+        order["market_volatility_bps"] = float(order.get("market_volatility_bps") or 0.0)
+        order["force_exit_active"] = bool(order.get("force_exit_active", False))
         order["exit_result"] = str(order.get("exit_result") or "")
         order["exit_result_label"] = str(order.get("exit_result_label") or "")
         orders.append(order)
@@ -1824,6 +1903,10 @@ def _build_state(
         archive_summary = dict(candidate_store.archive_summary(days=30, recent_days=7)) if candidate_store is not None else _empty_archive_summary()
     except Exception:
         archive_summary = _empty_archive_summary()
+    try:
+        lifecycle_summary = dict(candidate_store.candidate_lifecycle_summary(limit=5000)) if candidate_store is not None else dict((_empty_candidate_observability().get("lifecycle") or {}))
+    except Exception:
+        lifecycle_summary = dict((_empty_candidate_observability().get("lifecycle") or {}))
     candidates = {
         "summary": {
             "count": len(candidate_items),
@@ -1839,6 +1922,7 @@ def _build_state(
         "observability": _build_candidate_observability(candidate_items, now=now),
         "items": candidate_items,
     }
+    candidates["observability"]["lifecycle"] = lifecycle_summary
     candidates["observability"]["recent_cycles"] = _build_recent_cycle_candidate_observability(recent_signal_cycles)
     wallet_profiles = {
         "summary": {
@@ -2006,6 +2090,9 @@ def _build_state(
             "stale_position_trim_pct": float(settings.stale_position_trim_pct),
             "stale_position_trim_cooldown_seconds": int(settings.stale_position_trim_cooldown_seconds),
             "stale_position_close_notional_usd": float(settings.stale_position_close_notional_usd),
+            "time_exit_retry_limit": int(settings.time_exit_retry_limit),
+            "time_exit_retry_cooldown_seconds": int(settings.time_exit_retry_cooldown_seconds),
+            "time_exit_priority_volatility_step_bps": float(settings.time_exit_priority_volatility_step_bps),
             "congested_utilization_threshold": float(settings.congested_utilization_threshold),
             "congested_stale_minutes": int(settings.congested_stale_minutes),
             "congested_trim_pct": float(settings.congested_trim_pct),
@@ -2040,6 +2127,8 @@ def _build_state(
             "updated_ts": int(trader.control_state.updated_ts),
         },
         "trading_mode": trading_mode,
+        "buy_blocked": buy_blocked,
+        "runner_heartbeat": runner_heartbeat,
         "persistence": persistence,
         "mode": str(decision_mode.get("mode") or "manual"),
         "decision_mode": decision_mode,
@@ -2224,6 +2313,25 @@ def main() -> None:
     settings = Settings()
     setup_logger(settings.log_level)
     log = logging.getLogger("polybot.daemon")
+    writer_scope = derive_writer_scope(
+        dry_run=bool(settings.dry_run),
+        funder_address=str(settings.funder_address or ""),
+        watch_wallets=str(settings.watch_wallets or ""),
+    )
+    log.info(
+        "SINGLE_WRITER_SCOPE scope=%s dry_run=%s lock_path=%s",
+        writer_scope,
+        bool(settings.dry_run),
+        settings.wallet_lock_path,
+    )
+    if not bool(settings.dry_run) and not bool(settings.enable_single_writer):
+        log.error(
+            "startup blocked reason_code=single_writer_required_live dry_run=%s enable_single_writer=%s scope=%s",
+            bool(settings.dry_run),
+            bool(settings.enable_single_writer),
+            writer_scope,
+        )
+        raise SystemExit(2)
     if args.state_path == "/tmp/poly_runtime_data/state.json":
         args.state_path = settings.runtime_store_path("state.json")
     if args.decision_mode_path == os.getenv("POLY_DECISION_MODE_PATH", "/tmp/poly_runtime_data/decision_mode.json"):
@@ -2234,8 +2342,30 @@ def main() -> None:
         args.wallet_profiles_path = settings.runtime_store_path("wallet_profiles.json")
     if args.journal_path == os.getenv("POLY_JOURNAL_PATH", "/tmp/poly_runtime_data/journal.json"):
         args.journal_path = settings.runtime_store_path("journal.json")
-    trader = build_trader(settings)
+    pre_acquired_lock: FileLock | None = None
+    if bool(settings.enable_single_writer):
+        pre_acquired_lock = FileLock(
+            settings.wallet_lock_path,
+            timeout=0.0,
+            writer_scope=writer_scope,
+        )
+        try:
+            pre_acquired_lock.acquire()
+        except SingleWriterLockError as exc:
+            reason_code = str(getattr(exc, "reason_code", "") or "")
+            log.error(
+                "startup blocked reason_code=%s scope=%s lock_path=%s err=%s",
+                reason_code,
+                writer_scope,
+                settings.wallet_lock_path,
+                exc,
+            )
+            if reason_code == SINGLE_WRITER_CONFLICT_REASON:
+                raise SystemExit(SINGLE_WRITER_CONFLICT_EXIT_CODE)
+            raise SystemExit(3)
+    trader = None
     try:
+        trader = build_trader(settings, pre_acquired_writer_lock=pre_acquired_lock)
         _prepare_bootstrap_trader_state(trader)
         bootstrap_payload = _build_state(
             trader,
@@ -2287,8 +2417,14 @@ def main() -> None:
                 return
             time.sleep(settings.poll_interval_seconds)
     finally:
-        trader.broker.close()
-        trader.data_client.close()
+        if trader is not None:
+            trader.broker.close()
+            trader.data_client.close()
+            if getattr(trader, "_writer_lock", None) is not None:
+                trader._writer_lock.release()
+                trader._writer_lock = None
+        elif pre_acquired_lock is not None:
+            pre_acquired_lock.release()
 
 
 if __name__ == "__main__":

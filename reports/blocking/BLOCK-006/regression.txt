@@ -1,0 +1,13 @@
+BLOCK-006 regression report
+Date: 2026-03-26
+
+Regression commands:
+1) bash scripts/gates/gate_tests.sh BLOCK-006 -> PASS
+2) bash scripts/gates/gate_behavior.sh BLOCK-006 -> PASS
+3) bash scripts/gates/gate_docs.sh BLOCK-006 -> PASS
+4) bash scripts/gates/gate_block_item.sh BLOCK-006 -> PASS
+
+Regression notes:
+- Existing /api/state and /api/control behavior remains compatible with readonly mode.
+- Existing runner control regression set still passes.
+- Existing standby write-guard regression set still passes.

@@ -24,8 +24,11 @@ CORE_REQUIRED_KEYS = (
     "POLYMARKET_CLOB_HOST",
 )
 LIVE_REQUIRED_KEYS = (
-    "PRIVATE_KEY",
     "FUNDER_ADDRESS",
+    "SIGNER_URL",
+    "CLOB_API_KEY",
+    "CLOB_API_SECRET",
+    "CLOB_API_PASSPHRASE",
     "LIVE_ALLOWANCE_READY",
     "LIVE_GEOBLOCK_READY",
     "LIVE_ACCOUNT_READY",
@@ -105,7 +108,7 @@ def validate_env(env_actual: dict[str, str], env_example: dict[str, str]) -> tup
 
     dry_run = is_truthy(env_actual.get("DRY_RUN", env_example.get("DRY_RUN", "true")))
     if not dry_run:
-        for key in ("PRIVATE_KEY", "FUNDER_ADDRESS"):
+        for key in ("FUNDER_ADDRESS", "SIGNER_URL", "CLOB_API_KEY", "CLOB_API_SECRET", "CLOB_API_PASSPHRASE"):
             value = env_actual.get(key, "").strip()
             if not value:
                 problems.append(
@@ -115,6 +118,13 @@ def validate_env(env_actual: dict[str, str], env_example: dict[str, str]) -> tup
                         fallback=f"DRY_RUN=false requires {key} to be set",
                     )
                 )
+        if str(env_actual.get("PRIVATE_KEY", "")).strip():
+            problems.append(
+                _check_env_t(
+                    "problem.liveRawPrivateKeyForbidden",
+                    fallback="DRY_RUN=false forbids PRIVATE_KEY; use external signer boundary",
+                )
+            )
         for key in ("LIVE_ALLOWANCE_READY", "LIVE_GEOBLOCK_READY", "LIVE_ACCOUNT_READY"):
             if not is_truthy(env_actual.get(key, env_example.get(key, ""))):
                 problems.append(

@@ -100,8 +100,11 @@ class CheckEnvTests(unittest.TestCase):
 
         problems, warnings = MODULE.validate_env(env_actual, env_example)
 
-        self.assertIn(i18n_t("script.checkEnv.problem.dryRunRequiresKey", {"key": "PRIVATE_KEY"}), problems)
         self.assertIn(i18n_t("script.checkEnv.problem.dryRunRequiresKey", {"key": "FUNDER_ADDRESS"}), problems)
+        self.assertIn(i18n_t("script.checkEnv.problem.dryRunRequiresKey", {"key": "SIGNER_URL"}), problems)
+        self.assertIn(i18n_t("script.checkEnv.problem.dryRunRequiresKey", {"key": "CLOB_API_KEY"}), problems)
+        self.assertIn(i18n_t("script.checkEnv.problem.dryRunRequiresKey", {"key": "CLOB_API_SECRET"}), problems)
+        self.assertIn(i18n_t("script.checkEnv.problem.dryRunRequiresKey", {"key": "CLOB_API_PASSPHRASE"}), problems)
         self.assertIn(i18n_t("script.checkEnv.problem.dryRunRequiresTrue", {"key": "LIVE_ALLOWANCE_READY"}), problems)
         self.assertIn(i18n_t("script.checkEnv.problem.dryRunRequiresTrue", {"key": "LIVE_GEOBLOCK_READY"}), problems)
         self.assertIn(i18n_t("script.checkEnv.problem.dryRunRequiresTrue", {"key": "LIVE_ACCOUNT_READY"}), problems)
@@ -120,8 +123,11 @@ class CheckEnvTests(unittest.TestCase):
             "MAX_OPEN_POSITIONS": "8",
             "POLYMARKET_DATA_API": "https://data-api.polymarket.com",
             "POLYMARKET_CLOB_HOST": "https://clob.polymarket.com",
-            "PRIVATE_KEY": "secret",
             "FUNDER_ADDRESS": "0xabc",
+            "SIGNER_URL": "https://signer.internal.local",
+            "CLOB_API_KEY": "api-key",
+            "CLOB_API_SECRET": "api-secret",
+            "CLOB_API_PASSPHRASE": "api-passphrase",
             "LIVE_ALLOWANCE_READY": "true",
             "LIVE_GEOBLOCK_READY": "true",
             "LIVE_ACCOUNT_READY": "true",
@@ -144,8 +150,11 @@ class CheckEnvTests(unittest.TestCase):
             "MAX_OPEN_POSITIONS": "8",
             "POLYMARKET_DATA_API": "https://data-api.polymarket.com",
             "POLYMARKET_CLOB_HOST": "https://clob.polymarket.com",
-            "PRIVATE_KEY": "secret",
             "FUNDER_ADDRESS": "0xabc",
+            "SIGNER_URL": "https://signer.internal.local",
+            "CLOB_API_KEY": "api-key",
+            "CLOB_API_SECRET": "api-secret",
+            "CLOB_API_PASSPHRASE": "api-passphrase",
             "LIVE_ALLOWANCE_READY": "true",
             "LIVE_GEOBLOCK_READY": "true",
             "LIVE_ACCOUNT_READY": "true",
@@ -170,8 +179,11 @@ class CheckEnvTests(unittest.TestCase):
             "MAX_OPEN_POSITIONS": "8",
             "POLYMARKET_DATA_API": "https://data-api.polymarket.com",
             "POLYMARKET_CLOB_HOST": "https://clob.polymarket.com",
-            "PRIVATE_KEY": "secret",
             "FUNDER_ADDRESS": "0xabc",
+            "SIGNER_URL": "https://signer.internal.local",
+            "CLOB_API_KEY": "api-key",
+            "CLOB_API_SECRET": "api-secret",
+            "CLOB_API_PASSPHRASE": "api-passphrase",
             "LIVE_ALLOWANCE_READY": "true",
             "LIVE_GEOBLOCK_READY": "true",
             "LIVE_ACCOUNT_READY": "true",
@@ -184,6 +196,36 @@ class CheckEnvTests(unittest.TestCase):
 
         self.assertEqual(problems, [])
         self.assertEqual(warnings, [])
+
+    def test_validate_env_rejects_raw_private_key_in_live_mode(self) -> None:
+        env_actual = {
+            "DRY_RUN": "false",
+            "POLL_INTERVAL_SECONDS": "30",
+            "BANKROLL_USD": "5000",
+            "RISK_PER_TRADE_PCT": "0.01",
+            "DAILY_MAX_LOSS_PCT": "0.03",
+            "MAX_OPEN_POSITIONS": "8",
+            "POLYMARKET_DATA_API": "https://data-api.polymarket.com",
+            "POLYMARKET_CLOB_HOST": "https://clob.polymarket.com",
+            "PRIVATE_KEY": "raw-key-should-not-be-used",
+            "FUNDER_ADDRESS": "0xabc",
+            "SIGNER_URL": "https://signer.internal.local",
+            "CLOB_API_KEY": "api-key",
+            "CLOB_API_SECRET": "api-secret",
+            "CLOB_API_PASSPHRASE": "api-passphrase",
+            "LIVE_ALLOWANCE_READY": "true",
+            "LIVE_GEOBLOCK_READY": "true",
+            "LIVE_ACCOUNT_READY": "true",
+        }
+        env_example = dict(env_actual)
+
+        problems, _warnings = MODULE.validate_env(env_actual, env_example)
+
+        expected = i18n_t("script.checkEnv.problem.liveRawPrivateKeyForbidden")
+        self.assertTrue(
+            expected in problems
+            or any("PRIVATE_KEY" in str(item) and "forbids" in str(item) for item in problems)
+        )
 
 
 if __name__ == "__main__":

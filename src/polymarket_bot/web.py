@@ -5,10 +5,12 @@ import csv
 from html import escape as html_escape
 import io
 import json
+import logging
 import os
 import tempfile
 import time
 import threading
+from collections.abc import Callable
 from http.cookies import SimpleCookie
 from http import HTTPStatus
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -18,6 +20,17 @@ import urllib.error
 import urllib.request
 
 from polymarket_bot.config import Settings, build_runtime_artifact_paths
+from polymarket_bot.control_auth import (
+    ControlPlaneSecurityStatus,
+    SOURCE_POLICY_LOCAL_ONLY,
+    is_api_read_route_allowed,
+    is_api_write_route_allowed,
+    is_write_source_allowed,
+    normalize_source_policy,
+    parse_trusted_proxy_networks,
+    resolve_effective_client_ip,
+    validate_control_token,
+)
 from polymarket_bot.db import PersonalTerminalStore
 from polymarket_bot.i18n import (
     current_locale as i18n_current_locale,
@@ -30,6 +43,15 @@ from polymarket_bot.reconciliation_report import (
     build_reconciliation_report_from_paths,
     write_report_files,
 )
+from polymarket_bot.locks import (
+    FileLock,
+    SINGLE_WRITER_CONFLICT_REASON,
+    SingleWriterLockError,
+    derive_writer_scope,
+)
+from polymarket_bot.models import ControlAuditEvent
+from polymarket_bot.metrics import build_observability_snapshot, render_prometheus_metrics
+from polymarket_bot.state_store import StateStore
 
 
 class ReusableThreadingHTTPServer(ThreadingHTTPServer):
@@ -82,6 +104,55 @@ def _safe_write_json(path: str, payload: dict) -> None:
     os.replace(tmp_path, path)
 
 
+def _safe_append_jsonl(path: str, payload: dict[str, object]) -> None:
+    resolved = str(Path(path).expanduser())
+    parent = Path(resolved).parent
+    if str(parent) not in {"", "."}:
+        parent.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(payload, ensure_ascii=False) + "\n"
+    with open(resolved, "a", encoding="utf-8") as f:
+        f.write(line)
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def _default_control_plane_security_snapshot() -> dict[str, object]:
+    return ControlPlaneSecurityStatus(
+        live_mode=False,
+        write_api_requested=False,
+        write_api_available=False,
+        readonly_mode=True,
+        token_configured=False,
+        source_policy=SOURCE_POLICY_LOCAL_ONLY,
+        trusted_proxy_configured=False,
+        reason_codes=["write_api_not_requested"],
+    ).as_state_payload()
+
+
+def _default_signer_security_state() -> dict[str, object]:
+    return {
+        "live_mode": False,
+        "signer_required": False,
+        "signer_mode": "none",
+        "signer_healthy": True,
+        "signer_identity_matched": True,
+        "api_identity_matched": True,
+        "broker_identity_matched": True,
+        "raw_key_detected": False,
+        "funder_identity_present": False,
+        "api_creds_configured": False,
+        "hot_wallet_cap_enabled": False,
+        "hot_wallet_cap_ok": True,
+        "hot_wallet_cap_limit_usd": 0.0,
+        "hot_wallet_cap_value_usd": 0.0,
+        "reason_codes": [],
+        "last_checked_ts": 0,
+    }
+
+
+_SIGNER_SECURITY_ALLOWED_KEYS = tuple(_default_signer_security_state().keys())
+
+
 def _default_decision_mode() -> dict:
     return {
         "mode": "auto",
@@ -106,6 +177,17 @@ def _empty_candidates() -> dict:
         "observability": {
             "updated_ts": 0,
             "candidate_count": 0,
+            "lifecycle": {
+                "updated_ts": 0,
+                "active_count": 0,
+                "expired_discarded_count": 0,
+                "executed_count": 0,
+                "skipped_count": 0,
+                "by_status": {},
+                "block_reasons": {},
+                "block_layers": {},
+                "reason_layer_counts": {},
+            },
             "market_metadata": {
                 "hits": 0,
                 "misses": 0,
@@ -142,6 +224,14 @@ def _merge_candidate_observability_defaults(observability: dict | None) -> dict:
         **dict(defaults.get("market_metadata") or {}),
         **dict(source.get("market_metadata") or {}),
     }
+    merged["lifecycle"] = {
+        **dict(defaults.get("lifecycle") or {}),
+        **dict(source.get("lifecycle") or {}),
+        "by_status": dict(source.get("lifecycle", {}).get("by_status") or defaults.get("lifecycle", {}).get("by_status") or {}),
+        "block_reasons": dict(source.get("lifecycle", {}).get("block_reasons") or defaults.get("lifecycle", {}).get("block_reasons") or {}),
+        "block_layers": dict(source.get("lifecycle", {}).get("block_layers") or defaults.get("lifecycle", {}).get("block_layers") or {}),
+        "reason_layer_counts": dict(source.get("lifecycle", {}).get("reason_layer_counts") or defaults.get("lifecycle", {}).get("reason_layer_counts") or {}),
+    }
     merged["market_time_source"] = {
         **dict(defaults.get("market_time_source") or {}),
         **dict(source.get("market_time_source") or {}),
@@ -163,6 +253,63 @@ def _merge_candidate_observability_defaults(observability: dict | None) -> dict:
 
 def _api_state_payload(state: dict, candidate_store: PersonalTerminalStore, *, days: int = 30, recent_days: int = 7) -> dict:
     payload = dict(state)
+    admission = payload.get("admission")
+    if not isinstance(admission, dict):
+        admission = {}
+    if not admission:
+        trading_mode = payload.get("trading_mode")
+        if isinstance(trading_mode, dict):
+            admission = {
+                "mode": str(trading_mode.get("mode") or "REDUCE_ONLY").upper(),
+                "opening_allowed": bool(trading_mode.get("opening_allowed")),
+                "reduce_only": str(trading_mode.get("mode") or "").upper() != "NORMAL",
+                "halted": str(trading_mode.get("mode") or "").upper() == "HALTED",
+                "reason_codes": list(trading_mode.get("reason_codes") or []),
+                "updated_ts": int(trading_mode.get("updated_ts") or 0),
+            }
+    default_admission = _default_admission_state()
+    merged_evidence = dict(default_admission.get("evidence_summary") or {})
+    source_evidence = admission.get("evidence_summary") if isinstance(admission, dict) else {}
+    if isinstance(source_evidence, dict):
+        merged_evidence.update(source_evidence)
+    payload["admission"] = {
+        **default_admission,
+        **dict(admission or {}),
+        "reason_codes": list((admission or {}).get("reason_codes") or []),
+        "action_whitelist": list((admission or {}).get("action_whitelist") or default_admission.get("action_whitelist") or []),
+        "evidence_summary": merged_evidence,
+    }
+    kill_switch = payload.get("kill_switch")
+    if not isinstance(kill_switch, dict):
+        kill_switch = {}
+    default_kill_switch = _default_kill_switch_state()
+    payload["kill_switch"] = {
+        **default_kill_switch,
+        **dict(kill_switch or {}),
+        "reason_codes": list((kill_switch or {}).get("reason_codes") or []),
+        "open_buy_order_ids": list((kill_switch or {}).get("open_buy_order_ids") or []),
+        "non_terminal_buy_order_ids": list((kill_switch or {}).get("non_terminal_buy_order_ids") or []),
+        "cancel_requested_order_ids": list((kill_switch or {}).get("cancel_requested_order_ids") or []),
+        "tracked_buy_order_ids": list((kill_switch or {}).get("tracked_buy_order_ids") or []),
+        "pending_buy_order_keys": list((kill_switch or {}).get("pending_buy_order_keys") or []),
+    }
+    signer_security = payload.get("signer_security")
+    if not isinstance(signer_security, dict):
+        signer_security = {}
+    signer_source = dict(signer_security or {})
+    signer_filtered = {
+        key: signer_source[key]
+        for key in _SIGNER_SECURITY_ALLOWED_KEYS
+        if key in signer_source
+    }
+    reason_codes = signer_source.get("reason_codes")
+    if not isinstance(reason_codes, list):
+        reason_codes = []
+    payload["signer_security"] = {
+        **_default_signer_security_state(),
+        **signer_filtered,
+        "reason_codes": [str(item) for item in reason_codes if str(item).strip()],
+    }
     candidates = payload.get("candidates")
     if not isinstance(candidates, dict):
         candidates = _empty_candidates()
@@ -172,6 +319,12 @@ def _api_state_payload(state: dict, candidate_store: PersonalTerminalStore, *, d
         merged_candidates["observability"] = _merge_candidate_observability_defaults(candidates.get("observability"))
         candidates = merged_candidates
     payload["candidates"] = candidates
+    try:
+        payload["candidates"]["observability"]["lifecycle"] = dict(candidate_store.candidate_lifecycle_summary(limit=5000))
+    except Exception:
+        payload["candidates"]["observability"]["lifecycle"] = dict(
+            payload["candidates"]["observability"].get("lifecycle") or {}
+        )
     payload["stats"] = _stats_from_store(candidate_store, days=days, recent_days=recent_days)
     payload["archive"] = _archive_from_store(candidate_store, days=days, recent_days=recent_days)
     return payload
@@ -429,6 +582,8 @@ def _state_candidates(state: dict) -> dict:
                     "topic_bias": str(raw.get("topic_bias") or ""),
                     "topic_multiplier": float(raw.get("topic_multiplier") or 1.0),
                     "decision_reason": str(raw.get("decision_reason") or ""),
+                    "block_reason": str(decision_snapshot.get("block_reason") or raw.get("decision_reason") or ""),
+                    "block_layer": str(decision_snapshot.get("block_layer") or ""),
                     "skip_reason": str(decision_snapshot.get("skip_reason") or ""),
                     "market_time_source": str(decision_snapshot.get("market_time_source") or ""),
                     "market_metadata_hit": bool(decision_snapshot.get("market_metadata_hit", False)),
@@ -1346,6 +1501,9 @@ def _empty_state() -> dict:
             "stale_position_trim_pct": 0.0,
             "stale_position_trim_cooldown_seconds": 0,
             "stale_position_close_notional_usd": 0.0,
+            "time_exit_retry_limit": 0,
+            "time_exit_retry_cooldown_seconds": 0,
+            "time_exit_priority_volatility_step_bps": 0.0,
             "congested_utilization_threshold": 0.0,
             "congested_stale_minutes": 0,
             "congested_trim_pct": 0.0,
@@ -1376,6 +1534,23 @@ def _empty_state() -> dict:
             "reconciliation_status": "unknown",
             "persistence_status": "ok",
         },
+        "buy_blocked": {
+            "active": False,
+            "reason_code": "",
+            "since_ts": 0,
+            "duration_seconds": 0,
+            "updated_ts": 0,
+        },
+        "runner_heartbeat": {
+            "last_seen_ts": 0,
+            "last_cycle_started_ts": 0,
+            "last_cycle_finished_ts": 0,
+            "cycle_seq": 0,
+            "loop_status": "idle",
+            "writer_active": False,
+        },
+        "admission": _default_admission_state(),
+        "kill_switch": _default_kill_switch_state(),
         "persistence": {
             "status": "ok",
             "failure_count": 0,
@@ -1632,6 +1807,68 @@ def _empty_state() -> dict:
     }
 
 
+def _default_admission_state() -> dict:
+    return {
+        "mode": "REDUCE_ONLY",
+        "opening_allowed": False,
+        "reduce_only": True,
+        "halted": False,
+        "auto_recover": False,
+        "manual_confirmation_required": True,
+        "reason_codes": ["bootstrap_protected_evidence_missing"],
+        "action_whitelist": [
+            "sync_read",
+            "state_evaluation",
+            "cancel_pending_buy",
+            "risk_reduction_action",
+            "persist_state_update",
+        ],
+        "latch_kind": "manual",
+        "trusted": False,
+        "trusted_consecutive_cycles": 0,
+        "evidence_summary": {
+            "startup_ready": False,
+            "startup_failure_count": 0,
+            "reconciliation_status": "unknown",
+            "account_snapshot_age_seconds": 0,
+            "broker_event_sync_age_seconds": 0,
+            "ledger_diff": 0.0,
+            "ledger_diff_threshold_usd": 0.0,
+            "ambiguous_pending_orders": 0,
+            "recovery_conflict_count": 0,
+            "persistence_status": "unknown",
+        },
+        "updated_ts": 0,
+    }
+
+
+def _default_kill_switch_state() -> dict:
+    return {
+        "mode_requested": "none",
+        "phase": "IDLE",
+        "opening_allowed": True,
+        "reduce_only": False,
+        "halted": False,
+        "latched": False,
+        "broker_safe_confirmed": True,
+        "manual_required": False,
+        "auto_recover": True,
+        "reason_codes": [],
+        "open_buy_order_ids": [],
+        "non_terminal_buy_order_ids": [],
+        "cancel_requested_order_ids": [],
+        "tracked_buy_order_ids": [],
+        "pending_buy_order_keys": [],
+        "cancel_attempts": 0,
+        "query_error_count": 0,
+        "requested_ts": 0,
+        "last_broker_check_ts": 0,
+        "safe_confirmed_ts": 0,
+        "updated_ts": 0,
+        "last_error": "",
+    }
+
+
 def _empty_monitor_report(report_type: str) -> dict:
     return {
         "report_type": report_type,
@@ -1789,6 +2026,19 @@ def _strip_token_from_path(raw_path: str) -> str:
         query.pop("token", None)
     clean_query = urlencode(query, doseq=True)
     return urlunsplit((parsed.scheme, parsed.netloc, parsed.path or "/", clean_query, parsed.fragment))
+
+
+def _normalize_host_name(host: str) -> str:
+    value = str(host or "").strip().lower()
+    if not value:
+        return ""
+    if value.startswith("["):
+        end = value.find("]")
+        if end != -1:
+            return value[1:end]
+    if value.count(":") == 1:
+        return value.split(":", 1)[0].strip()
+    return value
 
 
 def _read_repo_dotenv_var(key: str) -> str:
@@ -2061,7 +2311,79 @@ def build_handler(
     journal_path: str = "",
     candidate_db_path: str = "",
     public_state_path: str = "",
+    state_store_path: str = "",
+    enable_write_api: bool = True,
+    write_api_requested: bool | None = None,
+    writer_assertion: Callable[[], None] | None = None,
+    allow_read_side_effects: bool = True,
+    writer_scope: str = "",
+    live_mode: bool = False,
+    control_source_policy: str = SOURCE_POLICY_LOCAL_ONLY,
+    trusted_proxy_cidrs: str = "",
+    control_token_min_length: int = 16,
+    control_audit_log_path: str = "",
+    control_plane_security_snapshot: dict[str, object] | None = None,
+    heartbeat_stale_after_seconds: int = 180,
+    buy_blocked_alert_after_seconds: int = 900,
 ):
+    raw_write_api_enabled = bool(enable_write_api)
+    write_api_requested_value = bool(raw_write_api_enabled if write_api_requested is None else write_api_requested)
+    live_mode_enabled = bool(live_mode)
+    token_ok, token_reason = validate_control_token(control_token, min_length=int(control_token_min_length or 16))
+    source_policy = normalize_source_policy(control_source_policy)
+    trusted_proxy_networks, trusted_proxy_reason = parse_trusted_proxy_networks(trusted_proxy_cidrs)
+    write_api_available = bool(raw_write_api_enabled and token_ok and not trusted_proxy_reason)
+    reason_codes: list[str] = []
+    if not write_api_requested_value:
+        reason_codes.append("write_api_not_requested")
+    if write_api_requested_value and not token_ok:
+        reason_codes.append(token_reason or "control_token_missing")
+    if write_api_requested_value and trusted_proxy_reason:
+        reason_codes.append(trusted_proxy_reason)
+    if write_api_requested_value and write_api_available:
+        reason_codes.append("write_api_enabled")
+    if write_api_requested_value and not write_api_available:
+        reason_codes.append("write_api_disabled")
+
+    security_status = ControlPlaneSecurityStatus(
+        live_mode=live_mode_enabled,
+        write_api_requested=write_api_requested_value,
+        write_api_available=write_api_available,
+        readonly_mode=not write_api_available,
+        token_configured=token_ok,
+        source_policy=source_policy,
+        trusted_proxy_configured=bool(trusted_proxy_networks),
+        reason_codes=reason_codes,
+    )
+    if isinstance(control_plane_security_snapshot, dict):
+        merged = _default_control_plane_security_snapshot()
+        merged.update(control_plane_security_snapshot)
+        merged["reason_codes"] = list(control_plane_security_snapshot.get("reason_codes") or merged.get("reason_codes") or [])
+        security_snapshot = merged
+    else:
+        security_snapshot = security_status.as_state_payload()
+
+    if not control_audit_log_path:
+        control_audit_log_path = _runtime_store_path(state_path, "control_audit_events.jsonl", "POLY_CONTROL_AUDIT_LOG_PATH")
+
+    read_side_effects_enabled = bool(allow_read_side_effects)
+    heartbeat_stale_after_seconds_value = max(10, int(heartbeat_stale_after_seconds or 10))
+    buy_blocked_alert_after_seconds_value = max(30, int(buy_blocked_alert_after_seconds or 30))
+
+    def _assert_writer_active_for_write() -> None:
+        if not write_api_available:
+            raise RuntimeError("write api disabled")
+        checker = writer_assertion
+        if callable(checker):
+            checker()
+
+    resolved_state_store_path = str(state_store_path or _runtime_store_path(state_path, "state.db", "POLY_STATE_STORE_PATH"))
+    state_store = StateStore(
+        resolved_state_store_path,
+        writer_assertion=_assert_writer_active_for_write if write_api_available else None,
+        read_only=not write_api_available,
+        ensure_schema=write_api_available,
+    )
     resolved_decision_mode_path = decision_mode_path or _runtime_store_path(
         state_path,
         "decision_mode.json",
@@ -2101,17 +2423,73 @@ def build_handler(
         "payload": _empty_blockbeats_payload(),
     }
 
-    def _sync_public_state_snapshot() -> None:
+    def _sync_public_state_snapshot(precomputed_payload: dict[str, object] | None = None) -> None:
+        if not read_side_effects_enabled:
+            return
         if not resolved_public_state_path:
             return
-        if not os.path.exists(state_path):
-            return
-        state = _load_json(state_path, _empty_state())
-        payload = _api_state_payload(state, candidate_store)
+        if isinstance(precomputed_payload, dict):
+            payload = dict(precomputed_payload)
+        else:
+            if not os.path.exists(state_path):
+                return
+            state = _load_json(state_path, _empty_state())
+            payload = _api_state_payload(state, candidate_store)
+            payload["control"] = _load_control_truth()
+            payload["control_plane_security"] = dict(security_snapshot)
+            now_ts = int(time.time())
+            payload["observability"] = build_observability_snapshot(
+                state_payload=payload,
+                now_ts=now_ts,
+                heartbeat_stale_after_seconds=heartbeat_stale_after_seconds_value,
+                buy_blocked_alert_after_seconds=buy_blocked_alert_after_seconds_value,
+            )
         try:
             _safe_write_json(resolved_public_state_path, payload)
         except Exception:
             return
+
+    def _load_control_truth() -> dict:
+        payload = _default_control()
+        try:
+            persisted = state_store.load_control_state()
+        except Exception:
+            persisted = None
+        if isinstance(persisted, dict):
+            payload.update(persisted)
+        return payload
+
+    def _build_request_observability_snapshot(
+        *,
+        days: int,
+        recent_days: int,
+    ) -> tuple[dict[str, object], dict[str, object], str]:
+        raw_state = _load_json(state_path, _empty_state())
+        payload = _api_state_payload(raw_state, candidate_store, days=days, recent_days=recent_days)
+        payload["control"] = _load_control_truth()
+        payload["control_plane_security"] = dict(security_snapshot)
+        now_ts = int(time.time())
+        observability = build_observability_snapshot(
+            state_payload=payload,
+            now_ts=now_ts,
+            heartbeat_stale_after_seconds=heartbeat_stale_after_seconds_value,
+            buy_blocked_alert_after_seconds=buy_blocked_alert_after_seconds_value,
+        )
+        payload["observability"] = dict(observability)
+        metrics_text = render_prometheus_metrics(observability)
+        return payload, observability, metrics_text
+
+    def _save_control_truth(payload: dict) -> dict:
+        _assert_writer_active_for_write()
+        normalized = _default_control()
+        normalized.update(dict(payload))
+        state_store.save_control_state(normalized)
+        if read_side_effects_enabled:
+            try:
+                _safe_write_json(control_path, normalized)
+            except Exception:
+                pass
+        return normalized
 
     def _cached_blockbeats_payload(force: bool = False) -> dict:
         now = time.time()
@@ -2199,11 +2577,136 @@ def build_handler(
             self.end_headers()
             self.wfile.write(raw)
 
+        def _request_remote_ip(self) -> str:
+            client = getattr(self, "client_address", ("", 0))
+            if isinstance(client, tuple) and client:
+                return str(client[0] or "").strip()
+            return ""
+
+        def _effective_client_ip(self) -> tuple[str, bool]:
+            remote_addr = self._request_remote_ip()
+            forwarded_for = self.headers.get("X-Forwarded-For", "")
+            return resolve_effective_client_ip(
+                remote_addr=remote_addr,
+                forwarded_for=forwarded_for,
+                trusted_proxy_networks=trusted_proxy_networks,
+            )
+
+        def _is_write_source_allowed(self) -> tuple[bool, str, str, bool]:
+            remote_ip = self._request_remote_ip()
+            client_ip, xff_used = self._effective_client_ip()
+            allowed = is_write_source_allowed(client_ip, source_policy=source_policy)
+            return (allowed, remote_ip, client_ip, xff_used)
+
+        def _emit_control_audit(
+            self,
+            *,
+            action: str,
+            status: str,
+            reason_code: str,
+            http_status: int,
+            path: str,
+            query: dict[str, list[str]],
+            authorized: bool,
+        ) -> None:
+            remote_ip = self._request_remote_ip()
+            client_ip, xff_used = self._effective_client_ip()
+            event = ControlAuditEvent(
+                ts=int(time.time()),
+                method="POST",
+                path=path,
+                action=str(action or ""),
+                status=str(status or ""),
+                reason_code=str(reason_code or ""),
+                http_status=int(http_status or 0),
+                source_ip=remote_ip,
+                client_ip=client_ip,
+                xff_used=bool(xff_used),
+                write_api_available=bool(security_snapshot.get("write_api_available")),
+                live_mode=bool(security_snapshot.get("live_mode")),
+                authorized=bool(authorized),
+            )
+            payload = {
+                "ts": event.ts,
+                "method": event.method,
+                "path": event.path,
+                "action": event.action,
+                "status": event.status,
+                "reason_code": event.reason_code,
+                "http_status": event.http_status,
+                "source_ip": event.source_ip,
+                "client_ip": event.client_ip,
+                "xff_used": event.xff_used,
+                "write_api_available": event.write_api_available,
+                "live_mode": event.live_mode,
+                "authorized": event.authorized,
+                "writer_scope": writer_scope,
+                "token_configured": bool(security_snapshot.get("token_configured")),
+                "source_policy": str(security_snapshot.get("source_policy") or source_policy),
+                "query_token_present": bool(_query_token(query)),
+            }
+            _safe_append_jsonl(control_audit_log_path, payload)
+
+        def _audit_or_fail(
+            self,
+            *,
+            action: str,
+            status: str,
+            reason_code: str,
+            http_status: int,
+            path: str,
+            query: dict[str, list[str]],
+            authorized: bool,
+        ) -> bool:
+            try:
+                self._emit_control_audit(
+                    action=action,
+                    status=status,
+                    reason_code=reason_code,
+                    http_status=http_status,
+                    path=path,
+                    query=query,
+                    authorized=authorized,
+                )
+            except Exception:
+                payload = _api_error_payload("writeApiDisabled", fallback="write api disabled")
+                payload["reason_code"] = "control_audit_write_failed"
+                payload["writer_scope"] = writer_scope
+                self._json_response(payload, HTTPStatus.SERVICE_UNAVAILABLE)
+                return False
+            return True
+
+        def _write_api_disabled_response(self, *, reason_code: str = "write_api_disabled", path: str = "", query: dict[str, list[str]] | None = None) -> None:
+            payload = _api_error_payload("writeApiDisabled", fallback="write api disabled")
+            payload["reason_code"] = str(reason_code or "write_api_disabled")
+            payload["writer_scope"] = writer_scope
+            if query is None:
+                query = {}
+            audit_ok = self._audit_or_fail(
+                action="write_blocked",
+                status="rejected",
+                reason_code=str(payload.get("reason_code") or "write_api_disabled"),
+                http_status=int(HTTPStatus.SERVICE_UNAVAILABLE),
+                path=str(path or ""),
+                query=query,
+                authorized=False,
+            )
+            if not audit_ok:
+                return
+            self._json_response(payload, HTTPStatus.SERVICE_UNAVAILABLE)
+
         def _is_authorized(self, query: dict[str, list[str]]) -> bool:
             if not control_token:
-                return True
+                return False
             got = _extract_token(self.headers, query)
             return got == control_token
+
+        def _is_local_read_access(self) -> bool:
+            remote_ip = self._request_remote_ip()
+            host_name = _normalize_host_name(self.headers.get("Host", ""))
+            if remote_ip not in {"127.0.0.1", "::1"}:
+                return False
+            return host_name in {"127.0.0.1", "::1", "localhost"}
 
         def _maybe_arm_cookie(self, query: dict[str, list[str]]) -> None:
             query_token = _query_token(query)
@@ -2237,13 +2740,13 @@ def build_handler(
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>{title}</title>
   <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#0f172a; color:#e2e8f0; margin:0; display:grid; min-height:100vh; place-items:center; }
-    main { width:min(92vw, 460px); background:#111827; border:1px solid #334155; border-radius:16px; padding:24px; box-shadow:0 20px 60px rgba(0,0,0,.35); }
-    h1 { margin:0 0 10px; font-size:22px; }
-    p { margin:0 0 16px; color:#94a3b8; line-height:1.5; }
-    input { width:100%; box-sizing:border-box; padding:12px 14px; border-radius:10px; border:1px solid #475569; background:#020617; color:#e2e8f0; margin:0 0 12px; }
-    button { width:100%; padding:12px 14px; border-radius:10px; border:0; background:#22c55e; color:#052e16; font-weight:700; cursor:pointer; }
-    code { color:#f8fafc; }
+    body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background:#0f172a; color:#e2e8f0; margin:0; display:grid; min-height:100vh; place-items:center; }}
+    main {{ width:min(92vw, 460px); background:#111827; border:1px solid #334155; border-radius:16px; padding:24px; box-shadow:0 20px 60px rgba(0,0,0,.35); }}
+    h1 {{ margin:0 0 10px; font-size:22px; }}
+    p {{ margin:0 0 16px; color:#94a3b8; line-height:1.5; }}
+    input {{ width:100%; box-sizing:border-box; padding:12px 14px; border-radius:10px; border:1px solid #475569; background:#020617; color:#e2e8f0; margin:0 0 12px; }}
+    button {{ width:100%; padding:12px 14px; border-radius:10px; border:0; background:#22c55e; color:#052e16; font-weight:700; cursor:pointer; }}
+    code {{ color:#f8fafc; }}
   </style>
 </head>
 <body>
@@ -2283,8 +2786,12 @@ def build_handler(
             path = parsed.path
             query = parse_qs(parsed.query, keep_blank_values=False)
 
-            if control_token and not self._is_authorized(query):
-                if path.startswith("/api/"):
+            if (path.startswith("/api/") or path == "/metrics") and not is_api_read_route_allowed("GET", path):
+                self._json_response(_api_error_payload("notFound", fallback="not found"), HTTPStatus.NOT_FOUND)
+                return
+
+            if control_token and not (self._is_authorized(query) or self._is_local_read_access()):
+                if path.startswith("/api/") or path == "/metrics":
                     self._json_response(_api_error_payload("unauthorized", fallback="unauthorized"), HTTPStatus.UNAUTHORIZED)
                 else:
                     self._html_response(self._unauthorized_page(), HTTPStatus.UNAUTHORIZED)
@@ -2297,22 +2804,28 @@ def build_handler(
             self._maybe_arm_cookie(query)
 
             if path == "/api/state":
-                payload = _api_state_payload(
-                    _load_json(state_path, _empty_state()),
-                    candidate_store,
+                payload, _, _ = _build_request_observability_snapshot(
                     days=_query_limit(query, "days", default=30, maximum=365),
                     recent_days=_query_limit(query, "recent_days", default=7, maximum=90),
                 )
-                payload["control"] = _load_json(control_path, _default_control())
-                _sync_public_state_snapshot()
+                if read_side_effects_enabled:
+                    _sync_public_state_snapshot(payload)
                 self._json_response(payload)
                 return
 
+            if path == "/metrics":
+                _, _, metrics_text = _build_request_observability_snapshot(
+                    days=30,
+                    recent_days=7,
+                )
+                self._text_response(metrics_text, "text/plain; version=0.0.4; charset=utf-8")
+                return
+
             if path == "/api/control":
-                if not self._is_authorized(query):
+                if control_token and not self._is_authorized(query):
                     self._json_response(_api_error_payload("unauthorized", fallback="unauthorized"), HTTPStatus.UNAUTHORIZED)
                     return
-                payload = _load_json(control_path, _default_control())
+                payload = _load_control_truth()
                 self._json_response(payload)
                 return
 
@@ -2332,6 +2845,11 @@ def build_handler(
                 return
 
             if path == "/api/blockbeats":
+                if not read_side_effects_enabled:
+                    cached = blockbeats_cache.get("payload")
+                    payload = dict(cached) if isinstance(cached, dict) else _empty_blockbeats_payload()
+                    self._json_response(payload)
+                    return
                 force = False
                 if query.get("force"):
                     try:
@@ -2566,7 +3084,7 @@ def build_handler(
                 return
 
             if path == "/api/mode":
-                control = _load_json(control_path, _default_control())
+                control = _load_control_truth()
                 payload = {
                     "mode": str(control.get("decision_mode") or "manual"),
                     "updated_ts": int(control.get("updated_ts") or 0),
@@ -2586,18 +3104,98 @@ def build_handler(
             path = parsed.path
             query = parse_qs(parsed.query, keep_blank_values=False)
 
-            if path not in {
-                "/api/control",
-                "/api/operator",
-                "/api/candidate/action",
-                "/api/mode",
-                "/api/journal/note",
-                "/api/wallet-profiles/update",
-            }:
-                self._json_response(_api_error_payload("notFound", fallback="not found"), HTTPStatus.NOT_FOUND)
+            if not is_api_write_route_allowed("POST", path):
+                payload = _api_error_payload("notFound", fallback="not found")
+                payload["reason_code"] = "write_route_not_allowed"
+                if not self._audit_or_fail(
+                    action="write_rejected",
+                    status="rejected",
+                    reason_code="write_route_not_allowed",
+                    http_status=int(HTTPStatus.NOT_FOUND),
+                    path=path,
+                    query=query,
+                    authorized=False,
+                ):
+                    return
+                self._json_response(payload, HTTPStatus.NOT_FOUND)
+                return
+            if not write_api_available:
+                reason_code = SINGLE_WRITER_CONFLICT_REASON
+                reason_codes = list(security_snapshot.get("reason_codes") or [])
+                for candidate in reason_codes:
+                    text = str(candidate or "").strip()
+                    if text in {"control_token_missing", "control_token_weak", "trusted_proxy_config_invalid", SINGLE_WRITER_CONFLICT_REASON}:
+                        reason_code = text
+                        break
+                self._write_api_disabled_response(reason_code=reason_code, path=path, query=query)
+                return
+            try:
+                _assert_writer_active_for_write()
+            except SingleWriterLockError as exc:
+                payload = _api_error_payload("writeApiDisabled", fallback="write api disabled")
+                payload["reason_code"] = str(getattr(exc, "reason_code", "") or SINGLE_WRITER_CONFLICT_REASON)
+                payload["writer_scope"] = writer_scope
+                if not self._audit_or_fail(
+                    action="write_blocked",
+                    status="rejected",
+                    reason_code=str(payload.get("reason_code") or SINGLE_WRITER_CONFLICT_REASON),
+                    http_status=int(HTTPStatus.SERVICE_UNAVAILABLE),
+                    path=path,
+                    query=query,
+                    authorized=False,
+                ):
+                    return
+                self._json_response(payload, HTTPStatus.SERVICE_UNAVAILABLE)
+                return
+            except Exception as exc:
+                reason_code = str(getattr(exc, "reason_code", "") or "writer_assertion_failed")
+                self._write_api_disabled_response(reason_code=reason_code, path=path, query=query)
+                return
+            source_allowed, _remote_ip, _client_ip, _xff_used = self._is_write_source_allowed()
+            if not source_allowed:
+                payload = _api_error_payload("forbidden", fallback="forbidden")
+                payload["reason_code"] = "source_not_allowed"
+                payload["source_policy"] = str(source_policy)
+                payload["writer_scope"] = writer_scope
+                if not self._audit_or_fail(
+                    action="write_rejected",
+                    status="rejected",
+                    reason_code="source_not_allowed",
+                    http_status=int(HTTPStatus.FORBIDDEN),
+                    path=path,
+                    query=query,
+                    authorized=False,
+                ):
+                    return
+                self._json_response(payload, HTTPStatus.FORBIDDEN)
                 return
             if not self._is_authorized(query):
-                self._json_response(_api_error_payload("unauthorized", fallback="unauthorized"), HTTPStatus.UNAUTHORIZED)
+                reason_code = "control_token_invalid"
+                if not _extract_token(self.headers, query):
+                    reason_code = "control_token_missing"
+                payload = _api_error_payload("unauthorized", fallback="unauthorized")
+                payload["reason_code"] = reason_code
+                if not self._audit_or_fail(
+                    action="write_rejected",
+                    status="rejected",
+                    reason_code=reason_code,
+                    http_status=int(HTTPStatus.UNAUTHORIZED),
+                    path=path,
+                    query=query,
+                    authorized=False,
+                ):
+                    return
+                self._json_response(payload, HTTPStatus.UNAUTHORIZED)
+                return
+            if not self._audit_or_fail(
+                action="write_request",
+                status="accepted",
+                reason_code="write_request_accepted",
+                http_status=int(HTTPStatus.ACCEPTED),
+                path=path,
+                query=query,
+                authorized=True,
+            ):
                 return
             self._maybe_arm_cookie(query)
 
@@ -2662,6 +3260,16 @@ def build_handler(
                             "payload": {"source": "candidate_action_api"},
                         }
                     )
+                if not self._audit_or_fail(
+                    action="candidate_action",
+                    status="success",
+                    reason_code="write_success",
+                    http_status=int(HTTPStatus.OK),
+                    path=path,
+                    query=query,
+                    authorized=True,
+                ):
+                    return
                 self._json_response({"ok": True, "candidate": updated, "idempotent_replay": idempotent_replay})
                 return
 
@@ -2670,10 +3278,20 @@ def build_handler(
                 if mode not in {"manual", "semi_auto", "auto"}:
                     self._json_response(_api_error_payload("invalidMode", fallback="invalid mode"), HTTPStatus.BAD_REQUEST)
                     return
-                payload = _load_json(control_path, _default_control())
+                payload = _load_control_truth()
                 payload["decision_mode"] = mode
                 payload["updated_ts"] = int(time.time())
-                _safe_write_json(control_path, payload)
+                payload = _save_control_truth(payload)
+                if not self._audit_or_fail(
+                    action="mode_update",
+                    status="success",
+                    reason_code="write_success",
+                    http_status=int(HTTPStatus.OK),
+                    path=path,
+                    query=query,
+                    authorized=True,
+                ):
+                    return
                 self._json_response(
                     {
                         "ok": True,
@@ -2711,6 +3329,16 @@ def build_handler(
                         },
                     }
                 )
+                if not self._audit_or_fail(
+                    action="journal_note",
+                    status="success",
+                    reason_code="write_success",
+                    http_status=int(HTTPStatus.OK),
+                    path=path,
+                    query=query,
+                    authorized=True,
+                ):
+                    return
                 self._json_response({"ok": True, "note": note, "summary": candidate_store.journal_summary(days=30)})
                 return
 
@@ -2790,6 +3418,16 @@ def build_handler(
                     )
                     return
                 candidate_store.upsert_wallet_profile(profile)
+                if not self._audit_or_fail(
+                    action="wallet_profile_update",
+                    status="success",
+                    reason_code="write_success",
+                    http_status=int(HTTPStatus.OK),
+                    path=path,
+                    query=query,
+                    authorized=True,
+                ):
+                    return
                 self._json_response({"ok": True, "wallet_profile": profile})
                 return
 
@@ -2799,11 +3437,21 @@ def build_handler(
                     self._json_response(_api_error_payload("invalidCommand", fallback="invalid command"), HTTPStatus.BAD_REQUEST)
                     return
                 if command == "clear_stale_pending":
-                    payload = _load_json(control_path, _default_control())
+                    payload = _load_control_truth()
                     requested_ts = int(time.time())
                     payload["clear_stale_pending_requested_ts"] = requested_ts
                     payload["updated_ts"] = requested_ts
-                    _safe_write_json(control_path, payload)
+                    payload = _save_control_truth(payload)
+                    if not self._audit_or_fail(
+                        action="operator_clear_stale_pending",
+                        status="success",
+                        reason_code="write_success",
+                        http_status=int(HTTPStatus.OK),
+                        path=path,
+                        query=query,
+                        authorized=True,
+                    ):
+                        return
                     self._json_response(
                         {
                             "ok": True,
@@ -2842,6 +3490,16 @@ def build_handler(
                         HTTPStatus.INTERNAL_SERVER_ERROR,
                     )
                     return
+                if not self._audit_or_fail(
+                    action="operator_generate_reconciliation_report",
+                    status="success",
+                    reason_code="write_success",
+                    http_status=int(HTTPStatus.OK),
+                    path=path,
+                    query=query,
+                    authorized=True,
+                ):
+                    return
                 self._json_response(
                     {
                         "ok": True,
@@ -2856,7 +3514,7 @@ def build_handler(
                 )
                 return
 
-            payload = _load_json(control_path, _default_control())
+            payload = _load_control_truth()
             command = str(incoming.get("command", "")).strip().lower()
             value = bool(incoming.get("value", True))
 
@@ -2872,7 +3530,17 @@ def build_handler(
                 return
 
             payload["updated_ts"] = int(time.time())
-            _safe_write_json(control_path, payload)
+            payload = _save_control_truth(payload)
+            if not self._audit_or_fail(
+                action=f"control_command:{command}",
+                status="success",
+                reason_code="write_success",
+                http_status=int(HTTPStatus.OK),
+                path=path,
+                query=query,
+                authorized=True,
+            ):
+                return
             self._json_response(payload)
 
     return Handler
@@ -2884,7 +3552,22 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8787)
     parser.add_argument("--state-path", default="/tmp/poly_runtime_data/state.json")
     parser.add_argument("--control-path", default="/tmp/poly_runtime_data/control.json")
+    parser.add_argument("--state-store-path", default=os.getenv("POLY_STATE_STORE_PATH", "/tmp/poly_runtime_data/state.db"))
     parser.add_argument("--control-token", default=os.getenv("POLY_CONTROL_TOKEN", ""))
+    parser.add_argument(
+        "--write-source-policy",
+        default=os.getenv("POLY_CONTROL_SOURCE_POLICY", ""),
+        help="write source policy: local_only|internal_only|any",
+    )
+    parser.add_argument(
+        "--trusted-proxy-cidrs",
+        default=os.getenv("POLY_TRUSTED_PROXY_CIDRS", ""),
+        help="comma-separated trusted reverse proxy CIDRs for X-Forwarded-For",
+    )
+    parser.add_argument(
+        "--control-audit-log-path",
+        default=os.getenv("POLY_CONTROL_AUDIT_LOG_PATH", ""),
+    )
     parser.add_argument("--monitor-30m-json-path", default="/tmp/poly_monitor_30m_report.json")
     parser.add_argument("--monitor-12h-json-path", default="/tmp/poly_monitor_12h_report.json")
     parser.add_argument("--reconciliation-eod-json-path", default="/tmp/poly_reconciliation_eod_report.json")
@@ -2911,14 +3594,137 @@ def main() -> None:
         "--candidate-db-path",
         default=os.getenv("POLY_CANDIDATE_DB_PATH", "/tmp/poly_runtime_data/decision_terminal.db"),
     )
+    parser.add_argument("--enable-write-api", default=os.getenv("POLY_ENABLE_WRITE_API", "false"))
     parser.add_argument("--frontend-dir", default="")
     args = parser.parse_args()
+    logging.basicConfig(
+        level=getattr(logging, str(os.getenv("LOG_LEVEL", "INFO")).upper(), logging.INFO),
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
+    log = logging.getLogger("polybot.web")
     settings = Settings()
+    writer_scope = derive_writer_scope(
+        dry_run=bool(settings.dry_run),
+        funder_address=str(settings.funder_address or ""),
+        watch_wallets=str(settings.watch_wallets or ""),
+    )
+    log.info(
+        "SINGLE_WRITER_SCOPE scope=%s dry_run=%s lock_path=%s",
+        writer_scope,
+        bool(settings.dry_run),
+        settings.wallet_lock_path,
+    )
+    if not bool(settings.dry_run) and not bool(settings.enable_single_writer):
+        log.error(
+            "startup blocked reason_code=single_writer_required_live dry_run=%s enable_single_writer=%s scope=%s",
+            bool(settings.dry_run),
+            bool(settings.enable_single_writer),
+            writer_scope,
+        )
+        raise SystemExit(2)
+
+    try:
+        write_api_requested = _parse_bool_value(args.enable_write_api, field="enable_write_api")
+    except ValueError as exc:
+        raise SystemExit(f"invalid --enable-write-api: {exc}")
+
+    source_policy_raw = str(args.write_source_policy or settings.control_write_source_policy or SOURCE_POLICY_LOCAL_ONLY)
+    try:
+        source_policy = normalize_source_policy(source_policy_raw)
+    except ValueError as exc:
+        raise SystemExit(f"invalid --write-source-policy: {exc}")
+
+    trusted_proxy_cidrs = str(args.trusted_proxy_cidrs or settings.control_trusted_proxy_cidrs or "")
+    trusted_proxy_networks, trusted_proxy_reason = parse_trusted_proxy_networks(trusted_proxy_cidrs)
+    if trusted_proxy_reason and write_api_requested:
+        log.error(
+            "startup blocked reason_code=%s trusted_proxy_cidrs=%s",
+            trusted_proxy_reason,
+            trusted_proxy_cidrs,
+        )
+        raise SystemExit(4)
+
+    control_token = str(args.control_token or "").strip()
+    token_ok, token_reason = validate_control_token(control_token, min_length=int(settings.control_token_min_length or 16))
+    live_mode = not bool(settings.dry_run)
+
+    reason_codes: list[str] = []
+    if not write_api_requested:
+        reason_codes.append("write_api_not_requested")
+    if write_api_requested and not token_ok:
+        reason_codes.append(str(token_reason or "control_token_missing"))
+    if write_api_requested and trusted_proxy_reason:
+        reason_codes.append(str(trusted_proxy_reason))
+
+    if live_mode and write_api_requested and not token_ok:
+        log.error(
+            "startup blocked reason_code=%s live_mode=true write_api_requested=%s",
+            token_reason,
+            write_api_requested,
+        )
+        raise SystemExit(4)
+
+    writer_lock: FileLock | None = None
+    write_api_available = False
+    if write_api_requested and token_ok and not trusted_proxy_reason:
+        writer_lock = FileLock(
+            settings.wallet_lock_path,
+            timeout=0.0,
+            writer_scope=writer_scope,
+        )
+        try:
+            writer_lock.acquire()
+            write_api_available = True
+        except SingleWriterLockError as exc:
+            reason_code = str(getattr(exc, "reason_code", "") or "")
+            if reason_code == SINGLE_WRITER_CONFLICT_REASON:
+                reason_codes.append(SINGLE_WRITER_CONFLICT_REASON)
+                log.warning(
+                    "write api disabled reason_code=%s scope=%s lock_path=%s",
+                    reason_code,
+                    writer_scope,
+                    settings.wallet_lock_path,
+                )
+                writer_lock = None
+                write_api_available = False
+            else:
+                reason_codes.append(reason_code or "writer_lock_error")
+                log.error(
+                    "startup blocked reason_code=%s scope=%s lock_path=%s err=%s",
+                    reason_code,
+                    writer_scope,
+                    settings.wallet_lock_path,
+                    exc,
+                )
+                raise SystemExit(3)
+
+    if write_api_requested and not write_api_available and "write_api_not_requested" in reason_codes:
+        reason_codes = [code for code in reason_codes if code != "write_api_not_requested"]
+    if write_api_available and "write_api_enabled" not in reason_codes:
+        reason_codes.append("write_api_enabled")
+    elif not write_api_available and write_api_requested:
+        reason_codes.append("write_api_disabled")
+
+    security_status = ControlPlaneSecurityStatus(
+        live_mode=live_mode,
+        write_api_requested=write_api_requested,
+        write_api_available=write_api_available,
+        readonly_mode=not write_api_available,
+        token_configured=token_ok,
+        source_policy=source_policy,
+        trusted_proxy_configured=bool(trusted_proxy_networks),
+        reason_codes=reason_codes,
+    )
+
+    read_side_effects_enabled = bool(write_api_available)
+
     runtime_paths = build_runtime_artifact_paths(settings)
     if args.state_path == "/tmp/poly_runtime_data/state.json":
         args.state_path = runtime_paths["state_path"]
     if args.control_path == "/tmp/poly_runtime_data/control.json":
         args.control_path = runtime_paths["control_path"]
+    if args.state_store_path == os.getenv("POLY_STATE_STORE_PATH", "/tmp/poly_runtime_data/state.db"):
+        args.state_store_path = settings.state_store_path
     if args.monitor_30m_json_path == "/tmp/poly_monitor_30m_report.json":
         args.monitor_30m_json_path = runtime_paths["monitor_30m_json_path"]
     if args.monitor_12h_json_path == "/tmp/poly_monitor_12h_report.json":
@@ -2941,6 +3747,8 @@ def main() -> None:
         args.journal_path = runtime_paths["journal_path"]
     if args.candidate_db_path == os.getenv("POLY_CANDIDATE_DB_PATH", "/tmp/poly_runtime_data/decision_terminal.db"):
         args.candidate_db_path = runtime_paths["candidate_db_path"]
+    if not str(args.control_audit_log_path or "").strip():
+        args.control_audit_log_path = runtime_paths["control_audit_log_path"]
 
     if args.frontend_dir:
         frontend = Path(args.frontend_dir)
@@ -2952,7 +3760,7 @@ def main() -> None:
         str(frontend),
         args.state_path,
         args.control_path,
-        args.control_token,
+        control_token,
         args.monitor_30m_json_path,
         args.monitor_12h_json_path,
         args.reconciliation_eod_json_path,
@@ -2964,10 +3772,24 @@ def main() -> None:
         args.journal_path,
         args.candidate_db_path,
         args.public_state_path,
+        args.state_store_path,
+        enable_write_api=write_api_available,
+        write_api_requested=write_api_requested,
+        writer_assertion=(writer_lock.assert_active if writer_lock is not None else None),
+        allow_read_side_effects=read_side_effects_enabled,
+        writer_scope=writer_scope,
+        live_mode=live_mode,
+        control_source_policy=source_policy,
+        trusted_proxy_cidrs=trusted_proxy_cidrs,
+        control_token_min_length=int(settings.control_token_min_length or 16),
+        control_audit_log_path=args.control_audit_log_path,
+        control_plane_security_snapshot=security_status.as_state_payload(),
+        heartbeat_stale_after_seconds=int(settings.observability_heartbeat_stale_seconds or 180),
+        buy_blocked_alert_after_seconds=int(settings.observability_buy_blocked_alert_seconds or 900),
     )
     server = ReusableThreadingHTTPServer((args.host, args.port), handler)
     try:
-        if hasattr(handler, "sync_public_state_snapshot"):
+        if read_side_effects_enabled and hasattr(handler, "sync_public_state_snapshot"):
             handler.sync_public_state_snapshot()
 
             def _background_public_state_sync() -> None:
@@ -2982,6 +3804,8 @@ def main() -> None:
         server.serve_forever()
     finally:
         server.server_close()
+        if writer_lock is not None:
+            writer_lock.release()
 
 
 if __name__ == "__main__":

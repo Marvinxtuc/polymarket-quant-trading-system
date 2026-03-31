@@ -1,0 +1,15 @@
+BLOCK-009 regression report (acceptance evidence round)
+Generated: 2026-03-27 11:55:00 CST
+
+Command:
+- bash scripts/gates/gate_block_item.sh BLOCK-009
+
+Gate results:
+- static: PASS
+- tests: PASS
+- behavior: PASS
+- docs: PASS
+- block-item: PASS
+
+Notes:
+- Full BLOCK-009 gate test set passed, including existing regression suites `test_runner_control.py` and `test_web_api.py`.

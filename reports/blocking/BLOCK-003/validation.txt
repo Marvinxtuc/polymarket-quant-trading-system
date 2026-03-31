@@ -1,0 +1,72 @@
+# BLOCK-003 validation log
+
+$ PYTHONPATH=src .venv/bin/python -m py_compile src/polymarket_bot/locks.py src/polymarket_bot/state_store.py src/polymarket_bot/runner.py src/polymarket_bot/main.py src/polymarket_bot/daemon.py src/polymarket_bot/web.py tests/test_single_writer_lock.py tests/test_second_executor_is_readonly_or_exit.py tests/test_lock_recovery_after_crash.py tests/test_control_state_cannot_be_overwritten_by_standby.py scripts/verify_single_writer.py scripts/verify_lock_recovery.py
+- RESULT: PASS
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_single_writer_lock.py"
+- RESULT: PASS (Ran 5 tests)
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_second_executor_is_readonly_or_exit.py"
+- RESULT: PASS (Ran 6 tests)
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_lock_recovery_after_crash.py"
+- RESULT: PASS (Ran 2 tests)
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_control_state_cannot_be_overwritten_by_standby.py"
+- RESULT: PASS (Ran 4 tests)
+
+$ PYTHONPATH=src:tests .venv/bin/python scripts/verify_single_writer.py
+- RESULT: PASS
+- OUTPUT: writer_scope=paper:default
+
+$ PYTHONPATH=src:tests .venv/bin/python scripts/verify_lock_recovery.py
+- RESULT: PASS
+- OUTPUT: writer_scope=paper:default
+
+$ ./scripts/gates/gate_static.sh BLOCK-003
+- RESULT: PASS
+
+$ ./scripts/gates/gate_tests.sh BLOCK-003
+- RESULT: PASS
+
+$ ./scripts/gates/gate_behavior.sh BLOCK-003
+- RESULT: PASS
+
+$ ./scripts/gates/gate_docs.sh BLOCK-003
+- RESULT: PASS
+
+$ ./scripts/gates/gate_block_item.sh BLOCK-003
+- RESULT: PASS
+
+## Acceptance evidence rerun (2026-03-26)
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_second_executor_is_readonly_or_exit.py"
+- RESULT: PASS (Ran 6 tests)
+- COVERAGE: lock-before-build (main/daemon), live single-writer bypass denied
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_control_state_cannot_be_overwritten_by_standby.py"
+- RESULT: PASS (Ran 4 tests)
+- COVERAGE: standby GET no side-effects, web lock-before-write-handler
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_single_writer_lock.py"
+- RESULT: PASS (Ran 5 tests)
+- COVERAGE: all state_store mutation methods guard-enforced
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_lock_recovery_after_crash.py"
+- RESULT: PASS (Ran 2 tests)
+- COVERAGE: old writer write denied after handover
+
+$ ./scripts/gates/gate_static.sh BLOCK-003
+- RESULT: PASS
+
+$ ./scripts/gates/gate_tests.sh BLOCK-003
+- RESULT: PASS
+
+$ ./scripts/gates/gate_behavior.sh BLOCK-003
+- RESULT: PASS
+
+$ ./scripts/gates/gate_docs.sh BLOCK-003
+- RESULT: PASS
+
+$ ./scripts/gates/gate_block_item.sh BLOCK-003
+- RESULT: PASS

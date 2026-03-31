@@ -12,6 +12,7 @@ from unittest.mock import patch
 from polymarket_bot.db import PersonalTerminalStore
 from polymarket_bot.i18n import t as i18n_t
 from polymarket_bot.reconciliation_report import append_ledger_entry
+from polymarket_bot.state_store import StateStore
 from polymarket_bot.types import Candidate
 from polymarket_bot.web import build_handler
 
@@ -39,8 +40,9 @@ class _FakeSocket:
 
 class WebApiTests(unittest.TestCase):
     @staticmethod
-    def _dispatch(handler_cls, path: str) -> dict:
-        request = f"GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    def _dispatch(handler_cls, path: str, *, token: str = "") -> dict:
+        auth_header = f"X-Auth-Token: {token}\r\n" if token else ""
+        request = f"GET {path} HTTP/1.1\r\nHost: localhost\r\n{auth_header}\r\n"
         sock = _FakeSocket(request)
         server = SimpleNamespace(server_name="localhost", server_port=8787)
         handler_cls(sock, ("127.0.0.1", 12345), server)
@@ -49,11 +51,15 @@ class WebApiTests(unittest.TestCase):
         return json.loads(body)
 
     @staticmethod
-    def _dispatch_post(handler_cls, path: str, payload: dict) -> tuple[int, dict]:
+    def _dispatch_post(handler_cls, path: str, payload: dict, *, token: str = "") -> tuple[int, dict]:
         raw_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        auth_header = ""
+        if token:
+            auth_header = f"X-Auth-Token: {token}\r\n"
         request = (
             f"POST {path} HTTP/1.1\r\n"
             f"Host: localhost\r\n"
+            f"{auth_header}"
             f"Content-Type: application/json\r\n"
             f"Content-Length: {len(raw_body)}\r\n"
             f"\r\n"
@@ -68,8 +74,9 @@ class WebApiTests(unittest.TestCase):
         return status_code, json.loads(body)
 
     @staticmethod
-    def _dispatch_raw(handler_cls, path: str) -> tuple[int, str, str]:
-        request = f"GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n"
+    def _dispatch_raw(handler_cls, path: str, *, token: str = "") -> tuple[int, str, str]:
+        auth_header = f"X-Auth-Token: {token}\r\n" if token else ""
+        request = f"GET {path} HTTP/1.1\r\nHost: localhost\r\n{auth_header}\r\n"
         sock = _FakeSocket(request)
         server = SimpleNamespace(server_name="localhost", server_port=8787)
         handler_cls(sock, ("127.0.0.1", 12345), server)
@@ -222,6 +229,268 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(updated_state_again["summary"]["open_positions"], 3)
         self.assertEqual(state_payload_again["trading_mode"]["mode"], "HALTED")
         self.assertEqual(updated_state_again["trading_mode"]["mode"], "HALTED")
+
+    def test_api_state_includes_admission_decision_and_evidence_summary(self):
+        frontend_dir = tempfile.TemporaryDirectory()
+        Path(frontend_dir.name, "index.html").write_text("ok", encoding="utf-8")
+
+        state_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump(
+            {
+                "summary": {"open_positions": 0},
+                "trading_mode": {
+                    "mode": "REDUCE_ONLY",
+                    "opening_allowed": False,
+                    "reason_codes": ["startup_not_ready"],
+                    "updated_ts": 17,
+                    "source": "runner",
+                },
+                "admission": {
+                    "mode": "REDUCE_ONLY",
+                    "opening_allowed": False,
+                    "reduce_only": True,
+                    "halted": False,
+                    "reason_codes": ["startup_checks_fail"],
+                    "evidence_summary": {
+                        "reconciliation_status": "fail",
+                        "account_snapshot_age_seconds": 901,
+                        "broker_event_sync_age_seconds": 301,
+                        "ledger_diff": 1.7,
+                    },
+                    "updated_ts": 17,
+                },
+            },
+            state_file,
+        )
+        state_file.flush()
+        state_file.close()
+
+        control_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({"pause_opening": False}, control_file)
+        control_file.flush()
+        control_file.close()
+
+        monitor_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, monitor_file)
+        monitor_file.flush()
+        monitor_file.close()
+
+        monitor12_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, monitor12_file)
+        monitor12_file.flush()
+        monitor12_file.close()
+
+        reconciliation_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, reconciliation_file)
+        reconciliation_file.flush()
+        reconciliation_file.close()
+
+        reconciliation_text_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        reconciliation_text_file.write("")
+        reconciliation_text_file.flush()
+        reconciliation_text_file.close()
+
+        ledger_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        ledger_file.write("")
+        ledger_file.flush()
+        ledger_file.close()
+
+        handler_cls = build_handler(
+            frontend_dir.name,
+            state_file.name,
+            control_file.name,
+            "",
+            monitor_file.name,
+            monitor12_file.name,
+            reconciliation_file.name,
+            reconciliation_text_file.name,
+            ledger_file.name,
+        )
+
+        payload = self._dispatch(handler_cls, "/api/state")
+        admission = payload["admission"]
+        self.assertEqual(admission["mode"], "REDUCE_ONLY")
+        self.assertFalse(admission["opening_allowed"])
+        self.assertIn("startup_checks_fail", admission["reason_codes"])
+        evidence = admission["evidence_summary"]
+        self.assertEqual(evidence["reconciliation_status"], "fail")
+        self.assertEqual(evidence["account_snapshot_age_seconds"], 901)
+        self.assertEqual(evidence["broker_event_sync_age_seconds"], 301)
+        self.assertAlmostEqual(float(evidence["ledger_diff"]), 1.7, places=4)
+
+    def test_api_state_preserves_time_exit_state_machine_payload(self):
+        frontend_dir = tempfile.TemporaryDirectory()
+        Path(frontend_dir.name, "index.html").write_text("ok", encoding="utf-8")
+
+        state_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump(
+            {
+                "summary": {"open_positions": 1},
+                "config": {
+                    "time_exit_retry_limit": 2,
+                    "time_exit_retry_cooldown_seconds": 300,
+                    "time_exit_priority_volatility_step_bps": 100.0,
+                },
+                "positions": [
+                    {
+                        "token_id": "token-time-exit",
+                        "market_slug": "market-time-exit",
+                        "outcome": "YES",
+                        "time_exit_state": {
+                            "stage": "force_exit",
+                            "attempt_count": 3,
+                            "consecutive_failures": 2,
+                            "priority": 80,
+                            "priority_reason": "failures=2 | volatility=800.0bps | force_exit",
+                            "market_volatility_bps": 800.0,
+                            "last_attempt_ts": 111,
+                            "last_failure_ts": 111,
+                            "last_success_ts": 0,
+                            "next_retry_ts": 0,
+                            "force_exit_armed_ts": 111,
+                            "last_result": "failed",
+                            "last_error": "no liquidity",
+                        },
+                    }
+                ],
+                "recent_orders": [
+                    {
+                        "title": "market-time-exit",
+                        "token_id": "token-time-exit",
+                        "side": "SELL",
+                        "status": "REJECTED",
+                        "time_exit_stage": "force_exit",
+                        "time_exit_failure_count": 2,
+                        "exit_priority": 80,
+                        "exit_priority_reason": "failures=2 | volatility=800.0bps | force_exit",
+                        "market_volatility_bps": 800.0,
+                        "force_exit_active": True,
+                    }
+                ],
+            },
+            state_file,
+        )
+        state_file.flush()
+        state_file.close()
+
+        public_state_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({"summary": {"open_positions": 0}}, public_state_file)
+        public_state_file.flush()
+        public_state_file.close()
+
+        control_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({"pause_opening": False}, control_file)
+        control_file.flush()
+        control_file.close()
+
+        handler_cls = build_handler(
+            frontend_dir.name,
+            state_file.name,
+            control_file.name,
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            public_state_path=public_state_file.name,
+        )
+
+        payload = self._dispatch(handler_cls, "/api/state")
+
+        frontend_dir.cleanup()
+
+        self.assertEqual(payload["config"]["time_exit_retry_limit"], 2)
+        self.assertEqual(payload["positions"][0]["time_exit_state"]["stage"], "force_exit")
+        self.assertEqual(payload["positions"][0]["time_exit_state"]["consecutive_failures"], 2)
+        self.assertTrue(bool(payload["recent_orders"][0]["force_exit_active"]))
+
+    def test_api_state_includes_kill_switch_status_and_broker_safety_fields(self):
+        frontend_dir = tempfile.TemporaryDirectory()
+        Path(frontend_dir.name, "index.html").write_text("ok", encoding="utf-8")
+
+        state_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump(
+            {
+                "summary": {"open_positions": 1},
+                "kill_switch": {
+                    "mode_requested": "reduce_only",
+                    "phase": "WAITING_BROKER_TERMINAL",
+                    "opening_allowed": False,
+                    "reduce_only": True,
+                    "halted": False,
+                    "latched": True,
+                    "broker_safe_confirmed": False,
+                    "manual_required": False,
+                    "reason_codes": ["operator_reduce_only", "kill_switch_waiting_broker_terminal"],
+                    "open_buy_order_ids": ["oid-open-buy"],
+                    "non_terminal_buy_order_ids": ["oid-open-buy"],
+                    "cancel_requested_order_ids": ["oid-open-buy"],
+                    "tracked_buy_order_ids": ["oid-open-buy"],
+                    "pending_buy_order_keys": ["pending:oid-open-buy"],
+                    "cancel_attempts": 2,
+                    "query_error_count": 0,
+                    "requested_ts": 100,
+                    "last_broker_check_ts": 101,
+                    "updated_ts": 102,
+                },
+            },
+            state_file,
+        )
+        state_file.flush()
+        state_file.close()
+
+        control_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({"pause_opening": False}, control_file)
+        control_file.flush()
+        control_file.close()
+
+        monitor_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, monitor_file)
+        monitor_file.flush()
+        monitor_file.close()
+
+        monitor12_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, monitor12_file)
+        monitor12_file.flush()
+        monitor12_file.close()
+
+        reconciliation_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, reconciliation_file)
+        reconciliation_file.flush()
+        reconciliation_file.close()
+
+        reconciliation_text_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        reconciliation_text_file.write("")
+        reconciliation_text_file.flush()
+        reconciliation_text_file.close()
+
+        ledger_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        ledger_file.write("")
+        ledger_file.flush()
+        ledger_file.close()
+
+        handler_cls = build_handler(
+            frontend_dir.name,
+            state_file.name,
+            control_file.name,
+            "",
+            monitor_file.name,
+            monitor12_file.name,
+            reconciliation_file.name,
+            reconciliation_text_file.name,
+            ledger_file.name,
+        )
+
+        payload = self._dispatch(handler_cls, "/api/state")
+        kill_switch = payload["kill_switch"]
+        self.assertEqual(kill_switch["mode_requested"], "reduce_only")
+        self.assertEqual(kill_switch["phase"], "WAITING_BROKER_TERMINAL")
+        self.assertFalse(kill_switch["opening_allowed"])
+        self.assertFalse(kill_switch["broker_safe_confirmed"])
+        self.assertFalse(kill_switch["manual_required"])
+        self.assertIn("operator_reduce_only", kill_switch["reason_codes"])
+        self.assertEqual(kill_switch["open_buy_order_ids"], ["oid-open-buy"])
 
     def test_blockbeats_endpoint_serves_cached_dashboard_payload(self):
         frontend_dir = tempfile.TemporaryDirectory()
@@ -427,6 +696,18 @@ class WebApiTests(unittest.TestCase):
         ledger_file.write("")
         ledger_file.flush()
         ledger_file.close()
+        state_store_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        state_store_file.close()
+        StateStore(state_store_file.name).save_control_state(
+            {
+                "decision_mode": "manual",
+                "pause_opening": True,
+                "reduce_only": True,
+                "emergency_stop": False,
+                "clear_stale_pending_requested_ts": 0,
+                "updated_ts": int(time.time()),
+            }
+        )
 
         handler_cls = build_handler(
             frontend_dir.name,
@@ -438,6 +719,7 @@ class WebApiTests(unittest.TestCase):
             reconciliation_file.name,
             reconciliation_text_file.name,
             ledger_file.name,
+            state_store_path=state_store_file.name,
         )
 
         payload = self._dispatch(handler_cls, "/api/state")
@@ -510,11 +792,12 @@ class WebApiTests(unittest.TestCase):
             broker="PaperBroker",
         )
 
+        control_token = "test-control-token-1234"
         handler_cls = build_handler(
             frontend_dir.name,
             state_file.name,
             control_file.name,
-            "",
+            control_token,
             monitor_file.name,
             monitor12_file.name,
             reconciliation_file.name,
@@ -526,6 +809,7 @@ class WebApiTests(unittest.TestCase):
             handler_cls,
             "/api/operator",
             {"command": "generate_reconciliation_report"},
+            token=control_token,
         )
 
         generated_json = json.loads(Path(reconciliation_file.name).read_text(encoding="utf-8"))
@@ -600,11 +884,12 @@ class WebApiTests(unittest.TestCase):
         ledger_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
         ledger_file.close()
 
+        control_token = "test-control-token-1234"
         handler_cls = build_handler(
             frontend_dir.name,
             state_file.name,
             control_file.name,
-            "",
+            control_token,
             monitor_file.name,
             monitor12_file.name,
             reconciliation_file.name,
@@ -616,6 +901,7 @@ class WebApiTests(unittest.TestCase):
             handler_cls,
             "/api/operator",
             {"command": "clear_stale_pending"},
+            token=control_token,
         )
 
         control_payload = json.loads(Path(control_file.name).read_text(encoding="utf-8"))
@@ -625,7 +911,7 @@ class WebApiTests(unittest.TestCase):
         self.assertTrue(payload["ok"])
         self.assertEqual(payload["command"], "clear_stale_pending")
         self.assertGreater(int(payload["requested_ts"]), 0)
-        self.assertTrue(control_payload["pause_opening"])
+        self.assertFalse(control_payload["pause_opening"])
         self.assertEqual(int(control_payload["clear_stale_pending_requested_ts"]), int(payload["requested_ts"]))
 
     def test_candidate_action_and_mode_endpoints_use_runtime_store(self):
@@ -742,11 +1028,12 @@ class WebApiTests(unittest.TestCase):
             )
         )
 
+        control_token = "test-control-token-1234"
         handler_cls = build_handler(
             frontend_dir.name,
             state_file.name,
             control_file.name,
-            "",
+            control_token,
             monitor_file.name,
             monitor12_file.name,
             reconciliation_file.name,
@@ -759,35 +1046,45 @@ class WebApiTests(unittest.TestCase):
             handler_cls,
             "/api/candidate/action",
             {"candidate_id": "cand-1", "action": "follow", "note": "looks good"},
+            token=control_token,
         )
         replay_status, replay_payload = self._dispatch_post(
             handler_cls,
             "/api/candidate/action",
             {"candidate_id": "cand-1", "action": "follow", "note": "looks good"},
+            token=control_token,
         )
         mode_status, mode_payload = self._dispatch_post(
             handler_cls,
             "/api/mode",
             {"mode": "semi_auto"},
+            token=control_token,
         )
-        candidates_payload = self._dispatch(handler_cls, "/api/candidates?status=approved&limit=1&wallet=0xabc&market_slug=demo-market")
-        journal_payload = self._dispatch(handler_cls, "/api/journal?limit=1")
-        stats_payload = self._dispatch(handler_cls, "/api/stats?days=30&recent_days=1")
-        archive_payload = self._dispatch(handler_cls, "/api/archive?days=30&recent_days=1")
-        export_json_payload = self._dispatch(handler_cls, "/api/export?scope=actions&format=json&days=30&limit=2")
+        candidates_payload = self._dispatch(
+            handler_cls,
+            "/api/candidates?status=approved&limit=1&wallet=0xabc&market_slug=demo-market",
+            token=control_token,
+        )
+        journal_payload = self._dispatch(handler_cls, "/api/journal?limit=1", token=control_token)
+        stats_payload = self._dispatch(handler_cls, "/api/stats?days=30&recent_days=1", token=control_token)
+        archive_payload = self._dispatch(handler_cls, "/api/archive?days=30&recent_days=1", token=control_token)
+        export_json_payload = self._dispatch(handler_cls, "/api/export?scope=actions&format=json&days=30&limit=2", token=control_token)
         export_csv_status, export_csv_headers, export_csv_body = self._dispatch_raw(
             handler_cls,
             "/api/export?scope=journal&format=csv&days=30&limit=2",
+            token=control_token,
         )
         profiles_status, profiles_payload = self._dispatch_post(
             handler_cls,
             "/api/wallet-profiles/update",
             {"wallet": "0xabc", "tag": "CORE", "invalid_field": "boom"},
+            token=control_token,
         )
         invalid_score_status, invalid_score_payload = self._dispatch_post(
             handler_cls,
             "/api/wallet-profiles/update",
             {"wallet": "0xabc", "trust_score": "oops"},
+            token=control_token,
         )
 
         updated_candidate = store.get_candidate("cand-1")
@@ -1230,6 +1527,8 @@ class WebApiTests(unittest.TestCase):
                                     },
                                     "decision_snapshot": {
                                         "skip_reason": "market_not_accepting_orders",
+                                        "block_reason": "market_not_accepting_orders",
+                                        "block_layer": "candidate",
                                         "market_time_source": "metadata",
                                         "market_metadata_hit": True,
                                     },
@@ -1295,8 +1594,101 @@ class WebApiTests(unittest.TestCase):
         self.assertEqual(list_payload["items"][0]["signal_id"], "sig-replay")
         self.assertEqual(list_payload["items"][0]["status"], "watched")
         self.assertEqual(list_payload["items"][0]["skip_reason"], "market_not_accepting_orders")
+        self.assertEqual(list_payload["items"][0]["block_reason"], "market_not_accepting_orders")
+        self.assertEqual(list_payload["items"][0]["block_layer"], "candidate")
         self.assertEqual(list_payload["items"][0]["market_time_source"], "metadata")
         self.assertTrue(list_payload["items"][0]["market_metadata_hit"])
         self.assertEqual(list_payload["observability"]["recent_cycles"]["signals"], 1)
         self.assertEqual(detail_payload["candidate"]["signal_id"], "sig-replay")
         self.assertEqual(detail_payload["candidate"]["skip_reason"], "market_not_accepting_orders")
+
+    def test_state_and_metrics_surface_candidate_lifetime_expiration_summary(self):
+        frontend_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(frontend_dir.cleanup)
+        Path(frontend_dir.name, "index.html").write_text("ok", encoding="utf-8")
+
+        state_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, state_file)
+        state_file.flush()
+        state_file.close()
+
+        control_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, control_file)
+        control_file.flush()
+        control_file.close()
+
+        monitor_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, monitor_file)
+        monitor_file.flush()
+        monitor_file.close()
+
+        monitor12_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, monitor12_file)
+        monitor12_file.flush()
+        monitor12_file.close()
+
+        reconciliation_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        json.dump({}, reconciliation_file)
+        reconciliation_file.flush()
+        reconciliation_file.close()
+
+        reconciliation_text_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        reconciliation_text_file.write("")
+        reconciliation_text_file.flush()
+        reconciliation_text_file.close()
+
+        ledger_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
+        ledger_file.close()
+
+        db_path = str(Path(tempfile.mkdtemp()) / "terminal.db")
+        store = PersonalTerminalStore(db_path)
+        self.addCleanup(store.close)
+        now_ts = int(time.time())
+        store.upsert_candidate(
+            Candidate(
+                id="cand-expired-state",
+                signal_id="sig-expired-state",
+                trace_id="trc-expired-state",
+                wallet="0xabc",
+                market_slug="expired-state-market",
+                token_id="token-expired-state",
+                outcome="YES",
+                side="BUY",
+                confidence=0.8,
+                score=70.0,
+                status="approved",
+                created_ts=now_ts - 2000,
+                expires_ts=now_ts - 900,
+                updated_ts=now_ts - 1800,
+                signal_snapshot={"signal_id": "sig-expired-state", "timestamp": "2026-03-30T00:00:00+00:00"},
+            )
+        )
+
+        handler_cls = build_handler(
+            frontend_dir.name,
+            state_file.name,
+            control_file.name,
+            "",
+            monitor_file.name,
+            monitor12_file.name,
+            reconciliation_file.name,
+            reconciliation_text_file.name,
+            ledger_file.name,
+            candidate_db_path=db_path,
+            allow_read_side_effects=False,
+        )
+
+        state_payload = self._dispatch(handler_cls, "/api/state")
+        metrics_status, _headers, metrics_body = self._dispatch_raw(handler_cls, "/metrics")
+
+        lifecycle = state_payload["candidates"]["observability"]["lifecycle"]
+        self.assertEqual(metrics_status, 200)
+        self.assertEqual(lifecycle["expired_discarded_count"], 1)
+        self.assertEqual(lifecycle["block_reasons"]["candidate_lifetime_expired"], 1)
+        self.assertEqual(lifecycle["block_layers"]["candidate"], 1)
+        self.assertEqual(lifecycle["reason_layer_counts"]["candidate_lifetime_expired"]["candidate"], 1)
+        self.assertIn("polymarket_candidate_expired_discarded_count 1.0", metrics_body)
+        self.assertIn(
+            'polymarket_candidate_blocked_total{block_layer="candidate",reason_code="candidate_lifetime_expired"} 1.0',
+            metrics_body,
+        )

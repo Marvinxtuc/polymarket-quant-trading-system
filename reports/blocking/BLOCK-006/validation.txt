@@ -1,0 +1,18 @@
+BLOCK-006 validation (control-plane auth hardening)
+Date: 2026-03-26
+
+Proof commands executed:
+1) PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -p 'test_empty_token_rejected_in_live_mode.py' -> PASS
+2) PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -p 'test_readonly_api_still_available.py' -> PASS
+3) PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -p 'test_control_api_requires_token.py' -> PASS
+4) PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -p 'test_write_api_disabled_when_not_local_or_not_authorized.py' -> PASS
+5) PYTHONPATH=src:tests .venv/bin/python -m unittest discover -s tests -p 'test_control_audit_log_written.py' -> PASS
+6) PYTHONPATH=src .venv/bin/python scripts/verify_control_auth.py -> PASS
+7) PYTHONPATH=src .venv/bin/python scripts/verify_write_api_local_only.py -> PASS
+
+Validation highlights:
+- live mode + write API requested + empty/weak token exits before writer lock acquisition.
+- write_api_available is reused by startup status export, /api/state security snapshot, and POST admission.
+- readonly GET paths do not trigger write side effects (no public-state write, no blockbeats pull refresh).
+- denied writes are audited; audit sink failure blocks write path with 503 control_audit_write_failed.
+- /api/state exposes minimal control-plane security fields and does not leak raw token or sensitive path details.

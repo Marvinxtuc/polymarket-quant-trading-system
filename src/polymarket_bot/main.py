@@ -8,8 +8,17 @@ from polymarket_bot.brokers.paper import PaperBroker
 from polymarket_bot.clients.data_api import PolymarketDataClient
 from polymarket_bot.config import Settings
 from polymarket_bot.i18n import t as i18n_t
+from polymarket_bot.locks import (
+    FileLock,
+    SINGLE_WRITER_CONFLICT_EXIT_CODE,
+    SINGLE_WRITER_CONFLICT_REASON,
+    SingleWriterLockError,
+    derive_writer_scope,
+)
 from polymarket_bot.risk import RiskManager
 from polymarket_bot.runner import Trader
+from polymarket_bot.secrets import SecretConfigurationError, resolve_live_secret_bundle
+from polymarket_bot.signer_client import SignerClientError, build_signer_client
 from polymarket_bot.strategies.wallet_follower import WalletFollowerStrategy
 
 
@@ -27,7 +36,7 @@ def setup_logger(level: str) -> None:
     logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 
-def build_trader(settings: Settings) -> Trader:
+def build_trader(settings: Settings, *, pre_acquired_writer_lock: FileLock | None = None) -> Trader:
     data_client = PolymarketDataClient(
         settings.polymarket_data_api,
         market_base_url=settings.polymarket_clob_host,
@@ -59,15 +68,47 @@ def build_trader(settings: Settings) -> Trader:
     if settings.dry_run:
         broker = PaperBroker(settings=settings)
     else:
-        if not settings.private_key or not settings.funder_address:
+        try:
+            live_secrets = resolve_live_secret_bundle(settings)
+        except SecretConfigurationError as exc:
             raise RuntimeError(
-                _main_t("runtime.liveRequiresSecrets", fallback="LIVE mode requires PRIVATE_KEY and FUNDER_ADDRESS")
+                _main_t(
+                    "runtime.liveSignerSecretBoundaryInvalid",
+                    {"reasonCode": str(exc.reason_code)},
+                    fallback=f"LIVE mode secret boundary invalid ({exc.reason_code})",
+                )
+            ) from exc
+        try:
+            signer_client = build_signer_client(live_secrets)
+            signer_health = signer_client.health_check()
+        except SignerClientError as exc:
+            raise RuntimeError(
+                _main_t(
+                    "runtime.liveSignerUnavailable",
+                    {"reasonCode": str(exc.reason_code)},
+                    fallback=f"LIVE mode signer unavailable ({exc.reason_code})",
+                )
+            ) from exc
+
+        if not bool(signer_health.healthy):
+            reason_code = str(signer_health.reason_code or "signer_unhealthy")
+            raise RuntimeError(
+                _main_t(
+                    "runtime.liveSignerUnhealthy",
+                    {"reasonCode": reason_code},
+                    fallback=f"LIVE mode signer unhealthy ({reason_code})",
+                )
             )
+
         broker = LiveClobBroker(
             host=settings.polymarket_clob_host,
             chain_id=settings.chain_id,
-            private_key=settings.private_key,
-            funder=settings.funder_address,
+            funder=live_secrets.funder_address,
+            signer_client=signer_client,
+            signer_health=signer_health,
+            api_key=live_secrets.clob_api_key,
+            api_secret=live_secrets.clob_api_secret,
+            api_passphrase=live_secrets.clob_api_passphrase,
             market_client=data_client,
             signature_type=settings.clob_signature_type,
             user_stream_enabled=settings.user_stream_enabled,
@@ -83,6 +124,7 @@ def build_trader(settings: Settings) -> Trader:
         strategy=strategy,
         risk=risk,
         broker=broker,
+        pre_acquired_writer_lock=pre_acquired_writer_lock,
     )
 
 
@@ -93,13 +135,62 @@ def main() -> None:
 
     settings = Settings()
     setup_logger(settings.log_level)
+    log = logging.getLogger("polybot.main")
+    writer_scope = derive_writer_scope(
+        dry_run=bool(settings.dry_run),
+        funder_address=str(settings.funder_address or ""),
+        watch_wallets=str(settings.watch_wallets or ""),
+    )
+    log.info(
+        "SINGLE_WRITER_SCOPE scope=%s dry_run=%s lock_path=%s",
+        writer_scope,
+        bool(settings.dry_run),
+        settings.wallet_lock_path,
+    )
+    if not bool(settings.dry_run) and not bool(settings.enable_single_writer):
+        log.error(
+            "startup blocked reason_code=single_writer_required_live dry_run=%s enable_single_writer=%s scope=%s",
+            bool(settings.dry_run),
+            bool(settings.enable_single_writer),
+            writer_scope,
+        )
+        raise SystemExit(2)
 
-    trader = build_trader(settings)
+    pre_acquired_lock: FileLock | None = None
+    if bool(settings.enable_single_writer):
+        pre_acquired_lock = FileLock(
+            settings.wallet_lock_path,
+            timeout=0.0,
+            writer_scope=writer_scope,
+        )
+        try:
+            pre_acquired_lock.acquire()
+        except SingleWriterLockError as exc:
+            reason_code = str(getattr(exc, "reason_code", "") or "")
+            log.error(
+                "startup blocked reason_code=%s scope=%s lock_path=%s err=%s",
+                reason_code,
+                writer_scope,
+                settings.wallet_lock_path,
+                exc,
+            )
+            if reason_code == SINGLE_WRITER_CONFLICT_REASON:
+                raise SystemExit(SINGLE_WRITER_CONFLICT_EXIT_CODE)
+            raise SystemExit(3)
+
+    trader = None
     try:
+        trader = build_trader(settings, pre_acquired_writer_lock=pre_acquired_lock)
         trader.run(once=args.once)
     finally:
-        trader.broker.close()
-        trader.data_client.close()
+        if trader is not None:
+            trader.broker.close()
+            trader.data_client.close()
+            if getattr(trader, "_writer_lock", None) is not None:
+                trader._writer_lock.release()
+                trader._writer_lock = None
+        elif pre_acquired_lock is not None:
+            pre_acquired_lock.release()
 
 
 if __name__ == "__main__":

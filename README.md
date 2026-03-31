@@ -27,6 +27,24 @@ Wallet screening (Polymarket-native):
 - Event-signal controls: `WALLET_SIGNAL_SOURCE`, `WALLET_SIGNAL_LOOKBACK_SECONDS`, `WALLET_SIGNAL_PAGE_SIZE`, `WALLET_SIGNAL_MAX_PAGES`.
 - A wallet is monitored only if current Polymarket active positions pass all filters: `MIN_WALLET_ACTIVE_POSITIONS`, `MIN_WALLET_UNIQUE_MARKETS`, `MIN_WALLET_TOTAL_NOTIONAL_USD`, `MAX_WALLET_TOP_MARKET_SHARE`.
 
+BR-001 repeat-entry policy (restricted live rehearsal default):
+- `token_id` is the only local duplicate-entry key. Repeat-entry / add checks do not mix `market_slug` or `condition_id`.
+- Local repeat-entry truth comes from the runtime `positions_book` only. Candidate cache, approved queue state, or transient account snapshots are not allowed to override that truth.
+- If a local position for the same `token_id` already exists, a new BUY is blocked by default.
+- Same-wallet add is allowed only when all three are true at once:
+  - signal wallet equals the current position `entry_wallet`
+  - `SAME_WALLET_ADD_ENABLED=true`
+  - the wallet is present in `SAME_WALLET_ADD_ALLOWLIST`
+- Buy-side multi-wallet resonance is now observe-only. It may enrich explanation text, but it cannot change entry notional, candidate action level, or BUY sizing tendency.
+- Blocked repeat-entry candidates/export records expose both `block_reason` and `block_layer` so `/api/candidates` and `/api/state` reviews can show where the block happened.
+
+BR-002 candidate lifecycle policy (restricted live rehearsal default):
+- Candidate lifetime is enforced from one timestamp only: candidate `created_ts`.
+- The active lifetime window is controlled by `CANDIDATE_TTL_SECONDS` and capped by market end when the market window is shorter.
+- Once a candidate expires, it is discarded and cannot continue to influence decision review, approved queue, or execution.
+- `execution-precheck` now re-checks candidate freshness before any execution path, so stale queue/manual/approved paths cannot bypass lifecycle blocking.
+- Candidate exports and `/api/state` now surface lifecycle block metadata and `/metrics` exposes lifetime-expiration counts for audit/replay use.
+
 Risk checks:
 - Max risk per trade (`RISK_PER_TRADE_PCT`)
 - Daily loss cap (`DAILY_MAX_LOSS_PCT`)
@@ -179,7 +197,7 @@ If Codex or OpenClaw still cannot invoke the shared skill after you add the key,
 - Frontend: `frontend/` (this repo)
 - Runtime API: `GET /api/state` served by `polymarket_bot.web`
 - Decision / export APIs: `GET /api/candidates`, `GET /api/stats`, `GET /api/archive`, `GET /api/export`
-- Bot daemon: `polymarket_bot.daemon` writes runtime state to `/tmp/poly_runtime_data/state.json`
+- Bot daemon: `polymarket_bot.daemon` writes runtime state under `~/.local/share/poly_runtime_data/<paper|live>/<wallet>/state.json` by default; set `RUNTIME_ROOT_PATH` / `STATE_STORE_PATH` if you need a different namespace.
 - Pre-production readiness checklist: `preprod_readiness_checklist.md`
 
 Desktop launcher:
@@ -226,8 +244,12 @@ pip install -e '.[live]'
 2. Set in `.env`:
 - `DRY_RUN=false`
 - `CLOB_SIGNATURE_TYPE=0` for standard EOA wallets (`1` for Magic/email wallets, `2` for proxy/browser wallets)
-- `PRIVATE_KEY=...`
 - `FUNDER_ADDRESS=...`
+- `SIGNER_URL=...`
+- `CLOB_API_KEY=...`
+- `CLOB_API_SECRET=...`
+- `CLOB_API_PASSPHRASE=...`
+- keep `PRIVATE_KEY` empty in live mode (raw key is fail-closed)
 - Optional user stream tuning: `USER_STREAM_ENABLED=true`, `USER_STREAM_URL=wss://ws-subscriptions-clob.polymarket.com/ws/user`
 - Live admission gate: set `LIVE_ALLOWANCE_READY=true`, `LIVE_GEOBLOCK_READY=true`, and `LIVE_ACCOUNT_READY=true` only after you have manually confirmed those preconditions; `LIVE_NETWORK_SMOKE_MAX_AGE_SECONDS` controls how old the latest smoke log may be before startup blocks.
 
@@ -240,8 +262,18 @@ Live execution note:
 - Wallet-follow signals now default to `hybrid` mode, which prefers `/trades` / `/activity` events and only falls back to position diffs when event data is unavailable.
 - Signal, pending-order, and runtime position records now carry `condition_id`, and buy-side condition-level portfolio netting is enabled by default so repeated wallet signals on the same event share one exposure budget.
 - Runtime now keeps an append-only ledger at `LEDGER_PATH`, restores same-day realized PnL from that ledger on restart, and stores per-position `cost_basis_notional` in runtime state so sell-side realized PnL can survive restarts.
+- Runtime recovery truth now comes from SQLite (`STATE_STORE_PATH`), not `/tmp` snapshots. `state.json` / `control.json` are export artifacts only.
+- Pending truth is derived from persisted `order_intents` non-terminal states; startup recovery no longer treats file `pending_orders` as a second source of truth.
+- Startup recovery conflict policy is fail-closed: unresolved `pending/position/control` conflicts latch `reduce-only` and block all BUY paths.
 - In live mode, the bot also polls Polymarket accounting snapshot + current-day closed positions (`ACCOUNT_SYNC_REFRESH_SECONDS`) to surface `equity`, `cash_balance`, `positions_value`, and a conservative `broker_closed_pnl_today` risk floor.
 - On startup, live mode will also try to recover still-open exchange orders from the broker so pending state is rebuilt from exchange truth before falling back to the last runtime snapshot.
+- Runtime keeps a persisted SQLite state store (`STATE_STORE_PATH`) for control/runtime snapshots and idempotency keys; each process also takes a per-scope file lock (`WALLET_LOCK_PATH`) to enforce single-writer semantics across executors.
+- Writer scope rule is deterministic: `<mode>:<identity>` where live uses `FUNDER_ADDRESS` and paper uses the first `WATCH_WALLETS` entry (or `default`).
+- Lock conflicts now exit with fixed code `42` and `reason_code=single_writer_conflict` to distinguish from generic startup failures.
+- Every state-store mutation is guarded by runtime ownership checks (`assert_writer_active`), so a process that loses ownership cannot continue advancing order/control/risk/reconciliation writes.
+- Web instances without active writer ownership run strict read-only mode: write APIs return `503`, and GET endpoints avoid export-side effects (no public-state sync / lazy write paths).
+- Order idempotency now uses persisted intent claim (`claim_or_load_intent`) with deterministic `idempotency_key` and stable `strategy_order_uuid`; the in-process TTL cache is advisory/rate-limit only.
+- ACK_UNKNOWN recovery is bounded by `ACK_UNKNOWN_RECOVERY_WINDOW_SECONDS` and `ACK_UNKNOWN_MAX_PROBES`; over-limit intents become `manual_required` and cannot auto-create a second BUY intent.
 - Pending live orders now reconcile against both broker order status and recent authenticated trade fills, so partial fills can update runtime positions without waiting for the next positions snapshot to fully catch up.
 - Live execution events now also preserve structured preflight market context (`best_bid`, `best_ask`, `midpoint`, `tick_size`, `market_spread_bps`) so replay and shadow analysis can use real sample spreads.
 - Live broker now exposes a polling-based own-order event stream abstraction (`status` + `fill` events), so runner can consume incremental execution updates before the next full runtime reconcile.
@@ -249,13 +281,60 @@ Live execution note:
 - Runtime snapshots now persist the last broker-event watermark, so restart recovery can resume incremental reconcile without widening the replay window back to zero every time.
 - Trader startup now records a readiness checklist into the event log, ledger, and daemon state. In live mode that checklist includes broker capability checks plus the latest `NETWORK_SMOKE_LOG` result, and will mark the process not-ready if the last smoke run reported a block or endpoint failure, the smoke record is stale, or the explicit live admission flags are not set.
 - Daemon state now also exposes an execution reconciliation summary, including `internal_vs_ledger_diff`, pending-order staleness, snapshot age, broker reconcile age, and broker floor gap, so monitoring can distinguish “strategy looked quiet” from “execution facts have drifted”.
+- Admission gate is fail-closed and is the only opening truth: when `opening_allowed=false`, BUY is rejected even if legacy compatibility fields still look normal.
+- `/api/state` now exposes `admission` fields for operators: `mode`, `opening_allowed`, `reduce_only`, `halted`, `reason_codes`, and `evidence_summary` (`account_snapshot_age_seconds`, `broker_event_sync_age_seconds`, `ledger_diff`, `reconciliation_status`).
+- `HALTED` uses allowlist semantics (sync read / state evaluation / cancel pending BUY / required persistence updates only). `REDUCE_ONLY` blocks any net-exposure increase, including indirect replace/modify/retry paths.
+- Admission snapshot persistence is output-only (`mode` + `reason_codes` + evidence summary). Restart always begins protected and re-evaluates using fresh startup/reconciliation/staleness evidence before reopening BUY.
+- BLOCK-004 self-checks: run `PYTHONPATH=src .venv/bin/python scripts/verify_fail_closed_startup.py` and `PYTHONPATH=src .venv/bin/python scripts/verify_untrusted_state_blocks_buy.py`; full gate is `bash scripts/gates/gate_block_item.sh BLOCK-004`.
+- Kill switch is now a broker-terminal state machine (`REQUESTED -> CANCELING_BUY -> WAITING_BROKER_TERMINAL -> SAFE_CONFIRMED / FAILED_MANUAL_REQUIRED`) rather than a local boolean toggle.
+- `pause_opening` immediately blocks new BUY; `reduce_only` additionally requires pending/open BUY cleanup to broker terminal; `emergency_stop` enters strict `halted+latched` protection until broker safety is confirmed.
+- `cancel_requested` / queued cancel is not treated as safe; local pending cleanup alone is insufficient without broker terminal evidence.
+- Kill switch inflight state is persisted in runtime truth and recovered on restart, so “cancel requested but unconfirmed” keeps blocking BUY after process restart.
+- `/api/state` now exposes `kill_switch` operator fields: `phase`, `mode_requested`, `broker_safe_confirmed`, `open_buy_order_ids`, `non_terminal_buy_order_ids`, `reason_codes`, and `manual_required`.
+- BLOCK-005 self-checks: run `PYTHONPATH=src .venv/bin/python scripts/verify_kill_switch_terminal.py` and `PYTHONPATH=src .venv/bin/python scripts/verify_reduce_only_terminal_cleanup.py`; full gate is `bash scripts/gates/gate_block_item.sh BLOCK-005`.
+- Control-plane write access is now fail-closed behind a single `write_api_available` verdict shared by startup checks, POST routing, and `/api/state` export (`control_plane_security`).
+- Any write route requires both a valid control token and an allowed source address; no empty-token compatibility bypass remains in write mode.
+- Source policy defaults to `local_only`; `X-Forwarded-For` is ignored unless `POLY_TRUSTED_PROXY_CIDRS` is explicitly configured and the socket peer is in that trusted proxy list.
+- Live mode (`DRY_RUN=false`) blocks startup when `POLY_ENABLE_WRITE_API=true` but `POLY_CONTROL_TOKEN` is missing or weak (length < `CONTROL_TOKEN_MIN_LENGTH` or known weak value).
+- Write requests now emit audit records for both rejected and successful flows at `CONTROL_AUDIT_LOG_PATH` (default runtime namespace `control_audit_events.jsonl`).
+- `/api/state` exposes minimal control-plane security fields only: `token_configured`, `write_api_available`, `write_api_enabled`, `readonly_mode`, `live_mode`, `source_policy`, `trusted_proxy_configured`, `reason_codes`.
+- BLOCK-006 self-checks: run `PYTHONPATH=src .venv/bin/python scripts/verify_control_auth.py` and `PYTHONPATH=src .venv/bin/python scripts/verify_write_api_local_only.py`; full gate is `bash scripts/gates/gate_block_item.sh BLOCK-006`.
+- Live signer boundary is now fail-closed: `PRIVATE_KEY` is forbidden in live mode, and startup requires `SIGNER_URL` + `CLOB_API_*` credentials + identity binding (`signer/api/broker == FUNDER_ADDRESS`).
+- Live submit path only accepts minimal signer output (`signed_order`); signer responses that contain secret-like materials are rejected.
+- Startup and runtime enforce `LIVE_HOT_WALLET_BALANCE_CAP_USD`: startup exceedance fails readiness; runtime exceedance latches recovery conflict and blocks BUY.
+- `/api/state` includes minimal `signer_security` summary fields (`signer_healthy`, identity match booleans, cap status, reason codes) without exposing raw key/token/topology internals.
+- BLOCK-007 self-checks: run `PYTHONPATH=src:tests .venv/bin/python scripts/verify_signer_required_live.py` and `PYTHONPATH=src:tests .venv/bin/python scripts/verify_no_raw_key_in_live_mode.py`; full gate is `bash scripts/gates/gate_block_item.sh BLOCK-007`.
+- External observability now has a fixed, external metrics projection (`/metrics`) derived from the same request snapshot used by `/api/state` (`observability`), avoiding per-request dual refresh drift.
+- `runner_heartbeat` is updated only by the active runner loop; read-only web/standby paths do not write heartbeat and cannot fake healthy loop freshness.
+- `buy_blocked_duration_seconds` semantics are fixed: start on first BUY block transition (`opening_allowed -> false`), clear on unblock (`opening_allowed -> true`), and export both state and metrics consistently.
+- Alert routing uses a fixed `alert_code` whitelist with fixed `page|warning` mapping; metrics labels are low-cardinality only (`alert_code`, `severity`), never raw `reason_codes`, wallet, order id, or exception text.
+- `/metrics` is side-effect free: no heartbeat update, no runtime refresh, no recovery probe, no cache/public-state write.
+- BLOCK-008 self-checks: run `PYTHONPATH=src .venv/bin/python scripts/verify_metrics_and_alerts.py` and `PYTHONPATH=src .venv/bin/python scripts/verify_heartbeat_staleness_alert.py`; full gate is `bash scripts/gates/gate_block_item.sh BLOCK-008`.
+- Exposure / breaker docs for BLOCK-009 live in `docs/runbook/exposure_and_breakers.md`.
+- BLOCK-009 keeps all exposure math in USD terms so ledger, cap, and breaker checks use one unit of account.
+- The three cap layers are evaluated together on every BUY path: exposure ledger limit, wallet/portfolio cap, and breaker state; condition cap joins the same decision when `PORTFOLIO_NETTING_ENABLED=true`.
+- When multiple risk reasons are present, the system reports the primary reason first and keeps secondary reasons as supporting evidence.
+- Loss streak counting increments on realized losing closes, resets on a winning close, and clears on full state reset or explicit recovery reset.
+- Intraday drawdown is measured on the configured local trading day boundary (`RISK_BREAKER_TIMEZONE`), and latches only when threshold breach is paired with negative realized-loss evidence.
+- Breakers clear only after their release condition is met and the protected state has been re-evaluated as healthy; otherwise they stay latched.
+- Any risk fault is fail-closed: if breaker state cannot be trusted, BUY remains blocked until the risk state is rebuilt and exported cleanly.
+- BLOCK-009 self-checks: run `PYTHONPATH=src .venv/bin/python scripts/verify_exposure_caps.py` and `PYTHONPATH=src .venv/bin/python scripts/verify_loss_streak_and_drawdown_breakers.py`; full gate is `bash scripts/gates/gate_block_item.sh BLOCK-009`.
 
 ## Environment Notes
 
 - Keep real secrets in `.env` and never commit them.
 - `.env.example` is the safe template; update it when you add new settings.
 - For paper trading, you can leave `PRIVATE_KEY` and `FUNDER_ADDRESS` empty.
-- For live trading, `PRIVATE_KEY` and `FUNDER_ADDRESS` are required.
+- For live trading, use `FUNDER_ADDRESS` + `SIGNER_URL` + `CLOB_API_*`; `PRIVATE_KEY` must stay empty (forbidden in live mode).
+- Concurrency guardrails: `ENABLE_SINGLE_WRITER` (default true) acquires `WALLET_LOCK_PATH`; `STATE_STORE_PATH` hosts runtime/control/idempotency data; `IDEMPOTENCY_WINDOW_SECONDS` controls duplicate suppression window.
+- Control-plane security knobs: `POLY_ENABLE_WRITE_API`, `POLY_CONTROL_TOKEN`, `CONTROL_TOKEN_MIN_LENGTH`, `POLY_CONTROL_SOURCE_POLICY` (`local_only|internal_only|any`), `POLY_TRUSTED_PROXY_CIDRS`, `POLY_CONTROL_AUDIT_LOG_PATH`.
+- Runtime recovery and conflict handling details: `docs/runbook/runtime_state_recovery.md`.
+- Single-writer lifecycle, scope rule, and standby behavior: `docs/runbook/single_writer_lock.md`.
+- Kill switch broker-terminal confirmation and restart recovery runbook: `docs/runbook/kill_switch_terminal_confirmation.md`.
+- Control-plane auth, source policy, and write/read boundary runbook: `docs/runbook/control_plane_security.md`.
+- Signer/secret boundary and hot-wallet-cap runbook: `docs/runbook/signer_and_secret_boundary.md`.
+- Observability/heartbeat/metrics/alert mapping runbook: `docs/runbook/observability_and_alerting.md`.
+- Exposure / loss-streak / drawdown breaker runbook: `docs/runbook/exposure_and_breakers.md`.
 - `BLOCKBEATS_API_KEY` is optional for the trading engine, but required for the shared BlockBeats skill. The repo helper `scripts/blockbeats_query.sh` will also use it and can load it from `.env`.
 
 Before switching to live-like testing, run:
@@ -356,3 +435,24 @@ NETWORK_SMOKE_LOG=/tmp/poly_network_smoke.jsonl make network-smoke
   - 现在会同时输出 `gross_cashflow` 和 `net_cashflow`，并支持用 `REPLAY_TAKER_FEE_BPS`、`REPLAY_ENTRY_SLIPPAGE_BPS`、`REPLAY_EXIT_SLIPPAGE_BPS`、`REPLAY_FEE_KEYWORDS` 对 fee-enabled 市场做费用/滑点敏感性校准
   - 还支持 spread-aware 滑点参数：`REPLAY_ENTRY_SPREAD_MULTIPLIER`、`REPLAY_EXIT_SPREAD_MULTIPLIER`、`REPLAY_EDGE_PRICE_PENALTY_BPS`
   - replay 现在也会纳入 live reconcile 产生的 `order_reconciled` / `order_partial_fill` 样本
+
+## BLOCK-010 Final Release Gate (GO/NO-GO)
+
+- 最终上线门禁统一入口：`bash scripts/gates/gate_release_readiness.sh`
+- required blocks 单一来源：`scripts/gates/release_blocks.json`（当前为 `BLOCK-001` 到 `BLOCK-009`）
+- 判定规则（默认 fail-closed）：
+  - 任一 required block 失败 => `NO-GO`
+  - 任一 required block 缺失 machine result 或报告结构不合格 => `NO-GO`
+  - 仅当全部 required blocks 通过时才允许 `GO`
+- release 报告（原子落盘）：
+  - 机器可读：`reports/release/go_no_go_summary.json`
+  - 人类可读：`reports/release/go_no_go_summary.md`
+- 报告包含固定元数据：
+  - `git commit`
+  - `git branch`
+  - `execution timestamp`
+  - `release gate command`
+  - `required blocks` 列表
+- 运行与故障处理说明见：
+  - `docs/runbook/release_gating_and_go_no_go.md`
+  - `docs/blocking/final_release_checklist.md`

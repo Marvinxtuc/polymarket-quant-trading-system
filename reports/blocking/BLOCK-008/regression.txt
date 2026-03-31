@@ -1,0 +1,19 @@
+BLOCK-008 regression + gates rerun (evidence supplementation)
+Date: 2026-03-27
+Workspace: /Users/marvin.xa/Desktop/Polymarket
+
+Commands:
+1) bash scripts/gates/gate_static.sh BLOCK-008
+   Result: PASS
+
+2) bash scripts/gates/gate_tests.sh BLOCK-008
+   Result: PASS
+
+3) bash scripts/gates/gate_behavior.sh BLOCK-008
+   Result: PASS
+
+4) bash scripts/gates/gate_docs.sh BLOCK-008
+   Result: PASS
+
+5) bash scripts/gates/gate_block_item.sh BLOCK-008
+   Result: PASS (static=0 tests=0 behavior=0 docs=0 overall=0)

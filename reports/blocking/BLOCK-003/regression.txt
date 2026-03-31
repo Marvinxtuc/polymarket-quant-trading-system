@@ -1,0 +1,28 @@
+# BLOCK-003 regression log
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_runtime_state_persistence.py"
+- RESULT: PASS (Ran 2 tests)
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_restart_recovery.py"
+- RESULT: PASS (Ran 2 tests)
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_tmp_deletion_recovery.py"
+- RESULT: PASS (Ran 2 tests)
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_runner_control.py"
+- RESULT: PASS (Ran 88 tests)
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_web_api.py"
+- RESULT: PASS (Ran 10 tests)
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_daemon_state.py"
+- RESULT: PASS (Ran 9 tests)
+
+## Acceptance regression rerun (2026-03-26)
+
+$ ./scripts/gates/gate_tests.sh BLOCK-003
+- RESULT: PASS
+- INCLUDED REGRESSION SUITES:
+  - test_runner_control.py (88)
+  - test_web_api.py (10)
+  - test_daemon_state.py (9)

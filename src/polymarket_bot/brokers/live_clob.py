@@ -13,6 +13,9 @@ from typing import Any, Callable
 
 from polymarket_bot.brokers.base import Broker
 from polymarket_bot.clients.data_api import PolymarketDataClient
+from polymarket_bot.models import SignerStatusSnapshot
+from polymarket_bot.secrets import normalize_identity
+from polymarket_bot.signer_client import SignerClient, SignerClientError, SignerHealthSnapshot
 from polymarket_bot.types import BrokerOrderEvent, ExecutionResult, OpenOrderSnapshot, OrderFillSnapshot, OrderStatusSnapshot, Signal
 
 
@@ -237,14 +240,26 @@ class _BufferedUserOrderStream:
                     self._close_ws(ws)
 
 
+class _AddressOnlySigner:
+    def __init__(self, address: str) -> None:
+        self._address = str(address or "").strip().lower()
+
+    def address(self) -> str:
+        return self._address
+
+
 class LiveClobBroker(Broker):
     def __init__(
         self,
         host: str,
         chain_id: int,
-        private_key: str,
         funder: str,
         *,
+        signer_client: SignerClient,
+        signer_health: SignerHealthSnapshot,
+        api_key: str,
+        api_secret: str,
+        api_passphrase: str,
         market_client: PolymarketDataClient | None = None,
         maker_buffer_ticks: int = 1,
         signature_type: int = 0,
@@ -256,7 +271,7 @@ class LiveClobBroker(Broker):
     ) -> None:
         try:
             from py_clob_client.client import ClobClient
-            from py_clob_client.clob_types import OrderArgs, OrderType, PartialCreateOrderOptions
+            from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType, PartialCreateOrderOptions
             from py_clob_client.order_builder.constants import BUY, SELL
         except Exception as exc:  # pragma: no cover
             raise RuntimeError(
@@ -278,21 +293,45 @@ class LiveClobBroker(Broker):
         self._signature_type = int(signature_type)
         self._user_stream_enabled = bool(user_stream_enabled)
         self._user_stream_url = str(user_stream_url or "").strip()
+        self._signer_client = signer_client
+        self._signer_health = signer_health
+
+        if not self._funder:
+            raise RuntimeError("funder address missing in live broker")
+
+        api_key_text = str(api_key or "").strip()
+        api_secret_text = str(api_secret or "").strip()
+        api_passphrase_text = str(api_passphrase or "").strip()
+        if not (api_key_text and api_secret_text and api_passphrase_text):
+            raise RuntimeError("live api credentials missing")
 
         self.client = ClobClient(
             host,
-            key=private_key,
             chain_id=chain_id,
+            key=None,
             signature_type=signature_type,
             funder=funder,
         )
-        creds = self.client.create_or_derive_api_creds()
+        creds = ApiCreds(
+            api_key=api_key_text,
+            api_secret=api_secret_text,
+            api_passphrase=api_passphrase_text,
+        )
         self.client.set_api_creds(creds)
-        self._api_creds = creds
+        self.client.signer = _AddressOnlySigner(self._funder)
+        self.client.mode = self.client._get_client_mode()
+        self._api_creds = {
+            "apiKey": api_key_text,
+            "secret": api_secret_text,
+            "passphrase": api_passphrase_text,
+        }
+        self._security_reason_codes: list[str] = []
+        self._validate_identity_binding()
+        self._signer_security_snapshot = self._build_signer_security_snapshot()
         self._user_stream = (
             _BufferedUserOrderStream(
                 url=user_stream_url,
-                auth=self._extract_api_creds(creds),
+                auth=self._extract_api_creds(self._api_creds),
                 ping_interval_seconds=user_stream_ping_interval_seconds,
                 reconnect_seconds=user_stream_reconnect_seconds,
                 buffer_size=user_stream_buffer_size,
@@ -302,6 +341,51 @@ class LiveClobBroker(Broker):
             if user_stream_enabled
             else None
         )
+
+    def _validate_identity_binding(self) -> None:
+        health = self._signer_health
+        reason_codes: list[str] = []
+        if not bool(health.healthy):
+            reason_codes.append(str(health.reason_code or "signer_unhealthy"))
+        signer_identity = normalize_identity(health.signer_identity)
+        api_identity = normalize_identity(health.api_identity)
+        if signer_identity and signer_identity != self._funder:
+            reason_codes.append("signer_identity_mismatch")
+        if api_identity and api_identity != self._funder:
+            reason_codes.append("api_identity_mismatch")
+        if not signer_identity:
+            reason_codes.append("signer_identity_missing")
+        if not api_identity:
+            reason_codes.append("api_identity_missing")
+        self._security_reason_codes = list(dict.fromkeys(reason_codes))
+        if self._security_reason_codes:
+            raise RuntimeError(
+                "live signer identity binding failed"
+            )
+
+    def _build_signer_security_snapshot(self) -> dict[str, object]:
+        health = self._signer_health
+        signer_identity = normalize_identity(health.signer_identity)
+        api_identity = normalize_identity(health.api_identity)
+        snapshot = SignerStatusSnapshot(
+            live_mode=True,
+            signer_required=True,
+            signer_mode="external_http",
+            signer_healthy=bool(health.healthy),
+            signer_identity_matched=bool(signer_identity and signer_identity == self._funder),
+            api_identity_matched=bool(api_identity and api_identity == self._funder),
+            broker_identity_matched=bool(self._funder),
+            raw_key_detected=False,
+            funder_identity_present=bool(self._funder),
+            api_creds_configured=all(self._extract_api_creds(self._api_creds).values()),
+            hot_wallet_cap_enabled=False,
+            hot_wallet_cap_ok=True,
+            hot_wallet_cap_limit_usd=0.0,
+            hot_wallet_cap_value_usd=0.0,
+            reason_codes=list(self._security_reason_codes or ([] if health.healthy else [str(health.reason_code or "signer_unhealthy")])),
+            last_checked_ts=int(time.time()),
+        )
+        return snapshot.as_state_payload()
 
     @staticmethod
     def _env_flag(name: str, default: bool = False) -> bool:
@@ -364,7 +448,33 @@ class LiveClobBroker(Broker):
             {
                 "name": "api_credentials",
                 "status": "PASS" if all(api_creds.values()) else "FAIL",
-                "message": "derived api creds ready" if all(api_creds.values()) else "missing derived api creds",
+                "message": "live api creds configured" if all(api_creds.values()) else "missing live api creds",
+            }
+        )
+        signer_snapshot = dict(getattr(self, "_signer_security_snapshot", {}) or {})
+        signer_reasons = list(signer_snapshot.get("reason_codes") or [])
+        checks.append(
+            {
+                "name": "signer_health",
+                "status": "PASS" if bool(signer_snapshot.get("signer_healthy", False)) else "FAIL",
+                "message": "external signer healthy"
+                if bool(signer_snapshot.get("signer_healthy", False))
+                else ",".join(str(code) for code in signer_reasons) or "signer unhealthy",
+            }
+        )
+        checks.append(
+            {
+                "name": "signer_identity_binding",
+                "status": "PASS"
+                if bool(signer_snapshot.get("signer_identity_matched", False))
+                and bool(signer_snapshot.get("api_identity_matched", False))
+                and bool(signer_snapshot.get("broker_identity_matched", False))
+                else "FAIL",
+                "message": "signer/api/broker identity matched"
+                if bool(signer_snapshot.get("signer_identity_matched", False))
+                and bool(signer_snapshot.get("api_identity_matched", False))
+                and bool(signer_snapshot.get("broker_identity_matched", False))
+                else "identity mismatch detected",
             }
         )
         checks.append(
@@ -438,6 +548,9 @@ class LiveClobBroker(Broker):
             }
         )
         return checks
+
+    def security_summary(self) -> dict[str, object] | None:
+        return dict(self._signer_security_snapshot or {})
 
     @staticmethod
     def _safe_float(value: object, default: float = 0.0) -> float:
@@ -541,37 +654,26 @@ class LiveClobBroker(Broker):
         tick_size: float,
         neg_risk: bool,
     ) -> object:
-        tick_size_text = str(self._safe_float(tick_size, 0.01))
-        options_cls = getattr(self, "_PartialCreateOrderOptions", None)
-        if options_cls is not None:
-            try:
-                options = options_cls(tick_size=tick_size_text, neg_risk=bool(neg_risk))
-            except Exception:
-                options = {"tick_size": tick_size_text, "neg_risk": bool(neg_risk)}
-        else:
-            options = {"tick_size": tick_size_text, "neg_risk": bool(neg_risk)}
-        create_and_post = getattr(self.client, "create_and_post_order", None)
-        if callable(create_and_post):
-            try:
-                return create_and_post(order_args, options=options)
-            except TypeError:
-                try:
-                    return create_and_post(order_args, self._OrderType.GTC, options=options)
-                except TypeError:
-                    return create_and_post(order_args, self._OrderType.GTC)
-
-        create_order = self.client.create_order
+        order_payload = {
+            "token_id": str(getattr(order_args, "token_id", "") or ""),
+            "price": float(self._safe_float(getattr(order_args, "price", 0.0), 0.0)),
+            "size": float(self._safe_float(getattr(order_args, "size", 0.0), 0.0)),
+            "side": str(getattr(order_args, "side", "") or ""),
+            "fee_rate_bps": int(self._safe_float(getattr(order_args, "fee_rate_bps", 0), 0.0)),
+            "tick_size": float(self._safe_float(tick_size, 0.01)),
+            "neg_risk": bool(neg_risk),
+            "chain_id": int(self._chain_id),
+            "funder_address": str(self._funder),
+        }
         try:
-            signed = create_order(order_args, options=options)
-        except TypeError:
-            try:
-                signed = create_order(
-                    order_args,
-                    tick_size=tick_size_text,
-                    neg_risk=bool(neg_risk),
-                )
-            except TypeError:
-                signed = create_order(order_args)
+            signed = self._signer_client.sign_order(order_payload)
+        except SignerClientError:
+            raise
+        except Exception as exc:
+            raise SignerClientError(
+                str(exc),
+                reason_code="signer_sign_order_failed",
+            ) from exc
         return self.client.post_order(signed, self._OrderType.GTC)
 
     @staticmethod
@@ -1614,6 +1716,7 @@ class LiveClobBroker(Broker):
         notional_usd: float,
         price: float,
         preflight_snapshot: dict[str, float | bool | str] | None = None,
+        strategy_order_uuid: str | None = None,
     ) -> ExecutionResult:
         order_id = None
         message = "live order posted"
@@ -1675,6 +1778,8 @@ class LiveClobBroker(Broker):
                 message = f"{message} | {' '.join(details)}"
 
         metadata: dict[str, object] = {}
+        if strategy_order_uuid:
+            metadata["strategy_order_uuid"] = strategy_order_uuid
         if preflight_snapshot:
             best_bid = self._safe_float(preflight_snapshot.get("best_bid"))
             best_ask = self._safe_float(preflight_snapshot.get("best_ask"))
@@ -1685,18 +1790,20 @@ class LiveClobBroker(Broker):
             requested_vs_mid_bps = 0.0
             if midpoint > 0.0 and price > 0.0:
                 requested_vs_mid_bps = ((price - midpoint) / midpoint) * 10000.0
-            metadata = {
-                "best_bid": best_bid,
-                "best_ask": best_ask,
-                "midpoint": midpoint,
-                "tick_size": self._safe_float(preflight_snapshot.get("tick_size")),
-                "min_order_size": self._safe_float(preflight_snapshot.get("min_order_size")),
-                "neg_risk": bool(preflight_snapshot.get("neg_risk")),
-                "last_trade_price": self._safe_float(preflight_snapshot.get("last_trade_price")),
-                "market_spread_bps": spread_bps,
-                "requested_vs_mid_bps": requested_vs_mid_bps,
-                "preflight_has_book": bool(best_bid > 0.0 and best_ask > 0.0 and midpoint > 0.0),
-            }
+            metadata.update(
+                {
+                    "best_bid": best_bid,
+                    "best_ask": best_ask,
+                    "midpoint": midpoint,
+                    "tick_size": self._safe_float(preflight_snapshot.get("tick_size")),
+                    "min_order_size": self._safe_float(preflight_snapshot.get("min_order_size")),
+                    "neg_risk": bool(preflight_snapshot.get("neg_risk")),
+                    "last_trade_price": self._safe_float(preflight_snapshot.get("last_trade_price")),
+                    "market_spread_bps": spread_bps,
+                    "requested_vs_mid_bps": requested_vs_mid_bps,
+                    "preflight_has_book": bool(best_bid > 0.0 and best_ask > 0.0 and midpoint > 0.0),
+                }
+            )
 
         return ExecutionResult(
             ok=ok,
@@ -1715,7 +1822,7 @@ class LiveClobBroker(Broker):
         if user_stream is not None:
             user_stream.close()
 
-    def execute(self, signal: Signal, notional_usd: float) -> ExecutionResult:
+    def execute(self, signal: Signal, notional_usd: float, *, strategy_order_uuid: str | None = None) -> ExecutionResult:
         side = str(signal.side).upper()
         if side not in self._side_map:
             return ExecutionResult(
@@ -1731,6 +1838,34 @@ class LiveClobBroker(Broker):
 
         price, size, snapshot, preflight_error = self._preflight_order(signal, notional_usd)
         if preflight_error:
+            metadata = {
+                "best_bid": self._safe_float(snapshot.get("best_bid")),
+                "best_ask": self._safe_float(snapshot.get("best_ask")),
+                "midpoint": self._safe_float(snapshot.get("midpoint")),
+                "tick_size": self._safe_float(snapshot.get("tick_size")),
+                "min_order_size": self._safe_float(snapshot.get("min_order_size")),
+                "neg_risk": bool(snapshot.get("neg_risk")),
+                "last_trade_price": self._safe_float(snapshot.get("last_trade_price")),
+                "market_spread_bps": (
+                    ((self._safe_float(snapshot.get("best_ask")) - self._safe_float(snapshot.get("best_bid"))) / max(0.0001, self._safe_float(snapshot.get("midpoint")))) * 10000.0
+                    if self._safe_float(snapshot.get("best_ask")) > 0.0
+                    and self._safe_float(snapshot.get("best_bid")) > 0.0
+                    and self._safe_float(snapshot.get("midpoint")) > 0.0
+                    else 0.0
+                ),
+                "requested_vs_mid_bps": (
+                    ((max(0.01, min(0.99, signal.price_hint)) - self._safe_float(snapshot.get("midpoint"))) / max(0.0001, self._safe_float(snapshot.get("midpoint")))) * 10000.0
+                    if self._safe_float(snapshot.get("midpoint")) > 0.0
+                    else 0.0
+                ),
+                "preflight_has_book": bool(
+                    self._safe_float(snapshot.get("best_bid")) > 0.0
+                    and self._safe_float(snapshot.get("best_ask")) > 0.0
+                    and self._safe_float(snapshot.get("midpoint")) > 0.0
+                ),
+            }
+            if strategy_order_uuid:
+                metadata["strategy_order_uuid"] = strategy_order_uuid
             return ExecutionResult(
                 ok=False,
                 broker_order_id=None,
@@ -1740,32 +1875,7 @@ class LiveClobBroker(Broker):
                 status="rejected",
                 requested_notional=notional_usd,
                 requested_price=max(0.01, min(0.99, signal.price_hint)),
-                metadata={
-                    "best_bid": self._safe_float(snapshot.get("best_bid")),
-                    "best_ask": self._safe_float(snapshot.get("best_ask")),
-                    "midpoint": self._safe_float(snapshot.get("midpoint")),
-                    "tick_size": self._safe_float(snapshot.get("tick_size")),
-                    "min_order_size": self._safe_float(snapshot.get("min_order_size")),
-                    "neg_risk": bool(snapshot.get("neg_risk")),
-                    "last_trade_price": self._safe_float(snapshot.get("last_trade_price")),
-                    "market_spread_bps": (
-                        ((self._safe_float(snapshot.get("best_ask")) - self._safe_float(snapshot.get("best_bid"))) / max(0.0001, self._safe_float(snapshot.get("midpoint")))) * 10000.0
-                        if self._safe_float(snapshot.get("best_ask")) > 0.0
-                        and self._safe_float(snapshot.get("best_bid")) > 0.0
-                        and self._safe_float(snapshot.get("midpoint")) > 0.0
-                        else 0.0
-                    ),
-                    "requested_vs_mid_bps": (
-                        ((max(0.01, min(0.99, signal.price_hint)) - self._safe_float(snapshot.get("midpoint"))) / max(0.0001, self._safe_float(snapshot.get("midpoint")))) * 10000.0
-                        if self._safe_float(snapshot.get("midpoint")) > 0.0
-                        else 0.0
-                    ),
-                    "preflight_has_book": bool(
-                        self._safe_float(snapshot.get("best_bid")) > 0.0
-                        and self._safe_float(snapshot.get("best_ask")) > 0.0
-                        and self._safe_float(snapshot.get("midpoint")) > 0.0
-                    ),
-                },
+                metadata=metadata,
             )
 
         order_args = self._OrderArgs(
@@ -1781,17 +1891,59 @@ class LiveClobBroker(Broker):
                 tick_size=self._safe_float(snapshot.get("tick_size"), 0.01),
                 neg_risk=bool(snapshot.get("neg_risk")),
             )
-        except Exception as exc:
+        except SignerClientError as exc:
+            reason_code = str(getattr(exc, "reason_code", "") or "signer_sign_order_failed")
             return ExecutionResult(
                 ok=False,
                 broker_order_id=None,
-                message=f"live order error: {exc}",
+                message=f"live signer unavailable ({reason_code})",
                 filled_notional=0.0,
                 filled_price=0.0,
                 status="error",
                 requested_notional=notional_usd,
                 requested_price=price,
                 metadata={
+                    "reason_code": reason_code,
+                    "security_fail_close": True,
+                    "security_category": "SIGNER_UNAVAILABLE",
+                    "best_bid": self._safe_float(snapshot.get("best_bid")),
+                    "best_ask": self._safe_float(snapshot.get("best_ask")),
+                    "midpoint": self._safe_float(snapshot.get("midpoint")),
+                    "tick_size": self._safe_float(snapshot.get("tick_size")),
+                    "min_order_size": self._safe_float(snapshot.get("min_order_size")),
+                    "neg_risk": bool(snapshot.get("neg_risk")),
+                    "last_trade_price": self._safe_float(snapshot.get("last_trade_price")),
+                    "market_spread_bps": (
+                        ((self._safe_float(snapshot.get("best_ask")) - self._safe_float(snapshot.get("best_bid"))) / max(0.0001, self._safe_float(snapshot.get("midpoint")))) * 10000.0
+                        if self._safe_float(snapshot.get("best_ask")) > 0.0
+                        and self._safe_float(snapshot.get("best_bid")) > 0.0
+                        and self._safe_float(snapshot.get("midpoint")) > 0.0
+                        else 0.0
+                    ),
+                    "requested_vs_mid_bps": (
+                        ((price - self._safe_float(snapshot.get("midpoint"))) / max(0.0001, self._safe_float(snapshot.get("midpoint")))) * 10000.0
+                        if self._safe_float(snapshot.get("midpoint")) > 0.0
+                        else 0.0
+                    ),
+                    "preflight_has_book": bool(
+                        self._safe_float(snapshot.get("best_bid")) > 0.0
+                        and self._safe_float(snapshot.get("best_ask")) > 0.0
+                        and self._safe_float(snapshot.get("midpoint")) > 0.0
+                    ),
+                },
+            )
+        except Exception:
+            return ExecutionResult(
+                ok=False,
+                broker_order_id=None,
+                message="live order error",
+                filled_notional=0.0,
+                filled_price=0.0,
+                status="error",
+                requested_notional=notional_usd,
+                requested_price=price,
+                metadata={
+                    "reason_code": "live_order_submit_failed",
                     "best_bid": self._safe_float(snapshot.get("best_bid")),
                     "best_ask": self._safe_float(snapshot.get("best_ask")),
                     "midpoint": self._safe_float(snapshot.get("midpoint")),
@@ -1823,4 +1975,5 @@ class LiveClobBroker(Broker):
             notional_usd=notional_usd,
             price=price,
             preflight_snapshot=snapshot,
+            strategy_order_uuid=strategy_order_uuid,
         )

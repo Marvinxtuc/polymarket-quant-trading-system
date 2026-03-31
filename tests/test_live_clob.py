@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from polymarket_bot.brokers.live_clob import LiveClobBroker, _configure_sdk_http_timeout
+from polymarket_bot.signer_client import SignerClientError, SignerHealthSnapshot
 from polymarket_bot.types import Signal
 
 
@@ -28,6 +29,7 @@ class _FakeOrderType:
 class _FakeClient:
     def __init__(self):
         self.last_order = None
+        self.last_signed = None
         self.heartbeat_payloads = []
         self.open_orders_payload = []
         self.trades_payload = []
@@ -37,6 +39,7 @@ class _FakeClient:
         return order_args
 
     def post_order(self, signed, order_type):
+        self.last_signed = signed
         return {"orderID": "oid-demo", "status": "live"}
 
     def get_order(self, order_id):
@@ -61,6 +64,20 @@ class _FakePartialCreateOrderOptions:
     def __init__(self, *, tick_size, neg_risk):
         self.tick_size = tick_size
         self.neg_risk = neg_risk
+
+
+class _FakeSignerClient:
+    def __init__(self):
+        self.payloads = []
+
+    def sign_order(self, payload):
+        self.payloads.append(dict(payload))
+        return {"signed_payload": dict(payload)}
+
+
+class _SignerClientRaises:
+    def sign_order(self, payload):  # noqa: ANN001
+        raise SignerClientError("signer unavailable", reason_code="signer_sign_order_failed")
 
 
 class _FakeMarketClient:
@@ -139,51 +156,82 @@ class LiveClobTests(unittest.TestCase):
                 pass
             sdk_helpers._http_client = original_client
 
-    def test_create_and_post_order_passes_partial_options_to_create_order(self):
-        class _SdkStyleClient(_FakeClient):
-            def __init__(self):
-                super().__init__()
-                self.last_options = None
-
-            def create_order(self, order_args, options=None):
-                self.last_order = order_args
-                self.last_options = options
-                return order_args
-
+    def test_create_and_post_order_uses_external_signer_payload(self):
         broker = LiveClobBroker.__new__(LiveClobBroker)
-        broker.client = _SdkStyleClient()
+        broker.client = _FakeClient()
         broker._OrderType = _FakeOrderType
-        broker._PartialCreateOrderOptions = _FakePartialCreateOrderOptions
+        broker._chain_id = 137
+        broker._funder = "0xabc"
+        broker._signer_client = _FakeSignerClient()
+        order_args = _FakeOrderArgs(token_id="token-1", price=0.44, size=2.0, side="BUY")
 
-        response = broker._create_and_post_order(object(), tick_size=0.01, neg_risk=True)
+        response = broker._create_and_post_order(order_args, tick_size=0.01, neg_risk=True)
 
         self.assertEqual(response["orderID"], "oid-demo")
-        self.assertIsInstance(broker.client.last_options, _FakePartialCreateOrderOptions)
-        self.assertEqual(broker.client.last_options.tick_size, "0.01")
-        self.assertTrue(broker.client.last_options.neg_risk)
+        self.assertEqual(len(broker._signer_client.payloads), 1)
+        payload = broker._signer_client.payloads[0]
+        self.assertEqual(payload["token_id"], "token-1")
+        self.assertEqual(payload["side"], "BUY")
+        self.assertEqual(payload["tick_size"], 0.01)
+        self.assertEqual(payload["chain_id"], 137)
+        self.assertEqual(payload["funder_address"], "0xabc")
+        self.assertEqual(broker.client.last_signed, {"signed_payload": payload})
 
-    def test_create_and_post_order_passes_partial_options_to_create_and_post(self):
-        class _SdkCreateAndPostClient(_FakeClient):
-            def __init__(self):
-                super().__init__()
-                self.last_options = None
-
-            def create_and_post_order(self, order_args, options=None):
-                self.last_order = order_args
-                self.last_options = options
-                return {"orderID": "oid-direct", "status": "live"}
+    def test_create_and_post_order_wraps_unexpected_signer_exception(self):
+        class _BrokenSigner:
+            def sign_order(self, payload):
+                raise ValueError(f"boom:{payload.get('token_id')}")
 
         broker = LiveClobBroker.__new__(LiveClobBroker)
-        broker.client = _SdkCreateAndPostClient()
+        broker.client = _FakeClient()
         broker._OrderType = _FakeOrderType
-        broker._PartialCreateOrderOptions = _FakePartialCreateOrderOptions
+        broker._chain_id = 137
+        broker._funder = "0xabc"
+        broker._signer_client = _BrokenSigner()
+        order_args = _FakeOrderArgs(token_id="token-err", price=0.44, size=2.0, side="BUY")
 
-        response = broker._create_and_post_order(object(), tick_size=0.005, neg_risk=False)
+        with self.assertRaises(SignerClientError) as ctx:
+            broker._create_and_post_order(order_args, tick_size=0.005, neg_risk=False)
 
-        self.assertEqual(response["orderID"], "oid-direct")
-        self.assertIsInstance(broker.client.last_options, _FakePartialCreateOrderOptions)
-        self.assertEqual(broker.client.last_options.tick_size, "0.005")
-        self.assertFalse(broker.client.last_options.neg_risk)
+        self.assertEqual(ctx.exception.reason_code, "signer_sign_order_failed")
+
+    def test_execute_signer_error_is_fail_closed_without_local_key_fallback(self):
+        broker = LiveClobBroker.__new__(LiveClobBroker)
+        broker._OrderArgs = _FakeOrderArgs
+        broker._OrderType = _FakeOrderType
+        broker._side_map = {"BUY": "BUY_FLAG", "SELL": "SELL_FLAG"}
+        broker.client = _FakeClient()
+        broker.market_client = _FakeMarketClient()
+        broker.maker_buffer_ticks = 1
+        broker._chain_id = 137
+        broker._funder = "0xabc"
+        broker._signer_client = _SignerClientRaises()
+
+        result = broker.execute(_signal("BUY"), 10.0)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status, "error")
+        self.assertIn("live signer unavailable", result.message)
+        self.assertEqual(result.metadata.get("reason_code"), "signer_sign_order_failed")
+        self.assertTrue(bool(result.metadata.get("security_fail_close")))
+        self.assertEqual(result.broker_order_id, None)
+
+    def test_validate_identity_binding_rejects_mismatched_identities(self):
+        broker = LiveClobBroker.__new__(LiveClobBroker)
+        broker._funder = "0xabc123"
+        broker._signer_health = SimpleNamespace(
+            healthy=True,
+            signer_identity="0xdef456",
+            api_identity="0xabc123",
+            reason_code="",
+            message="ok",
+        )
+        broker._security_reason_codes = []
+
+        with self.assertRaises(RuntimeError):
+            broker._validate_identity_binding()
+
+        self.assertIn("signer_identity_mismatch", broker._security_reason_codes)
 
     def test_execute_maps_sell_side(self):
         broker = LiveClobBroker.__new__(LiveClobBroker)
@@ -193,11 +241,14 @@ class LiveClobTests(unittest.TestCase):
         broker.client = _FakeClient()
         broker.market_client = _FakeMarketClient()
         broker.maker_buffer_ticks = 1
+        broker._chain_id = 137
+        broker._funder = "0xabc"
+        broker._signer_client = _FakeSignerClient()
 
         result = broker.execute(_signal("SELL"), 10.0)
 
         self.assertTrue(result.ok)
-        self.assertEqual(broker.client.last_order.side, "SELL_FLAG")
+        self.assertEqual(broker._signer_client.payloads[-1]["side"], "SELL_FLAG")
         self.assertEqual(result.broker_order_id, "oid-demo")
         self.assertTrue(result.is_pending)
         self.assertEqual(result.filled_notional, 0.0)
@@ -230,6 +281,9 @@ class LiveClobTests(unittest.TestCase):
         broker.client = _MatchedClient()
         broker.market_client = _FakeMarketClient()
         broker.maker_buffer_ticks = 1
+        broker._chain_id = 137
+        broker._funder = "0xabc"
+        broker._signer_client = _FakeSignerClient()
 
         result = broker.execute(_signal("BUY", price_hint=0.54), 10.0)
 
@@ -248,12 +302,16 @@ class LiveClobTests(unittest.TestCase):
         broker.client = _FakeClient()
         broker.market_client = _FakeMarketClient(best_bid=0.52, best_ask=0.53, tick_size=0.01, midpoint=0.525)
         broker.maker_buffer_ticks = 1
+        broker._chain_id = 137
+        broker._funder = "0xabc"
+        broker._signer_client = _FakeSignerClient()
 
         result = broker.execute(_signal("BUY", price_hint=0.54), 10.0)
 
         self.assertTrue(result.ok)
-        self.assertEqual(broker.client.last_order.price, 0.52)
-        self.assertAlmostEqual(broker.client.last_order.size, 10.0 / 0.52, places=6)
+        payload = broker._signer_client.payloads[-1]
+        self.assertEqual(payload["price"], 0.52)
+        self.assertAlmostEqual(float(payload["size"]), 10.0 / 0.52, places=6)
         self.assertEqual(result.requested_price, 0.52)
         self.assertTrue(bool(result.metadata.get("preflight_has_book")))
         self.assertAlmostEqual(float(result.metadata.get("best_bid") or 0.0), 0.52, places=4)
@@ -597,6 +655,34 @@ class LiveClobTests(unittest.TestCase):
         assert checks is not None
         index = {str(row["name"]): row for row in checks}
         self.assertEqual(index["operator_prechecks"]["status"], "PASS")
+
+    def test_identity_binding_rejects_signer_or_api_mismatch(self):
+        for signer_identity, api_identity, expected_reason in (
+            ("0xwrong", "0xabc", "signer_identity_mismatch"),
+            ("0xabc", "0xwrong", "api_identity_mismatch"),
+            ("", "0xabc", "signer_identity_missing"),
+            ("0xabc", "", "api_identity_missing"),
+        ):
+            with self.subTest(
+                signer_identity=signer_identity,
+                api_identity=api_identity,
+                expected_reason=expected_reason,
+            ):
+                broker = LiveClobBroker.__new__(LiveClobBroker)
+                broker._funder = "0xabc"
+                broker._security_reason_codes = []
+                broker._signer_health = SignerHealthSnapshot(
+                    healthy=True,
+                    signer_identity=signer_identity,
+                    api_identity=api_identity,
+                    reason_code="",
+                    message="ok",
+                )
+
+                with self.assertRaises(RuntimeError):
+                    broker._validate_identity_binding()
+
+                self.assertIn(expected_reason, broker._security_reason_codes)
 
 
 if __name__ == "__main__":

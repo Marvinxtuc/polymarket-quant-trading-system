@@ -11,11 +11,18 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from polymarket_bot.admission_gate import AdmissionDecision, MODE_REDUCE_ONLY
 from polymarket_bot.clients.data_api import AccountingPosition, AccountingSnapshot, ClosedPosition, MarketMetadata
 from polymarket_bot.config import Settings
 from polymarket_bot.reconciliation_report import load_ledger_rows
 from polymarket_bot.risk import RiskManager, RiskState
-from polymarket_bot.runner import Trader
+from polymarket_bot.runner import (
+    REASON_CANDIDATE_LIFETIME_EXPIRED,
+    REASON_CROSS_WALLET_REPEAT_ENTRY_BLOCKED,
+    REASON_SAME_WALLET_ADD_NOT_ALLOWED,
+    Trader,
+)
+from polymarket_bot.state_store import StateStore
 from polymarket_bot.types import BrokerOrderEvent, ExecutionResult, OpenOrderSnapshot, OrderFillSnapshot, OrderStatusSnapshot, RiskDecision, Signal
 from polymarket_bot.wallet_scoring import RealizedWalletMetrics
 
@@ -97,8 +104,9 @@ class _DummyRisk:
 class _DummyBroker:
     def __init__(self):
         self.calls = []
+        self.heartbeat_calls: list[list[str]] = []
 
-    def execute(self, signal, notional_usd):
+    def execute(self, signal, notional_usd, *, strategy_order_uuid=None):
         self.calls.append((signal, notional_usd))
         return ExecutionResult(
             ok=True,
@@ -112,7 +120,31 @@ class _DummyBroker:
         )
 
     def list_open_orders(self):
+        return []
+
+    def list_recent_fills(self, *, since_ts: int = 0, order_ids: list[str] | None = None, limit: int = 200):
+        return []
+
+    def get_order_status(self, order_id: str):
+        _ = order_id
         return None
+
+    def list_order_events(self, *, since_ts: int = 0, order_ids: list[str] | None = None, limit: int = 200):
+        _ = (since_ts, order_ids, limit)
+        return []
+
+    def heartbeat(self, order_ids: list[str]):
+        self.heartbeat_calls.append(list(order_ids))
+        return True
+
+    def cancel_order(self, order_id: str):
+        normalized = str(order_id or "").strip()
+        return {
+            "order_id": normalized,
+            "status": "canceled",
+            "ok": True,
+            "message": "dummy cancel",
+        }
 
 
 class _RejectingBroker(_DummyBroker):
@@ -120,7 +152,7 @@ class _RejectingBroker(_DummyBroker):
         super().__init__()
         self.message = message
 
-    def execute(self, signal, notional_usd):
+    def execute(self, signal, notional_usd, *, strategy_order_uuid=None):
         self.calls.append((signal, notional_usd))
         return ExecutionResult(
             ok=False,
@@ -139,13 +171,13 @@ class _PendingBroker(_DummyBroker):
         super().__init__()
         self.order_statuses: dict[str, OrderStatusSnapshot] = {}
         self.heartbeat_calls: list[list[str]] = []
-        self.open_orders = None
-        self.recent_fills = None
-        self.order_events = None
+        self.open_orders: list[OpenOrderSnapshot] | None = []
+        self.recent_fills: list[OrderFillSnapshot] | None = []
+        self.order_events: list[BrokerOrderEvent] | None = None
         self.cancel_requests: list[str] = []
         self.cancel_responses: dict[str, dict[str, object]] = {}
 
-    def execute(self, signal, notional_usd):
+    def execute(self, signal, notional_usd, *, strategy_order_uuid=None):
         self.calls.append((signal, notional_usd))
         return ExecutionResult(
             ok=True,
@@ -286,6 +318,111 @@ def _signal(
 
 
 class TraderControlTests(unittest.TestCase):
+    @staticmethod
+    def _order_status_from_pending(raw_order: dict[str, object]) -> str:
+        status = str(raw_order.get("broker_status") or "").strip().lower()
+        if status in {"cancel_requested", "canceled", "failed", "rejected", "unmatched", "filled"}:
+            return status
+        if status in {"partial", "partially_filled"}:
+            return "partially_filled"
+        return status or "posted"
+
+    def _seed_runtime_truth_from_snapshot(self, settings: Settings) -> None:
+        try:
+            with open(settings.runtime_state_path, "r", encoding="utf-8") as f:
+                snapshot = json.load(f)
+        except Exception:
+            return
+        if not isinstance(snapshot, dict) or not snapshot:
+            return
+
+        store = StateStore(settings.state_store_path)
+        control_payload = dict(store.load_control_state() or {})
+        if not control_payload:
+            control_payload = {
+                "decision_mode": settings.decision_mode,
+                "pause_opening": False,
+                "reduce_only": False,
+                "emergency_stop": False,
+                "clear_stale_pending_requested_ts": 0,
+                "updated_ts": 0,
+            }
+
+        runtime_payload = {
+            "ts": int(snapshot.get("ts") or 0),
+            "runtime_version": int(snapshot.get("runtime_version") or 0),
+            "broker_event_sync_ts": int(snapshot.get("broker_event_sync_ts") or 0),
+            "recent_order_keys": dict(snapshot.get("recent_order_keys") or {}),
+            "signal_cycles": list(snapshot.get("signal_cycles") or []),
+            "trace_registry": list(snapshot.get("trace_registry") or []),
+            "last_operator_action": dict(snapshot.get("last_operator_action") or {}),
+        }
+        risk_payload = dict(snapshot.get("risk_state") or {})
+        reconciliation_payload = dict(snapshot.get("reconciliation") or {})
+        positions = [dict(row) for row in list(snapshot.get("positions") or []) if isinstance(row, dict)]
+
+        now_ts = int(time.time())
+        intents_by_id: dict[str, dict[str, object]] = {}
+        for order in list(snapshot.get("pending_orders") or []):
+            if not isinstance(order, dict):
+                continue
+            intent_id = str(order.get("signal_id") or order.get("key") or order.get("order_id") or "").strip()
+            token_id = str(order.get("token_id") or "").strip()
+            side = str(order.get("side") or "").strip().upper()
+            if not intent_id or not token_id or side not in {"BUY", "SELL"}:
+                continue
+            created_ts = int(order.get("ts") or now_ts)
+            updated_ts = int(order.get("last_heartbeat_ts") or created_ts)
+            intents_by_id[intent_id] = {
+                "intent_id": intent_id,
+                "strategy_order_uuid": str(order.get("strategy_order_uuid") or ""),
+                "broker_order_id": str(order.get("order_id") or ""),
+                "token_id": token_id,
+                "condition_id": str(order.get("condition_id") or ""),
+                "side": side,
+                "status": self._order_status_from_pending(order),
+                "recovered_source": str(order.get("recovery_source") or "legacy_snapshot"),
+                "recovery_reason": str(order.get("recovery_status") or "legacy_pending_order"),
+                "payload": dict(order),
+                "created_ts": created_ts,
+                "updated_ts": updated_ts,
+            }
+
+        for order in list(snapshot.get("recent_orders") or []):
+            if not isinstance(order, dict):
+                continue
+            intent_id = str(order.get("signal_id") or "").strip()
+            token_id = str(order.get("token_id") or "").strip()
+            side = str(order.get("side") or "").strip().upper()
+            if not intent_id or intent_id in intents_by_id or not token_id or side not in {"BUY", "SELL"}:
+                continue
+            created_ts = int(order.get("ts") or now_ts)
+            intents_by_id[intent_id] = {
+                "intent_id": intent_id,
+                "strategy_order_uuid": str(order.get("strategy_order_uuid") or ""),
+                "broker_order_id": str(order.get("order_id") or ""),
+                "token_id": token_id,
+                "condition_id": str(order.get("condition_id") or ""),
+                "side": side,
+                "status": str(order.get("status") or "posted").strip().lower() or "posted",
+                "recovered_source": "legacy_snapshot",
+                "recovery_reason": "legacy_recent_order",
+                "payload": dict(order),
+                "created_ts": created_ts,
+                "updated_ts": int(order.get("updated_ts") or now_ts),
+            }
+
+        store.save_runtime_truth(
+            {
+                "runtime": runtime_payload,
+                "control": control_payload,
+                "risk": risk_payload,
+                "reconciliation": reconciliation_payload,
+                "positions": positions,
+                "order_intents": list(intents_by_id.values()),
+            }
+        )
+
     def _make_settings(self, control_path: str, **kwargs: object) -> Settings:
         max_signals_per_cycle = int(kwargs.get("max_signals_per_cycle", 1))
         runtime_state_path = kwargs.get("runtime_state_path")
@@ -304,7 +441,7 @@ class TraderControlTests(unittest.TestCase):
         if candidate_db_path is None:
             candidate_db_path = str(Path(tempfile.mkdtemp()) / "terminal.db")
 
-        return Settings(
+        settings = Settings(
             _env_file=None,
             dry_run=bool(kwargs.get("dry_run", True)),
             decision_mode=str(kwargs.get("decision_mode", "auto")),
@@ -357,12 +494,41 @@ class TraderControlTests(unittest.TestCase):
             resonance_min_wallet_score=float(kwargs.get("resonance_min_wallet_score", 65.0)),
             resonance_trim_fraction=float(kwargs.get("resonance_trim_fraction", 0.35)),
             resonance_core_exit_fraction=float(kwargs.get("resonance_core_exit_fraction", 0.6)),
+            same_wallet_add_enabled=bool(kwargs.get("same_wallet_add_enabled", False)),
+            same_wallet_add_allowlist=str(kwargs.get("same_wallet_add_allowlist", "")),
             live_network_smoke_max_age_seconds=int(kwargs.get("live_network_smoke_max_age_seconds", 43200)),
             live_allowance_ready=bool(kwargs.get("live_allowance_ready", False)),
             live_geoblock_ready=bool(kwargs.get("live_geoblock_ready", False)),
             live_account_ready=bool(kwargs.get("live_account_ready", False)),
             funder_address=str(kwargs.get("funder_address", "")),
         )
+        try:
+            with open(control_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                control_keys = {
+                    "decision_mode",
+                    "pause_opening",
+                    "reduce_only",
+                    "emergency_stop",
+                    "clear_stale_pending_requested_ts",
+                    "updated_ts",
+                }
+                if any(key in payload for key in control_keys):
+                    normalized = {
+                        "decision_mode": settings.decision_mode,
+                        "pause_opening": False,
+                        "reduce_only": False,
+                        "emergency_stop": False,
+                        "clear_stale_pending_requested_ts": 0,
+                        "updated_ts": 0,
+                    }
+                    normalized.update(payload)
+                    StateStore(settings.state_store_path).save_control_state(normalized)
+        except Exception:
+            pass
+        self._seed_runtime_truth_from_snapshot(settings)
+        return settings
 
     def _arm_live_trader(self, trader: Trader, *, account_snapshot_ts: int | None = None) -> None:
         snapshot_ts = int(account_snapshot_ts or time.time())
@@ -564,6 +730,446 @@ class TraderControlTests(unittest.TestCase):
         self.assertEqual(len(broker.calls), 1)
         self.assertEqual(broker.calls[0][0].side, "SELL")
         self.assertNotIn("token-demo", trader.positions_book)
+
+    def test_admission_gate_blocks_buy_even_when_legacy_mode_fields_show_normal(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 44,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(control_path),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([_signal("BUY")]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        self._arm_live_trader(trader)
+
+        now_ts = int(time.time())
+        trader._admission_decision = AdmissionDecision(
+            mode=MODE_REDUCE_ONLY,
+            opening_allowed=False,
+            reduce_only=True,
+            halted=False,
+            auto_recover=False,
+            manual_confirmation_required=True,
+            reason_codes=("startup_checks_fail",),
+            action_whitelist=("sync_read", "state_evaluation", "cancel_pending_buy", "persist_state_update"),
+            latch_kind="manual",
+            trusted=False,
+            trusted_consecutive_cycles=0,
+            evidence_summary={
+                "startup_ready": False,
+                "reconciliation_status": "ok",
+                "account_snapshot_age_seconds": 0,
+                "broker_event_sync_age_seconds": 0,
+                "ledger_diff": 0.0,
+                "persistence_status": "ok",
+            },
+            evaluated_ts=now_ts,
+            auto_latch_active=False,
+            manual_latch_active=True,
+        )
+        trader.admission_opening_allowed = False
+        trader.admission_reduce_only = True
+        trader.admission_halted = False
+
+        # Deliberately forge legacy compatibility fields to NORMAL; admission gate must still block BUY.
+        trader.trading_mode = "NORMAL"
+        trader.trading_mode_reasons = []
+        trader.trading_mode_updated_ts = now_ts
+
+        def _noop_update_trading_mode(self, control, *, now=None, reconciliation=None):
+            return self.trading_mode_state()
+
+        with patch.object(Trader, "_update_trading_mode", _noop_update_trading_mode):
+            trader.step()
+
+        self.assertEqual(len(broker.calls), 0)
+        self.assertGreaterEqual(len(trader.recent_signal_cycles), 1)
+        latest_cycle = trader.recent_signal_cycles[0]
+        candidate = latest_cycle["candidates"][0]
+        self.assertEqual(candidate["final_status"], "skipped")
+        self.assertEqual(candidate["decision_snapshot"]["skip_reason"], "startup_not_ready")
+
+    def test_runtime_degradation_reconciliation_fail_blocks_buy(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 45,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(control_path, dry_run=False, funder_address="0xabc"),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([_signal("BUY", token_id="token-reconcile-fail", market_slug="reconcile-fail")]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        self._arm_live_trader(trader)
+
+        def _forced_reconciliation_summary(self, *, now=None):
+            return {
+                "day_key": "1970-01-01",
+                "status": "fail",
+                "issues": ["forced_reconciliation_fail"],
+                "recovery_conflicts": [],
+                "startup_ready": True,
+                "internal_realized_pnl": 0.0,
+                "ledger_realized_pnl": 0.0,
+                "broker_closed_pnl_today": 0.0,
+                "effective_daily_realized_pnl": 0.0,
+                "internal_vs_ledger_diff": 0.0,
+                "broker_floor_gap_vs_internal": 0.0,
+                "fill_count_today": 0,
+                "fill_notional_today": 0.0,
+                "account_sync_count_today": 0,
+                "startup_checks_count_today": 0,
+                "last_fill_ts": 0,
+                "last_account_sync_ts": 0,
+                "last_startup_checks_ts": 0,
+                "pending_orders": 0,
+                "pending_entry_orders": 0,
+                "pending_exit_orders": 0,
+                "stale_pending_orders": 0,
+                "ambiguous_pending_orders": 0,
+                "open_positions": 0,
+                "tracked_notional_usd": 0.0,
+                "ledger_available": True,
+                "account_snapshot_age_seconds": 0,
+                "broker_reconcile_age_seconds": 0,
+                "broker_event_sync_age_seconds": 0,
+            }
+
+        with patch.object(Trader, "reconciliation_summary", _forced_reconciliation_summary):
+            trader.step()
+
+        self.assertEqual(len(broker.calls), 0)
+        self.assertEqual(trader.trading_mode, "REDUCE_ONLY")
+        self.assertIn("reconciliation_fail", trader.trading_mode_reasons)
+
+    def test_runtime_degradation_stale_event_stream_blocks_buy(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 46,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                dry_run=False,
+                funder_address="0xabc",
+                poll_interval_seconds=30,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([_signal("BUY", token_id="token-event-stale", market_slug="event-stale")]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        self._arm_live_trader(trader)
+        now = int(time.time())
+        restored = self._restore_pending_order(
+            trader,
+            key="pending-event-stale",
+            order_id="oid-event-stale",
+            side="BUY",
+            token_id="token-pending-event",
+            ts=now,
+        )
+        trader.pending_orders[restored["key"]] = restored
+        trader._last_broker_event_sync_ts = now - 1000
+        trader.state.account_snapshot_ts = now
+
+        trader.step()
+
+        self.assertEqual(len(broker.calls), 0)
+        self.assertEqual(trader.trading_mode, "REDUCE_ONLY")
+        self.assertIn("broker_event_stream_stale", trader.trading_mode_reasons)
+
+    def test_runtime_degradation_ledger_diff_exceeded_blocks_buy(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 47,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(control_path, dry_run=False, funder_address="0xabc"),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([_signal("BUY", token_id="token-ledger-diff", market_slug="ledger-diff")]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        self._arm_live_trader(trader)
+
+        def _forced_reconciliation_summary(self, *, now=None):
+            return {
+                "day_key": "1970-01-01",
+                "status": "ok",
+                "issues": [],
+                "recovery_conflicts": [],
+                "startup_ready": True,
+                "internal_realized_pnl": 0.0,
+                "ledger_realized_pnl": 0.0,
+                "broker_closed_pnl_today": 0.0,
+                "effective_daily_realized_pnl": 0.0,
+                "internal_vs_ledger_diff": 5.0,
+                "broker_floor_gap_vs_internal": 0.0,
+                "fill_count_today": 0,
+                "fill_notional_today": 0.0,
+                "account_sync_count_today": 0,
+                "startup_checks_count_today": 0,
+                "last_fill_ts": 0,
+                "last_account_sync_ts": 0,
+                "last_startup_checks_ts": 0,
+                "pending_orders": 0,
+                "pending_entry_orders": 0,
+                "pending_exit_orders": 0,
+                "stale_pending_orders": 0,
+                "ambiguous_pending_orders": 0,
+                "open_positions": 0,
+                "tracked_notional_usd": 0.0,
+                "ledger_available": True,
+                "account_snapshot_age_seconds": 0,
+                "broker_reconcile_age_seconds": 0,
+                "broker_event_sync_age_seconds": 0,
+            }
+
+        with patch.object(Trader, "reconciliation_summary", _forced_reconciliation_summary):
+            trader.step()
+
+        self.assertEqual(len(broker.calls), 0)
+        self.assertEqual(trader.trading_mode, "REDUCE_ONLY")
+        self.assertIn("ledger_diff_exceeded", trader.trading_mode_reasons)
+
+    def test_halted_mode_whitelist_blocks_regular_sell_execution(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 48,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(control_path),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([_signal("SELL", token_id="token-halted", market_slug="halted-market")]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        self._arm_live_trader(trader)
+        trader.positions_book["token-halted"] = {
+            "token_id": "token-halted",
+            "condition_id": "condition-halted",
+            "market_slug": "halted-market",
+            "outcome": "YES",
+            "quantity": 10.0,
+            "price": 0.6,
+            "notional": 6.0,
+            "cost_basis_notional": 6.0,
+            "opened_ts": int(time.time()) - 600,
+            "last_buy_ts": int(time.time()) - 600,
+            "last_trim_ts": 0,
+            "entry_wallet": "0x1111111111111111111111111111111111111111",
+            "entry_wallet_score": 80.0,
+            "entry_wallet_tier": "CORE",
+        }
+        trader._refresh_risk_state()
+        trader.record_external_persistence_fault("daemon_state_write", "/tmp/state.json", OSError("disk full"))
+
+        trader.step()
+
+        self.assertEqual(trader.trading_mode, "HALTED")
+        self.assertEqual(len(broker.calls), 0)
+        self.assertIn("token-halted", trader.positions_book)
+
+    def test_reduce_only_blocks_retry_like_buy_resubmission(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 49,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _DummyBroker()
+        sig = _signal("BUY", token_id="token-retry-block", market_slug="retry-block")
+        trader = Trader(
+            settings=self._make_settings(control_path),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([sig]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        self._arm_live_trader(trader)
+        identity = trader._build_intent_identity(sig, 50.0)
+        claim_status, _intent = trader._claim_or_load_intent(signal=sig, notional_usd=50.0, identity=identity)
+        self.assertIn(claim_status, {"CLAIMED_NEW", "EXISTING_NON_TERMINAL"})
+        updated, _ = trader._set_intent_status(
+            strategy_order_uuid=str(identity.get("strategy_order_uuid") or ""),
+            idempotency_key=str(identity.get("idempotency_key") or ""),
+            status="ack_unknown",
+        )
+        self.assertTrue(updated)
+
+        StateStore(trader.settings.state_store_path).save_control_state(
+            {
+                "decision_mode": trader.control_state.decision_mode,
+                "pause_opening": False,
+                "reduce_only": True,
+                "emergency_stop": False,
+                "clear_stale_pending_requested_ts": 0,
+                "updated_ts": 50,
+            }
+        )
+
+        trader.step()
+
+        self.assertEqual(len(broker.calls), 0)
+        persisted = StateStore(trader.settings.state_store_path).load_intent_by_idempotency_key(
+            str(identity.get("idempotency_key") or "")
+        )
+        self.assertIsNotNone(persisted)
+        self.assertEqual(str(persisted.status), "ack_unknown")
+
+    def test_persisted_admission_snapshot_does_not_override_fresh_evidence(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 51,
+                },
+                f,
+            )
+            control_path = f.name
+
+        settings = self._make_settings(control_path)
+        store = StateStore(settings.state_store_path)
+        store.save_runtime_truth(
+            {
+                "runtime": {
+                    "admission": {
+                        "mode": "HALTED",
+                        "opening_allowed": False,
+                        "reason_codes": ["persistence_fault"],
+                    }
+                },
+                "control": {
+                    "decision_mode": "auto",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "clear_stale_pending_requested_ts": 0,
+                    "updated_ts": 0,
+                },
+                "risk": {},
+                "reconciliation": {"status": "ok"},
+                "positions": [],
+                "order_intents": [],
+            }
+        )
+
+        trader = Trader(
+            settings=settings,
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+        self._arm_live_trader(trader)
+
+        self.assertEqual(trader.trading_mode, "NORMAL")
+        self.assertNotIn("persistence_fault", trader.trading_mode_reasons)
+
+    def test_insufficient_bootstrap_evidence_keeps_opening_blocked(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 52,
+                },
+                f,
+            )
+            control_path = f.name
+
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                dry_run=False,
+                funder_address="0xabc",
+                live_allowance_ready=True,
+                live_geoblock_ready=True,
+                live_account_ready=True,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+
+        trader.startup_ready = True
+        trader.startup_failure_count = 0
+        trader.state.account_snapshot_ts = 0
+        trader._admission_bootstrap_protected = True
+        trader._update_trading_mode(
+            trader.control_state,
+            reconciliation={
+                "status": "ok",
+                "issues": [],
+                "ambiguous_pending_orders": 0,
+                "account_snapshot_age_seconds": 0,
+                "broker_event_sync_age_seconds": 0,
+                "internal_vs_ledger_diff": 0.0,
+            },
+        )
+
+        self.assertEqual(trader.trading_mode, "REDUCE_ONLY")
+        self.assertIn("bootstrap_protected_evidence_missing", trader.trading_mode_reasons)
 
     def test_pending_buy_does_not_create_position_before_reconcile(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
@@ -818,34 +1424,29 @@ class TraderControlTests(unittest.TestCase):
         trader._refresh_risk_state()
         trader.strategy = _DummyStrategy([])
 
-        with open(control_path, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "pause_opening": False,
-                    "reduce_only": False,
-                    "emergency_stop": False,
-                    "clear_stale_pending_requested_ts": int(time.time()),
-                    "updated_ts": 31,
-                },
-                f,
-            )
+        StateStore(trader.settings.state_store_path).save_control_state(
+            {
+                "decision_mode": trader.control_state.decision_mode,
+                "pause_opening": False,
+                "reduce_only": False,
+                "emergency_stop": False,
+                "clear_stale_pending_requested_ts": int(time.time()),
+                "updated_ts": 31,
+            }
+        )
 
         trader.step()
 
-        self.assertEqual(len(trader.pending_orders), 1)
-        self.assertIn("fresh-live-token-demo", trader.pending_orders)
+        self.assertEqual(len(trader.pending_orders), 0)
         self.assertEqual(trader.recent_orders[0]["status"], "CANCELED")
-        self.assertIn("operator_clear_stale_pending", trader.recent_orders[0]["reason"])
-        self.assertEqual(broker.cancel_requests, ["live-token-demo"])
+        self.assertIn("trading_mode_cancel_pending_entry", trader.recent_orders[0]["reason"])
+        self.assertIn("operator_clear_stale_pending", trader.recent_orders[1]["reason"])
+        self.assertEqual(broker.cancel_requests, ["live-token-demo", "live-token-demo-fresh"])
         self.assertEqual(trader.last_operator_action["name"], "clear_stale_pending")
         self.assertEqual(trader.last_operator_action["status"], "cleared")
         self.assertEqual(trader.last_operator_action["cleared_count"], 1)
         self.assertEqual(trader.last_operator_action["remaining_pending_orders"], 1)
-        self.assertAlmostEqual(
-            trader.state.pending_entry_notional_usd,
-            float(trader.pending_orders["fresh-live-token-demo"]["requested_notional"]),
-            places=4,
-        )
+        self.assertAlmostEqual(trader.state.pending_entry_notional_usd, 0.0, places=4)
 
     def test_reduce_only_cancels_pending_buy_orders(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
@@ -873,16 +1474,16 @@ class TraderControlTests(unittest.TestCase):
         trader.step()
         self.assertEqual(len(trader.pending_orders), 1)
 
-        with open(control_path, "w", encoding="utf-8") as f:
-            json.dump(
-                {
-                    "pause_opening": False,
-                    "reduce_only": True,
-                    "emergency_stop": False,
-                    "updated_ts": 33,
-                },
-                f,
-            )
+        StateStore(trader.settings.state_store_path).save_control_state(
+            {
+                "decision_mode": trader.control_state.decision_mode,
+                "pause_opening": False,
+                "reduce_only": True,
+                "emergency_stop": False,
+                "clear_stale_pending_requested_ts": 0,
+                "updated_ts": 33,
+            }
+        )
 
         trader.strategy = _DummyStrategy([])
         trader.step()
@@ -890,7 +1491,7 @@ class TraderControlTests(unittest.TestCase):
         self.assertEqual(len(trader.pending_orders), 0)
         self.assertEqual(broker.cancel_requests, ["live-token-demo"])
         self.assertEqual(trader.recent_orders[0]["status"], "CANCELED")
-        self.assertIn("reduce_only_cancel_pending_entry", trader.recent_orders[0]["reason"])
+        self.assertIn("kill_switch_reduce_only", trader.recent_orders[0]["reason"])
 
     def test_system_reduce_only_cancels_pending_buy_orders(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
@@ -1421,7 +2022,7 @@ class TraderControlTests(unittest.TestCase):
                 super().__init__()
                 self._client = client
 
-            def execute(self, signal, notional_usd):
+            def execute(self, signal, notional_usd, *, strategy_order_uuid=None):
                 if not self.calls:
                     self._client.accounting_snapshot = AccountingSnapshot(
                         wallet="0xabc",
@@ -1430,7 +2031,7 @@ class TraderControlTests(unittest.TestCase):
                         equity=8.5,
                         valuation_time="2026-03-19T13:43:40Z",
                     )
-                return super().execute(signal, notional_usd)
+                return super().execute(signal, notional_usd, strategy_order_uuid=strategy_order_uuid)
 
         broker = _BalanceUpdatingPendingBroker(data_client)
         previous = {
@@ -1534,7 +2135,7 @@ class TraderControlTests(unittest.TestCase):
         self.assertEqual(len(broker.calls), 1)
         self.assertEqual(len(trader.pending_orders), 1)
 
-    def test_runtime_snapshot_restores_recent_order_keys_and_blocks_duplicate_buy(self):
+    def test_runtime_snapshot_recent_order_keys_are_advisory_not_idempotency_truth(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
             json.dump(
                 {
@@ -1583,8 +2184,10 @@ class TraderControlTests(unittest.TestCase):
         )
 
         trader.step()
+        self.assertEqual(len(broker.calls), 1)
 
-        self.assertEqual(len(broker.calls), 0)
+        trader.step()
+        self.assertEqual(len(broker.calls), 1)
 
     def test_wallet_score_trade_tier_reduces_order_size(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
@@ -2263,8 +2866,15 @@ class TraderControlTests(unittest.TestCase):
             broker=_DummyBroker(),
         )
 
-        self.assertEqual(trader.positions_book, {})
-        self.assertEqual(trader.state.open_positions, 0)
+        self.assertIn("stale-token", trader.positions_book)
+        self.assertEqual(trader.state.open_positions, 1)
+        self.assertIn("recovery_conflict", trader.trading_mode_reasons)
+        self.assertTrue(
+            any(
+                str(item.get("category") or "") == "AMBIGUOUS_POSITION"
+                for item in list(getattr(trader, "_recovery_conflicts", []))
+            )
+        )
 
     def test_broker_dust_positions_are_ignored_at_startup(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as control_file:
@@ -2682,8 +3292,8 @@ class TraderControlTests(unittest.TestCase):
         self.assertEqual(len(trader.pending_orders), 1)
         restored = next(iter(trader.pending_orders.values()))
         self.assertEqual(restored["order_id"], "oid-stale")
-        self.assertEqual(restored["recovery_status"], "uncertain_empty_broker_open_orders")
-        self.assertEqual(restored["recovery_source"], "snapshot")
+        self.assertEqual(restored["recovery_status"], "db_pending_without_broker_open_and_without_fill_evidence")
+        self.assertEqual(restored["recovery_source"], "db")
 
     def test_restored_uncertain_pending_order_blocks_duplicate_buy_after_restart(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
@@ -2743,7 +3353,9 @@ class TraderControlTests(unittest.TestCase):
         trader.step()
 
         self.assertEqual(len(broker.calls), 0)
-        self.assertEqual(len(trader.pending_orders), 1)
+        self.assertEqual(len(trader.pending_orders), 0)
+        self.assertEqual(trader.recent_orders[0]["status"], "CANCELED")
+        self.assertIn("trading_mode_cancel_pending_entry", str(trader.recent_orders[0]["reason"]))
 
     def test_runtime_snapshot_restores_broker_event_sync_cursor(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
@@ -2783,7 +3395,7 @@ class TraderControlTests(unittest.TestCase):
         self.assertEqual(trader._last_broker_event_sync_ts, 1700000123)
         dumped = trader._dump_runtime_state()
         self.assertEqual(dumped["broker_event_sync_ts"], 1700000123)
-        self.assertEqual(dumped["runtime_version"], 7)
+        self.assertEqual(dumped["runtime_version"], 9)
 
     def test_live_startup_checks_fail_when_network_smoke_reports_block(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
@@ -3774,7 +4386,7 @@ class TraderControlTests(unittest.TestCase):
         )
         self._arm_live_trader(trader)
 
-        with patch("polymarket_bot.runner.os.replace", side_effect=OSError("disk full")):
+        with patch.object(trader._state_store, "save_runtime_truth", side_effect=OSError("disk full")):
             with self.assertRaises(OSError):
                 trader.persist_runtime_state(runtime_state_file.name)
 
@@ -3782,7 +4394,7 @@ class TraderControlTests(unittest.TestCase):
         self.assertEqual(trader.trading_mode, "HALTED")
         self.assertIn("persistence_fault", trader.trading_mode_reasons)
         self.assertEqual(persistence["status"], "fault")
-        self.assertEqual(persistence["last_failure"]["kind"], "runtime_state_write")
+        self.assertEqual(persistence["last_failure"]["kind"], "runtime_truth_write")
 
     def test_persistence_fault_cancels_pending_buy_orders(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
@@ -4278,7 +4890,7 @@ class TraderControlTests(unittest.TestCase):
         self.assertIn("token-manual", trader.positions_book)
         self.assertGreaterEqual(trader.journal_summary()["total_entries"], 1)
 
-    def test_candidate_marks_existing_position_conflict(self):
+    def test_candidate_blocks_cross_wallet_repeat_entry(self):
         with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
             json.dump(
                 {
@@ -4338,16 +4950,434 @@ class TraderControlTests(unittest.TestCase):
 
         queued = trader.list_candidates(limit=4)
         self.assertEqual(len(queued), 1)
-        self.assertEqual(queued[0]["skip_reason"], "existing_position_conflict")
+        self.assertEqual(queued[0]["skip_reason"], REASON_CROSS_WALLET_REPEAT_ENTRY_BLOCKED)
+        self.assertEqual(queued[0]["block_reason"], REASON_CROSS_WALLET_REPEAT_ENTRY_BLOCKED)
+        self.assertEqual(queued[0]["block_layer"], "candidate")
         self.assertEqual(queued[0]["suggested_action"], "watch")
         self.assertTrue(queued[0]["has_existing_position"])
         self.assertTrue(queued[0]["existing_position_conflict"])
-        self.assertIn("当前已有仓位", " ".join(queued[0].get("explanation") or []))
+        self.assertIn("新的钱包信号不能继续放大仓位", " ".join(queued[0].get("explanation") or []))
         factor_keys = [str(item.get("key") or "") for item in queued[0].get("reason_factors") or []]
         self.assertIn("existing_position", factor_keys)
         self.assertIn("skip_reason", factor_keys)
         self.assertIn("decision", factor_keys)
-        self.assertIn("已有仓位", " ".join(str(item.get("detail") or "") for item in queued[0].get("reason_factors") or []))
+        self.assertIn("别的钱包", " ".join(str(item.get("detail") or "") for item in queued[0].get("reason_factors") or []))
+
+    def test_candidate_blocks_same_wallet_add_by_default(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "manual",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 1,
+                },
+                f,
+            )
+            control_path = f.name
+
+        wallet = "0x1111111111111111111111111111111111111111"
+        strategy = _DummyStrategy([_signal("BUY", token_id="token-add-default", market_slug="add-market", wallet=wallet)])
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="manual",
+                max_signals_per_cycle=1,
+                token_add_cooldown_seconds=0,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=strategy,
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        trader.positions_book["token-add-default"] = {
+            "token_id": "token-add-default",
+            "condition_id": "condition-add-default",
+            "market_slug": "add-market",
+            "outcome": "YES",
+            "quantity": 20.0,
+            "price": 0.5,
+            "notional": 10.0,
+            "cost_basis_notional": 10.0,
+            "opened_ts": int(time.time()) - 300,
+            "last_buy_ts": int(time.time()) - 300,
+            "last_trim_ts": 0,
+            "entry_wallet": wallet,
+            "entry_wallet_score": 82.0,
+            "entry_wallet_tier": "CORE",
+            "entry_reason": "existing position",
+            "trace_id": "trc-add-default",
+            "origin_signal_id": "sig-add-default",
+            "last_signal_id": "sig-add-default",
+            "last_exit_kind": "",
+            "last_exit_label": "",
+            "last_exit_summary": "",
+            "last_exit_ts": 0,
+        }
+
+        trader.step()
+
+        queued = trader.list_candidates(limit=4)
+        self.assertEqual(len(broker.calls), 0)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["skip_reason"], REASON_SAME_WALLET_ADD_NOT_ALLOWED)
+        self.assertEqual(queued[0]["block_reason"], REASON_SAME_WALLET_ADD_NOT_ALLOWED)
+        self.assertEqual(queued[0]["block_layer"], "candidate")
+        self.assertEqual(queued[0]["status"], "watched")
+
+    def test_cross_wallet_repeat_entry_does_not_enlarge_existing_position_in_auto_mode(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 1,
+                },
+                f,
+            )
+            control_path = f.name
+
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="auto",
+                max_signals_per_cycle=1,
+                token_add_cooldown_seconds=0,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy(
+                [
+                    _signal(
+                        "BUY",
+                        token_id="token-cross-auto",
+                        market_slug="cross-auto-market",
+                        wallet="0xnew000000000000000000000000000000000000",
+                    )
+                ]
+            ),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        trader.positions_book["token-cross-auto"] = {
+            "token_id": "token-cross-auto",
+            "condition_id": "condition-cross-auto",
+            "market_slug": "cross-auto-market",
+            "outcome": "YES",
+            "quantity": 50.0,
+            "price": 0.5,
+            "notional": 25.0,
+            "cost_basis_notional": 25.0,
+            "opened_ts": int(time.time()) - 300,
+            "last_buy_ts": int(time.time()) - 300,
+            "last_trim_ts": 0,
+            "entry_wallet": "0xold000000000000000000000000000000000000",
+            "entry_wallet_score": 80.0,
+            "entry_wallet_tier": "CORE",
+            "entry_reason": "existing position",
+            "trace_id": "trc-cross-auto",
+            "origin_signal_id": "sig-cross-auto",
+            "last_signal_id": "sig-cross-auto",
+            "last_exit_kind": "",
+            "last_exit_label": "",
+            "last_exit_summary": "",
+            "last_exit_ts": 0,
+        }
+        trader.state.open_positions = 1
+
+        trader.step()
+
+        self.assertEqual(len(broker.calls), 0)
+        self.assertAlmostEqual(trader.positions_book["token-cross-auto"]["notional"], 25.0, places=4)
+        queued = trader.list_candidates(limit=4)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["skip_reason"], REASON_CROSS_WALLET_REPEAT_ENTRY_BLOCKED)
+
+    def test_same_wallet_add_requires_explicit_allowlist(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 1,
+                },
+                f,
+            )
+            control_path = f.name
+
+        wallet = "0x1111111111111111111111111111111111111111"
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="auto",
+                max_signals_per_cycle=1,
+                token_add_cooldown_seconds=0,
+                same_wallet_add_enabled=True,
+                same_wallet_add_allowlist=wallet,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([_signal("BUY", token_id="token-demo", market_slug="demo-market", wallet=wallet)]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        trader.positions_book["token-demo"] = {
+            "token_id": "token-demo",
+            "condition_id": "condition-demo",
+            "market_slug": "demo-market",
+            "outcome": "YES",
+            "quantity": 100.0,
+            "price": 0.6,
+            "notional": 25.0,
+            "cost_basis_notional": 25.0,
+            "opened_ts": 0,
+            "last_buy_ts": 0,
+            "last_trim_ts": 0,
+            "entry_wallet": wallet,
+            "entry_wallet_score": 82.0,
+            "entry_wallet_tier": "CORE",
+            "entry_reason": "existing position",
+            "trace_id": "trc-allowed-add",
+            "origin_signal_id": "sig-allowed-add",
+            "last_signal_id": "sig-allowed-add",
+            "last_exit_kind": "",
+            "last_exit_label": "",
+            "last_exit_summary": "",
+            "last_exit_ts": 0,
+        }
+        trader.state.open_positions = 1
+
+        trader.step()
+
+        self.assertEqual(len(broker.calls), 1)
+        self.assertEqual(broker.calls[0][0].position_action, "add")
+        self.assertGreater(trader.positions_book["token-demo"]["notional"], 25.0)
+        self.assertEqual(trader.positions_book["token-demo"]["entry_wallet"], wallet)
+
+    def test_manual_approved_repeat_entry_cannot_bypass_execution_precheck(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "manual",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 1,
+                },
+                f,
+            )
+            control_path = f.name
+
+        wallet = "0x1111111111111111111111111111111111111111"
+        strategy = _DummyStrategy([_signal("BUY", token_id="token-manual-block", market_slug="manual-block-market", wallet=wallet)])
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="manual",
+                max_signals_per_cycle=1,
+                token_add_cooldown_seconds=0,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=strategy,
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        trader.positions_book["token-manual-block"] = {
+            "token_id": "token-manual-block",
+            "condition_id": "condition-manual-block",
+            "market_slug": "manual-block-market",
+            "outcome": "YES",
+            "quantity": 20.0,
+            "price": 0.5,
+            "notional": 10.0,
+            "cost_basis_notional": 10.0,
+            "opened_ts": int(time.time()) - 300,
+            "last_buy_ts": int(time.time()) - 300,
+            "last_trim_ts": 0,
+            "entry_wallet": wallet,
+            "entry_wallet_score": 82.0,
+            "entry_wallet_tier": "CORE",
+            "entry_reason": "existing position",
+            "trace_id": "trc-manual-block",
+            "origin_signal_id": "sig-manual-block",
+            "last_signal_id": "sig-manual-block",
+            "last_exit_kind": "",
+            "last_exit_label": "",
+            "last_exit_summary": "",
+            "last_exit_ts": 0,
+        }
+
+        trader.step()
+
+        queued = trader.list_candidates(limit=4)
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["skip_reason"], REASON_SAME_WALLET_ADD_NOT_ALLOWED)
+        assert trader.candidate_store is not None
+        trader.candidate_store.record_candidate_action(queued[0]["id"], action="follow", note="force it")
+        strategy._signals = []
+
+        trader.step()
+
+        blocked = trader.candidate_store.get_candidate(queued[0]["id"])
+        self.assertEqual(len(broker.calls), 0)
+        self.assertIsNotNone(blocked)
+        assert blocked is not None
+        self.assertEqual(blocked["status"], "skipped")
+        latest_cycle = trader.recent_signal_cycles[0]
+        latest_candidate = latest_cycle["candidates"][0]
+        self.assertEqual(latest_candidate["decision_snapshot"]["block_reason"], REASON_SAME_WALLET_ADD_NOT_ALLOWED)
+        self.assertEqual(latest_candidate["decision_snapshot"]["block_layer"], "execution_precheck")
+
+    def test_candidate_lifetime_uses_generation_timestamp_not_signal_timestamp(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "manual",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 1,
+                },
+                f,
+            )
+            control_path = f.name
+
+        signal_time = datetime.now(timezone.utc) - timedelta(seconds=600)
+        signal = _signal("BUY", token_id="token-lifetime-created", market_slug="candidate-life-market")
+        signal.timestamp = signal_time
+        now_ts = int(time.time())
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="manual",
+                max_signals_per_cycle=1,
+                candidate_ttl_seconds=900,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+
+        candidate = trader._candidate_from_signal(signal, now=now_ts)
+
+        self.assertEqual(candidate.created_ts, now_ts)
+        self.assertEqual(candidate.expires_ts, now_ts + 900)
+
+    def test_approved_candidate_expires_at_decision_layer_before_queue(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "manual",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 1,
+                },
+                f,
+            )
+            control_path = f.name
+
+        now_ts = int(time.time())
+        signal = _signal("BUY", token_id="token-approved-expired", market_slug="approved-expired-market")
+        signal.signal_id = "sig-approved-expired"
+        signal.trace_id = "trc-approved-expired"
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="manual",
+                max_signals_per_cycle=1,
+                candidate_ttl_seconds=900,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=_DummyBroker(),
+        )
+        candidate = trader._candidate_from_signal(signal, now=now_ts - 1800)
+        candidate.status = "approved"
+        candidate.selected_action = "follow"
+        candidate.expires_ts = now_ts + 3600
+        assert trader.candidate_store is not None
+        trader.candidate_store.upsert_candidate(candidate)
+
+        plans = trader._claim_approved_candidate_plans()
+
+        expired = trader.candidate_store.get_candidate(candidate.id)
+        self.assertEqual(plans, [])
+        self.assertIsNotNone(expired)
+        assert expired is not None
+        self.assertEqual(expired["status"], "expired")
+        self.assertEqual(expired["block_reason"], REASON_CANDIDATE_LIFETIME_EXPIRED)
+        self.assertEqual(expired["block_layer"], "decision")
+        self.assertEqual(expired["lifecycle_state"], "expired_discarded")
+
+    def test_stale_queued_candidate_cannot_bypass_execution_precheck(self):
+        with tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8") as f:
+            json.dump(
+                {
+                    "decision_mode": "manual",
+                    "pause_opening": False,
+                    "reduce_only": False,
+                    "emergency_stop": False,
+                    "updated_ts": 1,
+                },
+                f,
+            )
+            control_path = f.name
+
+        now_ts = int(time.time())
+        signal = _signal("BUY", token_id="token-queued-expired", market_slug="queued-expired-market")
+        signal.signal_id = "sig-queued-expired"
+        signal.trace_id = "trc-queued-expired"
+        broker = _DummyBroker()
+        trader = Trader(
+            settings=self._make_settings(
+                control_path,
+                decision_mode="manual",
+                max_signals_per_cycle=1,
+                candidate_ttl_seconds=900,
+            ),
+            data_client=_DummyDataClient(),
+            strategy=_DummyStrategy([]),
+            risk=_DummyRisk(),
+            broker=broker,
+        )
+        candidate = trader._candidate_from_signal(signal, now=now_ts - 1800)
+        candidate.status = "queued"
+        candidate.selected_action = "follow"
+        candidate.note = "force stale queue"
+        assert trader.candidate_store is not None
+        trader.candidate_store.upsert_candidate(candidate)
+        queued_signal = trader._candidate_to_signal(trader.candidate_store.get_candidate(candidate.id) or {})
+        assert queued_signal is not None
+
+        with patch.object(Trader, "_claim_approved_candidate_plans", return_value=[{
+            "signal": queued_signal,
+            "candidate_id": candidate.id,
+            "candidate_action": "follow",
+            "candidate_note": "force stale queue",
+            "origin": "approved_queue",
+        }]):
+            trader.step()
+
+        blocked = trader.candidate_store.get_candidate(candidate.id)
+        self.assertEqual(len(broker.calls), 0)
+        self.assertIsNotNone(blocked)
+        assert blocked is not None
+        self.assertEqual(blocked["status"], "expired")
+        self.assertEqual(blocked["block_reason"], REASON_CANDIDATE_LIFETIME_EXPIRED)
+        self.assertEqual(blocked["block_layer"], "execution_precheck")
+        self.assertEqual(blocked["lifecycle_state"], "expired_discarded")
+        latest_cycle = trader.recent_signal_cycles[0]
+        latest_candidate = latest_cycle["candidates"][0]
+        self.assertEqual(latest_candidate["decision_snapshot"]["block_reason"], REASON_CANDIDATE_LIFETIME_EXPIRED)
+        self.assertEqual(latest_candidate["decision_snapshot"]["block_layer"], "execution_precheck")
 
     def test_candidate_enrich_uses_price_history_momentum(self):
         class _HistoryDataClient(_DummyDataClient):

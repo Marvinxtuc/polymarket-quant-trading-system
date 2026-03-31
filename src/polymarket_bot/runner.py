@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import re
@@ -10,15 +11,108 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from polymarket_bot.admission_gate import (
+    AdmissionDecision,
+    AdmissionEvidence,
+    MODE_HALTED,
+    MODE_NORMAL,
+    REASON_AMBIGUOUS_PENDING_UNRESOLVED,
+    REASON_ADMISSION_GATE_INTERNAL_ERROR,
+    REASON_LEDGER_DIFF_EXCEEDED,
+    REASON_OPERATOR_MANUAL_REDUCE_ONLY,
+    REASON_PERSISTENCE_FAULT,
+    REASON_RISK_BREAKER_STATE_INVALID,
+    REASON_RISK_LEDGER_FAULT,
+    REASON_RECOVERY_CONFLICT_UNRESOLVED,
+    REASON_RECOVERY_CONFLICT_UNRESOLVED_MANUAL,
+    REASON_STARTUP_CHECKS_FAIL,
+    REASON_STALE_ACCOUNT_SNAPSHOT,
+    REASON_STALE_BROKER_EVENT_STREAM,
+    evaluate_admission,
+)
 from polymarket_bot.brokers.base import Broker
 from polymarket_bot.clients.data_api import AccountingSnapshot, MarketMetadata, PolymarketDataClient, PriceHistoryPoint
 from polymarket_bot.config import Settings
 from polymarket_bot.db import PersonalTerminalStore
+from polymarket_bot.force_exit import (
+    begin_time_exit_attempt,
+    estimate_time_exit_volatility_bps,
+    record_time_exit_failure,
+    record_time_exit_success,
+    should_attempt_time_exit,
+)
 from polymarket_bot.i18n import enum_label as i18n_enum_label, humanize_identifier as i18n_humanize_identifier, label as i18n_label, t as i18n_t
+from polymarket_bot.idempotency import (
+    CLAIMED_NEW,
+    EXISTING_NON_TERMINAL,
+    EXISTING_TERMINAL,
+    INTENT_STATUS_ACKED_PENDING,
+    INTENT_STATUS_ACK_UNKNOWN,
+    INTENT_STATUS_FAILED,
+    INTENT_STATUS_FILLED,
+    INTENT_STATUS_MANUAL_REQUIRED,
+    INTENT_STATUS_NEW,
+    INTENT_STATUS_PARTIAL,
+    INTENT_STATUS_SENDING,
+    NON_TERMINAL_STATUSES,
+    STORAGE_ERROR,
+    build_intent_idempotency_key,
+    normalize_status as normalize_intent_status,
+)
+from polymarket_bot.heartbeat import (
+    LOOP_STATUS_ERROR as RUNNER_LOOP_STATUS_ERROR,
+    LOOP_STATUS_IDLE as RUNNER_LOOP_STATUS_IDLE,
+    LOOP_STATUS_RUNNING as RUNNER_LOOP_STATUS_RUNNING,
+    LOOP_STATUS_STOPPED as RUNNER_LOOP_STATUS_STOPPED,
+    default_runner_heartbeat,
+    normalize_runner_heartbeat,
+)
+from polymarket_bot.kill_switch import (
+    MODE_EMERGENCY_STOP as KILL_SWITCH_MODE_EMERGENCY_STOP,
+    MODE_NONE as KILL_SWITCH_MODE_NONE,
+    MODE_PAUSE_OPENING as KILL_SWITCH_MODE_PAUSE_OPENING,
+    MODE_REDUCE_ONLY as KILL_SWITCH_MODE_REDUCE_ONLY,
+    PHASE_CANCELING_BUY as KILL_SWITCH_PHASE_CANCELING_BUY,
+    PHASE_FAILED_MANUAL_REQUIRED as KILL_SWITCH_PHASE_FAILED_MANUAL_REQUIRED,
+    PHASE_IDLE as KILL_SWITCH_PHASE_IDLE,
+    PHASE_REQUESTED as KILL_SWITCH_PHASE_REQUESTED,
+    PHASE_SAFE_CONFIRMED as KILL_SWITCH_PHASE_SAFE_CONFIRMED,
+    PHASE_WAITING_BROKER_TERMINAL as KILL_SWITCH_PHASE_WAITING_BROKER_TERMINAL,
+    default_state as default_kill_switch_state,
+    normalize_state as normalize_kill_switch_state,
+    requested_mode as requested_kill_switch_mode,
+    status_is_terminal as kill_switch_status_is_terminal,
+)
+from polymarket_bot.locks import (
+    FileLock,
+    SingleWriterLockError,
+    derive_writer_scope,
+)
+from polymarket_bot.models.control_state import PersistedControlState
+from polymarket_bot.models.exit_state import (
+    TIME_EXIT_STAGE_FORCE_EXIT,
+    TIME_EXIT_STAGE_IDLE,
+    normalize_time_exit_state,
+)
+from polymarket_bot.models.exposure_ledger import ExposureLedgerEntry
+from polymarket_bot.models.risk_breaker_state import RiskBreakerState, default_risk_breaker_state
+from polymarket_bot.models.signer_status import SignerStatusSnapshot
 from polymarket_bot.notifier import Notifier
 from polymarket_bot.reconciliation_report import append_ledger_entry, load_ledger_rows
-from polymarket_bot.risk import RiskManager, RiskState
+from polymarket_bot.risk import (
+    REASON_CONDITION_EXPOSURE_CAP_REACHED,
+    REASON_INTRADAY_DRAWDOWN_BREAKER_ACTIVE,
+    REASON_LOSS_STREAK_BREAKER_ACTIVE,
+    REASON_PORTFOLIO_EXPOSURE_CAP_REACHED,
+    REASON_RISK_BREAKER_STATE_INVALID as RISK_REASON_BREAKER_STATE_INVALID,
+    REASON_RISK_LEDGER_FAULT as RISK_REASON_LEDGER_FAULT,
+    REASON_WALLET_EXPOSURE_CAP_REACHED,
+    RiskManager,
+    RiskState,
+)
+from polymarket_bot.state_store import StateStore
 from polymarket_bot.strategies.wallet_follower import WalletFollowerStrategy
 from polymarket_bot.types import (
     BrokerOrderEvent,
@@ -36,6 +130,16 @@ from polymarket_bot.types import (
 from polymarket_bot.wallet_history import WalletHistoryStore
 from polymarket_bot.wallet_scoring import RealizedWalletMetrics
 
+REASON_REPEAT_ENTRY_BLOCKED_EXISTING_POSITION = "repeat_entry_blocked_existing_position"
+REASON_SAME_WALLET_ADD_NOT_ALLOWED = "same_wallet_add_not_allowed"
+REASON_CROSS_WALLET_REPEAT_ENTRY_BLOCKED = "cross_wallet_repeat_entry_blocked"
+REASON_CANDIDATE_LIFETIME_EXPIRED = "candidate_lifetime_expired"
+REPEAT_ENTRY_BLOCK_REASONS = {
+    REASON_REPEAT_ENTRY_BLOCKED_EXISTING_POSITION,
+    REASON_SAME_WALLET_ADD_NOT_ALLOWED,
+    REASON_CROSS_WALLET_REPEAT_ENTRY_BLOCKED,
+}
+
 _MARKET_WINDOW_PATTERN = re.compile(r"-(5m|15m|30m|1h)-(\d{10})$")
 _MARKET_WINDOW_SECONDS = {
     "5m": 300,
@@ -44,16 +148,45 @@ _MARKET_WINDOW_SECONDS = {
     "1h": 3600,
 }
 _MARKET_METADATA_CACHE_TTL_SECONDS = 300
+_ORDER_INTENT_TERMINAL_STATUSES = {"filled", "canceled", "failed", "rejected", "unmatched"}
+_VALID_DECISION_MODES = {"manual", "semi_auto", "auto"}
 
 
-@dataclass(slots=True)
-class ControlState:
-    decision_mode: str = "manual"
-    pause_opening: bool = False
-    reduce_only: bool = False
-    emergency_stop: bool = False
-    clear_stale_pending_requested_ts: int = 0
-    updated_ts: int = 0
+ControlState = PersistedControlState
+
+
+def _legacy_trading_mode_reason(reason: str) -> str:
+    normalized = str(reason or "").strip()
+    if not normalized:
+        return ""
+    mapping = {
+        REASON_STARTUP_CHECKS_FAIL: "startup_not_ready",
+        REASON_STALE_ACCOUNT_SNAPSHOT: "account_state_stale",
+        REASON_STALE_BROKER_EVENT_STREAM: "broker_event_stream_stale",
+        REASON_OPERATOR_MANUAL_REDUCE_ONLY: "pause_opening",
+        "operator_pause_opening": "pause_opening",
+        "operator_emergency_stop": "emergency_stop",
+        REASON_ADMISSION_GATE_INTERNAL_ERROR: "emergency_stop",
+        REASON_RECOVERY_CONFLICT_UNRESOLVED: "recovery_conflict",
+        REASON_RECOVERY_CONFLICT_UNRESOLVED_MANUAL: "recovery_conflict",
+        REASON_RISK_LEDGER_FAULT: "risk_ledger_fault",
+        REASON_RISK_BREAKER_STATE_INVALID: "risk_breaker_state_invalid",
+        REASON_LOSS_STREAK_BREAKER_ACTIVE: "loss_streak_breaker_active",
+        REASON_INTRADAY_DRAWDOWN_BREAKER_ACTIVE: "intraday_drawdown_breaker_active",
+    }
+    return mapping.get(normalized, normalized)
+
+
+def _legacy_trading_mode_reasons(reason_codes: tuple[str, ...]) -> list[str]:
+    projected: list[str] = []
+    seen: set[str] = set()
+    for raw in reason_codes:
+        label = _legacy_trading_mode_reason(raw)
+        if not label or label in seen:
+            continue
+        seen.add(label)
+        projected.append(label)
+    return projected
 
 
 @dataclass(slots=True)
@@ -63,6 +196,7 @@ class Trader:
     strategy: WalletFollowerStrategy
     risk: RiskManager
     broker: Broker
+    pre_acquired_writer_lock: FileLock | None = None
     state: RiskState = field(init=False)
     log: logging.Logger = field(init=False)
     _cached_wallets: list[str] = field(init=False, default_factory=list)
@@ -82,11 +216,12 @@ class Trader:
     _recent_order_keys: dict[str, float] = field(init=False, default_factory=dict)
     _last_broker_reconcile_ts: float = field(init=False, default=0.0)
     _wallet_history_store: WalletHistoryStore | None = field(init=False, default=None)
-    _last_control_signature: tuple[str, bool, bool, bool, int, int] = field(
+    _last_control_signature: tuple[str, bool, bool, bool, int, int, int] = field(
         init=False,
-        default=("manual", False, False, False, 0, 0),
+        default=("manual", False, False, False, 0, 0, 0),
     )
     _last_operator_pending_cleanup_ts: int = field(init=False, default=0)
+    _last_operator_risk_breaker_clear_ts: int = field(init=False, default=0)
     _signal_seq: int = field(init=False, default=0)
     _cycle_seq: int = field(init=False, default=0)
     _trace_seq: int = field(init=False, default=0)
@@ -95,6 +230,8 @@ class Trader:
     _active_day_key: str = field(init=False, default="")
     _last_account_sync_ts: float = field(init=False, default=0.0)
     _last_broker_event_sync_ts: int = field(init=False, default=0)
+    _intent_local_status: dict[str, str] = field(init=False, default_factory=dict)
+    _ack_unknown_tracker: dict[str, dict[str, float | int | bool]] = field(init=False, default_factory=dict)
     startup_checks: list[dict[str, object]] = field(init=False, default_factory=list)
     startup_ready: bool = field(init=False, default=True)
     startup_warning_count: int = field(init=False, default=0)
@@ -102,6 +239,19 @@ class Trader:
     trading_mode: str = field(init=False, default="NORMAL")
     trading_mode_reasons: list[str] = field(init=False, default_factory=list)
     trading_mode_updated_ts: int = field(init=False, default=0)
+    admission_opening_allowed: bool = field(init=False, default=False)
+    admission_reduce_only: bool = field(init=False, default=True)
+    admission_halted: bool = field(init=False, default=False)
+    admission_auto_recover: bool = field(init=False, default=False)
+    admission_manual_confirmation_required: bool = field(init=False, default=True)
+    admission_latch_kind: str = field(init=False, default="manual")
+    admission_action_whitelist: tuple[str, ...] = field(init=False, default_factory=tuple)
+    admission_evidence_summary: dict[str, object] = field(init=False, default_factory=dict)
+    _admission_decision: AdmissionDecision = field(init=False, default_factory=AdmissionDecision.default)
+    _admission_auto_latch_active: bool = field(init=False, default=False)
+    _admission_trusted_consecutive_cycles: int = field(init=False, default=0)
+    _admission_bootstrap_protected: bool = field(init=False, default=True)
+    _admission_internal_error_latched: bool = field(init=False, default=False)
     account_state_status: str = field(init=False, default="unknown")
     reconciliation_status: str = field(init=False, default="unknown")
     persistence_status: str = field(init=False, default="ok")
@@ -119,11 +269,66 @@ class Trader:
     _critical_notification_watermarks: dict[str, int] = field(init=False, default_factory=dict)
     _candidate_price_history_cache: dict[str, dict[str, object]] = field(init=False, default_factory=dict)
     _market_metadata_cache: dict[str, dict[str, object]] = field(init=False, default_factory=dict)
+    _state_store: StateStore | None = field(init=False, default=None)
+    _writer_lock: FileLock | None = field(init=False, default=None)
+    writer_scope: str = field(init=False, default="")
+    _recovery_conflicts: list[dict[str, object]] = field(init=False, default_factory=list)
+    _recovery_block_buy_latched: bool = field(init=False, default=False)
+    _kill_switch_state: dict[str, object] = field(init=False, default_factory=default_kill_switch_state)
+    _signer_security_snapshot: dict[str, object] = field(init=False, default_factory=dict)
+    _hot_wallet_cap_conflict_latched: bool = field(init=False, default=False)
+    _runner_heartbeat: dict[str, object] = field(init=False, default_factory=default_runner_heartbeat)
+    _buy_blocked_since_ts: int = field(init=False, default=0)
+    _risk_breaker_state: dict[str, object] = field(init=False, default_factory=dict)
+    _exposure_ledger: dict[tuple[str, str], dict[str, object]] = field(init=False, default_factory=dict)
+    _risk_ledger_status: str = field(init=False, default="ok")
+    _risk_breaker_status: str = field(init=False, default="ok")
 
     def __post_init__(self) -> None:
         self.state = RiskState()
         self.log = logging.getLogger("polybot")
+        self.startup_ready = False
         self.decision_mode = self._normalize_decision_mode(self.settings.decision_mode)
+        self.writer_scope = derive_writer_scope(
+            dry_run=bool(getattr(self.settings, "dry_run", True)),
+            funder_address=str(getattr(self.settings, "funder_address", "") or ""),
+            watch_wallets=str(getattr(self.settings, "watch_wallets", "") or ""),
+        )
+        self._refresh_signer_security_snapshot()
+        if bool(getattr(self.settings, "enable_single_writer", False)):
+            try:
+                if self.pre_acquired_writer_lock is not None:
+                    self._writer_lock = self.pre_acquired_writer_lock
+                    self._writer_lock.assert_active()
+                else:
+                    self._writer_lock = FileLock(
+                        self.settings.wallet_lock_path,
+                        timeout=2.0,
+                        writer_scope=self.writer_scope,
+                    )
+                    self._writer_lock.acquire()
+                self.log.info(
+                    "SINGLE_WRITER_ACQUIRED scope=%s lock_path=%s",
+                    self.writer_scope,
+                    self.settings.wallet_lock_path,
+                )
+            except SingleWriterLockError as exc:
+                self.log.error(
+                    "Single-writer lock failed path=%s scope=%s reason_code=%s err=%s",
+                    self.settings.wallet_lock_path,
+                    self.writer_scope,
+                    getattr(exc, "reason_code", ""),
+                    exc,
+                )
+                raise
+            except Exception as exc:
+                self.log.error(
+                    "Single-writer lock failed path=%s scope=%s err=%s",
+                    self.settings.wallet_lock_path,
+                    self.writer_scope,
+                    exc,
+                )
+                raise
         candidate_db_path = str(self.settings.candidate_db_path or "").strip()
         if candidate_db_path:
             self.candidate_store = PersonalTerminalStore(candidate_db_path)
@@ -138,6 +343,15 @@ class Trader:
             log_path=str(getattr(self.settings, "notify_log_path", "") or ""),
         )
         self._active_day_key = self._utc_day_key()
+        self._state_store = StateStore(
+            self.settings.state_store_path,
+            writer_assertion=self._assert_writer_active if bool(getattr(self.settings, "enable_single_writer", False)) else None,
+        )
+        if bool(getattr(self.settings, "idempotency_enabled", True)):
+            try:
+                self._state_store.cleanup_idempotency(window_seconds=int(self.settings.idempotency_window_seconds))
+            except Exception:
+                self.log.warning("Idempotency cleanup failed path=%s", self.settings.state_store_path)
         self._wallet_history_store = WalletHistoryStore(
             client=self.data_client,
             cache_path=self.settings.wallet_history_path,
@@ -150,8 +364,30 @@ class Trader:
         self._maybe_sync_account_state(force=True)
         self._refresh_risk_state()
         self._run_startup_checks()
-        self._update_trading_mode(self.control_state, now=int(time.time()))
+        startup_now = int(time.time())
+        self._update_trading_mode(self.control_state, now=startup_now)
+        self._refresh_buy_blocked_state(now_ts=startup_now)
+        self._update_runner_heartbeat(now_ts=startup_now, loop_status=RUNNER_LOOP_STATUS_IDLE)
         self._refresh_risk_state()
+
+    def __del__(self) -> None:
+        try:
+            if self._writer_lock is not None:
+                self._writer_lock.release()
+        except Exception:
+            # Best-effort cleanup; do not raise during GC
+            pass
+
+    def _assert_writer_active(self) -> None:
+        if not bool(getattr(self.settings, "enable_single_writer", False)):
+            return
+        lock = self._writer_lock
+        if lock is None:
+            raise SingleWriterLockError(
+                "single-writer lock missing",
+                reason_code="single_writer_not_active",
+            )
+        lock.assert_active()
 
     def _tracked_notional_usd(self) -> float:
         return sum(max(0.0, float(pos.get("notional") or 0.0)) for pos in self.positions_book.values())
@@ -175,7 +411,229 @@ class Trader:
     def _pending_entry_orders(self) -> int:
         return sum(1 for order in self.pending_orders.values() if str(order.get("side") or "").upper() == "BUY")
 
+    def _risk_wallet_scope(self) -> str:
+        wallet = str(self.settings.funder_address or "").strip().lower()
+        return wallet or "default"
+
+    def _risk_portfolio_scope(self) -> str:
+        return str(self.writer_scope or self._risk_wallet_scope() or "default")
+
+    def _risk_timezone(self) -> timezone | ZoneInfo:
+        raw = str(getattr(self.settings, "risk_breaker_timezone", "UTC") or "UTC").strip() or "UTC"
+        try:
+            return ZoneInfo(raw)
+        except ZoneInfoNotFoundError:
+            self._risk_breaker_status = "invalid_timezone"
+            return timezone.utc
+        except Exception:
+            self._risk_breaker_status = "invalid_timezone"
+            return timezone.utc
+
+    def _risk_day_key(self, ts: int | None = None) -> str:
+        when = int(time.time()) if ts is None else int(ts)
+        tz = self._risk_timezone()
+        return datetime.fromtimestamp(max(0, when), tz=tz).strftime("%Y-%m-%d")
+
+    def _rebuild_exposure_ledger(self, *, now_ts: int) -> dict[tuple[str, str], dict[str, object]]:
+        bankroll = max(0.0, float(self.settings.bankroll_usd or 0.0))
+        wallet_cap = max(0.0, bankroll * float(getattr(self.settings, "max_wallet_exposure_pct", 1.0) or 0.0))
+        portfolio_cap = max(0.0, bankroll * float(getattr(self.settings, "max_portfolio_exposure_pct", 1.0) or 0.0))
+        condition_cap = (
+            max(0.0, bankroll * float(getattr(self.settings, "max_condition_exposure_pct", 0.0) or 0.0))
+            if bool(getattr(self.settings, "portfolio_netting_enabled", True))
+            else 0.0
+        )
+        wallet_scope = self._risk_wallet_scope()
+        portfolio_scope = self._risk_portfolio_scope()
+
+        wallet_filled = 0.0
+        wallet_pending_entry = 0.0
+        wallet_pending_exit = 0.0
+        portfolio_filled = 0.0
+        portfolio_pending_entry = 0.0
+        portfolio_pending_exit = 0.0
+        condition_filled: dict[str, float] = {}
+        condition_pending_entry: dict[str, float] = {}
+        condition_pending_exit: dict[str, float] = {}
+
+        for position in self.positions_book.values():
+            notional = max(0.0, float(position.get("notional") or 0.0))
+            if notional <= 0.0:
+                continue
+            wallet_filled += notional
+            portfolio_filled += notional
+            condition_key, _ = self._position_condition_exposure_key(position)
+            if condition_key:
+                condition_filled[condition_key] = condition_filled.get(condition_key, 0.0) + notional
+
+        for order in self.pending_orders.values():
+            side = str(order.get("side") or "").upper()
+            notional = max(0.0, float(order.get("requested_notional") or 0.0))
+            if notional <= 0.0:
+                continue
+            condition_key, _ = self._pending_order_condition_exposure_key(order)
+            if side == "BUY":
+                wallet_pending_entry += notional
+                portfolio_pending_entry += notional
+                if condition_key:
+                    condition_pending_entry[condition_key] = condition_pending_entry.get(condition_key, 0.0) + notional
+            elif side == "SELL":
+                wallet_pending_exit += notional
+                portfolio_pending_exit += notional
+                if condition_key:
+                    condition_pending_exit[condition_key] = condition_pending_exit.get(condition_key, 0.0) + notional
+
+        ledger: dict[tuple[str, str], dict[str, object]] = {}
+
+        def _make_entry(
+            *,
+            scope_type: str,
+            scope_key: str,
+            cap_notional_usd: float,
+            filled_notional_usd: float,
+            pending_entry_notional_usd: float,
+            pending_exit_notional_usd: float,
+            default_reason: str,
+            condition_scope: str = "",
+        ) -> dict[str, object]:
+            committed = max(0.0, filled_notional_usd + pending_entry_notional_usd)
+            blocked = cap_notional_usd > 0.0 and committed >= cap_notional_usd - 1e-9
+            entry = ExposureLedgerEntry(
+                scope_type=scope_type,
+                scope_key=scope_key,
+                valuation_currency="USD",
+                filled_exposure_notional_usd=max(0.0, filled_notional_usd),
+                pending_entry_exposure_notional_usd=max(0.0, pending_entry_notional_usd),
+                pending_exit_notional_usd=max(0.0, pending_exit_notional_usd),
+                committed_exposure_notional_usd=committed,
+                cap_notional_usd=max(0.0, cap_notional_usd),
+                blocked=blocked,
+                reason_code=default_reason if blocked else "",
+                wallet_scope=wallet_scope,
+                condition_scope=condition_scope,
+                updated_ts=int(now_ts),
+            )
+            return entry.to_payload()
+
+        wallet_entry = _make_entry(
+            scope_type="wallet",
+            scope_key=wallet_scope,
+            cap_notional_usd=wallet_cap,
+            filled_notional_usd=wallet_filled,
+            pending_entry_notional_usd=wallet_pending_entry,
+            pending_exit_notional_usd=wallet_pending_exit,
+            default_reason=REASON_WALLET_EXPOSURE_CAP_REACHED,
+        )
+        ledger[(str(wallet_entry["scope_type"]), str(wallet_entry["scope_key"]))] = wallet_entry
+
+        portfolio_entry = _make_entry(
+            scope_type="portfolio",
+            scope_key=portfolio_scope,
+            cap_notional_usd=portfolio_cap,
+            filled_notional_usd=portfolio_filled,
+            pending_entry_notional_usd=portfolio_pending_entry,
+            pending_exit_notional_usd=portfolio_pending_exit,
+            default_reason=REASON_PORTFOLIO_EXPOSURE_CAP_REACHED,
+        )
+        ledger[(str(portfolio_entry["scope_type"]), str(portfolio_entry["scope_key"]))] = portfolio_entry
+
+        condition_keys = set(condition_filled.keys()) | set(condition_pending_entry.keys()) | set(condition_pending_exit.keys())
+        for condition_key in sorted(condition_keys):
+            entry = _make_entry(
+                scope_type="condition",
+                scope_key=condition_key,
+                cap_notional_usd=condition_cap,
+                filled_notional_usd=condition_filled.get(condition_key, 0.0),
+                pending_entry_notional_usd=condition_pending_entry.get(condition_key, 0.0),
+                pending_exit_notional_usd=condition_pending_exit.get(condition_key, 0.0),
+                default_reason=REASON_CONDITION_EXPOSURE_CAP_REACHED,
+                condition_scope=condition_key,
+            )
+            ledger[(str(entry["scope_type"]), str(entry["scope_key"]))] = entry
+
+        return ledger
+
+    def _entry_lookup(self, *, scope_type: str, scope_key: str) -> dict[str, object]:
+        return dict(self._exposure_ledger.get((scope_type, scope_key)) or {})
+
+    def _refresh_risk_breaker_state(self, *, now_ts: int) -> None:
+        try:
+            baseline = RiskBreakerState.from_payload(
+                self._risk_breaker_state or default_risk_breaker_state(day_key=self._risk_day_key(now_ts), now_ts=now_ts)
+            )
+            if str(baseline.valuation_currency or "USD").upper() != "USD":
+                raise ValueError("risk_breaker_state_invalid_currency")
+            if baseline.day_key and not re.match(r"^\d{4}-\d{2}-\d{2}$", str(baseline.day_key)):
+                raise ValueError("risk_breaker_state_invalid_day_key")
+            day_key = self._risk_day_key(now_ts)
+            reset_next_day = bool(getattr(self.settings, "risk_breaker_reset_next_day", True))
+            manual_persists = bool(getattr(self.settings, "risk_breaker_manual_lock_persists_across_day", True))
+            if not baseline.day_key:
+                baseline.day_key = day_key
+            if day_key != baseline.day_key and reset_next_day:
+                baseline.day_key = day_key
+                baseline.equity_peak_usd = 0.0
+                baseline.intraday_drawdown_pct = 0.0
+                baseline.intraday_drawdown_blocked = False
+                if not (baseline.manual_lock and manual_persists):
+                    baseline.loss_streak_count = 0
+                    baseline.loss_streak_blocked = False
+                    baseline.manual_required = False
+                    baseline.manual_lock = False
+
+            equity_now = max(0.0, float(self.state.equity_usd or 0.0))
+            if equity_now <= 0.0:
+                if baseline.equity_now_usd > 0.0:
+                    equity_now = float(baseline.equity_now_usd)
+                else:
+                    equity_now = max(0.0, float(self.settings.bankroll_usd))
+            if baseline.equity_peak_usd <= 0.0:
+                baseline.equity_peak_usd = max(equity_now, float(self.settings.bankroll_usd or 0.0), 1.0)
+            if equity_now > baseline.equity_peak_usd:
+                baseline.equity_peak_usd = equity_now
+            baseline.equity_now_usd = equity_now
+            drawdown_limit = max(0.0, float(getattr(self.settings, "intraday_drawdown_breaker_pct", 0.0) or 0.0))
+            baseline.intraday_drawdown_limit_pct = drawdown_limit
+            if baseline.equity_peak_usd > 0.0:
+                baseline.intraday_drawdown_pct = max(
+                    0.0, (baseline.equity_peak_usd - baseline.equity_now_usd) / baseline.equity_peak_usd
+                )
+            else:
+                baseline.intraday_drawdown_pct = 0.0
+            has_loss_evidence = float(self.state.effective_daily_realized_pnl or 0.0) < -1e-9
+            baseline.intraday_drawdown_blocked = (
+                drawdown_limit > 0.0
+                and has_loss_evidence
+                and baseline.intraday_drawdown_pct >= drawdown_limit - 1e-12
+            )
+            baseline.loss_streak_limit = max(1, int(getattr(self.settings, "loss_streak_breaker_limit", 1) or 1))
+            baseline.loss_streak_blocked = baseline.loss_streak_count >= baseline.loss_streak_limit
+            reasons: list[str] = []
+            if baseline.loss_streak_blocked:
+                reasons.append(REASON_LOSS_STREAK_BREAKER_ACTIVE)
+            if baseline.intraday_drawdown_blocked:
+                reasons.append(REASON_INTRADAY_DRAWDOWN_BREAKER_ACTIVE)
+            if baseline.manual_lock:
+                reasons.append("risk_breaker_manual_lock")
+            baseline.reason_codes = tuple(reasons)
+            baseline.manual_required = bool(baseline.manual_lock)
+            baseline.opening_allowed = not reasons
+            baseline.valuation_currency = "USD"
+            baseline.timezone = str(getattr(self.settings, "risk_breaker_timezone", "UTC") or "UTC").strip() or "UTC"
+            baseline.updated_ts = int(now_ts)
+            self._risk_breaker_state = baseline.to_payload()
+        except Exception:
+            self._risk_breaker_status = "invalid"
+            fallback = RiskBreakerState.from_payload(default_risk_breaker_state(day_key=self._risk_day_key(now_ts), now_ts=now_ts))
+            fallback.opening_allowed = False
+            fallback.manual_required = True
+            fallback.manual_lock = True
+            fallback.reason_codes = (RISK_REASON_BREAKER_STATE_INVALID,)
+            fallback.updated_ts = int(now_ts)
+            self._risk_breaker_state = fallback.to_payload()
+
     def _refresh_risk_state(self) -> None:
+        now_ts = int(time.time())
         self.state.open_positions = len(self.positions_book)
         self.state.tracked_notional_usd = self._tracked_notional_usd()
         self.state.pending_entry_notional_usd = self._pending_entry_notional_usd()
@@ -188,6 +646,57 @@ class Trader:
         self.state.account_state_status = str(self.account_state_status or "unknown")
         self.state.reconciliation_status = str(self.reconciliation_status or "unknown")
         self.state.persistence_status = str(self.persistence_status or "ok")
+        self.state.valuation_currency = "USD"
+
+        try:
+            self._exposure_ledger = self._rebuild_exposure_ledger(now_ts=now_ts)
+            self._risk_ledger_status = "ok"
+        except Exception:
+            self._risk_ledger_status = "fault"
+            self._exposure_ledger = {}
+        self._risk_breaker_status = "ok"
+        self._refresh_risk_breaker_state(now_ts=now_ts)
+        self.state.risk_ledger_status = str(self._risk_ledger_status or "fault")
+        self.state.risk_breaker_status = str(self._risk_breaker_status or "invalid")
+
+        wallet_entry = self._entry_lookup(scope_type="wallet", scope_key=self._risk_wallet_scope())
+        portfolio_entry = self._entry_lookup(scope_type="portfolio", scope_key=self._risk_portfolio_scope())
+        self.state.wallet_exposure_committed_usd = float(wallet_entry.get("committed_exposure_notional_usd") or 0.0)
+        self.state.wallet_exposure_cap_usd = float(wallet_entry.get("cap_notional_usd") or 0.0)
+        self.state.portfolio_exposure_committed_usd = float(portfolio_entry.get("committed_exposure_notional_usd") or 0.0)
+        self.state.portfolio_exposure_cap_usd = float(portfolio_entry.get("cap_notional_usd") or 0.0)
+
+        breaker = RiskBreakerState.from_payload(self._risk_breaker_state)
+        self.state.loss_streak_count = int(breaker.loss_streak_count or 0)
+        self.state.loss_streak_limit = int(breaker.loss_streak_limit or 0)
+        self.state.loss_streak_blocked = bool(breaker.loss_streak_blocked)
+        self.state.intraday_drawdown_pct = float(breaker.intraday_drawdown_pct or 0.0)
+        self.state.intraday_drawdown_limit_pct = float(breaker.intraday_drawdown_limit_pct or 0.0)
+        self.state.intraday_drawdown_blocked = bool(breaker.intraday_drawdown_blocked)
+        self.state.risk_breaker_opening_allowed = bool(breaker.opening_allowed)
+        self.state.risk_breaker_reason_codes = tuple(str(item) for item in breaker.reason_codes if str(item).strip())
+        self.state.risk_day_key = str(breaker.day_key or "")
+        self.state.condition_exposure_key = ""
+        self.state.condition_exposure_committed_usd = 0.0
+        self.state.condition_exposure_cap_usd = (
+            max(0.0, float(self.settings.bankroll_usd) * float(self.settings.max_condition_exposure_pct))
+            if bool(getattr(self.settings, "portfolio_netting_enabled", True))
+            else 0.0
+        )
+
+    def _hydrate_signal_condition_exposure(self, signal: Signal) -> None:
+        condition_key, _ = self._signal_condition_exposure_key(signal)
+        condition_entry = self._entry_lookup(scope_type="condition", scope_key=condition_key)
+        self.state.condition_exposure_key = condition_key
+        self.state.condition_exposure_committed_usd = float(condition_entry.get("committed_exposure_notional_usd") or 0.0)
+        self.state.condition_exposure_cap_usd = float(
+            condition_entry.get("cap_notional_usd")
+            or (
+                max(0.0, float(self.settings.bankroll_usd) * float(self.settings.max_condition_exposure_pct))
+                if bool(getattr(self.settings, "portfolio_netting_enabled", True))
+                else 0.0
+            )
+        )
 
     def _available_notional_usd(self) -> float:
         pending_entry_notional = self._pending_entry_notional_usd()
@@ -313,6 +822,303 @@ class Trader:
             restored[key] = expire_ts
         if restored:
             self._recent_order_keys = restored
+
+    def _claim_idempotency(self, signal: Signal, notional_usd: float) -> tuple[bool, str | None]:
+        if not bool(getattr(self.settings, "idempotency_enabled", False)):
+            return (True, None)
+        if self._state_store is None:
+            return (True, None)
+        uuid = self._strategy_order_uuid(signal, notional_usd)
+        claimed = False
+        try:
+            claimed = self._state_store.register_idempotency(
+                strategy_order_uuid=uuid,
+                wallet=str(signal.wallet or ""),
+                condition_id=str(signal.condition_id or ""),
+                token_id=str(signal.token_id or ""),
+                side=str(signal.side or ""),
+                notional=float(notional_usd),
+            )
+        except Exception as exc:
+            self.log.warning("Idempotency claim failed uuid=%s err=%s", uuid, exc)
+            return (False, uuid)
+        return (claimed, uuid)
+
+    def _ack_unknown_window_seconds(self) -> int:
+        return max(30, int(getattr(self.settings, "ack_unknown_recovery_window_seconds", 300) or 300))
+
+    def _ack_unknown_max_probes(self) -> int:
+        return max(1, int(getattr(self.settings, "ack_unknown_max_probes", 3) or 3))
+
+    def _intent_strategy_name(self) -> str:
+        configured = str(getattr(self.settings, "strategy_name", "") or "").strip().lower()
+        if configured:
+            return configured
+        strategy_obj = getattr(self, "strategy", None)
+        strategy_name = str(type(strategy_obj).__name__ if strategy_obj is not None else "strategy").strip().lower()
+        return strategy_name or "strategy"
+
+    def _intent_signal_source(self, signal: Signal) -> str:
+        from_signal = str(getattr(signal, "signal_source", "") or "").strip().lower()
+        if from_signal:
+            return from_signal
+        configured = str(getattr(self.settings, "wallet_signal_source", "") or "").strip().lower()
+        return configured or "unknown"
+
+    @staticmethod
+    def _signal_timestamp_epoch(signal: Signal) -> int:
+        try:
+            ts = getattr(signal, "timestamp", None)
+            if ts is None:
+                return int(time.time())
+            return int(ts.timestamp())  # datetime
+        except Exception:
+            return int(time.time())
+
+    def _intent_signal_fingerprint(self, signal: Signal, notional_usd: float) -> str:
+        notional_cents = int(round(self._safe_float(notional_usd) * 100.0))
+        basis = "|".join(
+            [
+                str(signal.wallet or "").strip().lower(),
+                str(signal.condition_id or "").strip().lower(),
+                str(signal.token_id or "").strip().lower(),
+                str(signal.side or "").strip().upper(),
+                str(signal.market_slug or "").strip().lower(),
+                str(signal.outcome or "").strip().lower(),
+                str(notional_cents),
+            ]
+        )
+        digest = hashlib.sha256(basis.encode("utf-8")).hexdigest()
+        return digest[:32]
+
+    def _build_intent_identity(self, signal: Signal, notional_usd: float) -> dict[str, object]:
+        strategy_name = self._intent_strategy_name()
+        signal_source = self._intent_signal_source(signal)
+        signal_fingerprint = self._intent_signal_fingerprint(signal, notional_usd)
+        notional_cents = int(round(self._safe_float(notional_usd) * 100.0))
+        bucket_seconds = max(1, int(getattr(self.settings, "idempotency_signal_bucket_seconds", 300) or 300))
+        signal_bucket = self._signal_timestamp_epoch(signal) // bucket_seconds
+        idempotency_key = build_intent_idempotency_key(
+            strategy_name=strategy_name,
+            signal_source=signal_source,
+            signal_fingerprint=signal_fingerprint,
+            token_id=str(signal.token_id or ""),
+            side=str(signal.side or ""),
+            salt=str(getattr(self.settings, "intent_idempotency_salt", "") or ""),
+            extra={
+                "wallet": str(signal.wallet or "").strip().lower(),
+                "condition_id": str(signal.condition_id or "").strip().lower(),
+                "notional_cents": notional_cents,
+                "signal_bucket": int(signal_bucket),
+            },
+        )
+        strategy_order_uuid = f"so-{idempotency_key[:24]}"
+        intent_id = f"intent-{idempotency_key[:24]}"
+        return {
+            "strategy_name": strategy_name,
+            "signal_source": signal_source,
+            "signal_fingerprint": signal_fingerprint,
+            "signal_bucket": int(signal_bucket),
+            "idempotency_key": idempotency_key,
+            "strategy_order_uuid": strategy_order_uuid,
+            "intent_id": intent_id,
+            "notional_cents": notional_cents,
+        }
+
+    def _set_intent_status(
+        self,
+        *,
+        strategy_order_uuid: str,
+        idempotency_key: str,
+        status: str,
+        broker_order_id: str | None = None,
+        payload_updates: dict[str, object] | None = None,
+        recovery_reason: str | None = None,
+        expected_from_statuses: list[str] | tuple[str, ...] | None = None,
+    ) -> tuple[bool, dict[str, object]]:
+        normalized = normalize_intent_status(status)
+        if not strategy_order_uuid and not idempotency_key:
+            return (False, {})
+        if normalized:
+            self._intent_local_status[strategy_order_uuid] = normalized
+        if self._state_store is None:
+            return (False, {})
+        update_status = getattr(self._state_store, "update_intent_status", None)
+        if not callable(update_status):
+            return (False, {})
+        try:
+            ok, updated_intent = update_status(
+                strategy_order_uuid=strategy_order_uuid,
+                idempotency_key=idempotency_key,
+                status=normalized,
+                broker_order_id=broker_order_id,
+                payload_updates=payload_updates,
+                recovery_reason=recovery_reason,
+                expected_from_statuses=expected_from_statuses,
+            )
+        except Exception as exc:
+            self.log.warning("update_intent_status failed uuid=%s key=%s err=%s", strategy_order_uuid, idempotency_key, exc)
+            return (False, {})
+        if not ok or updated_intent is None:
+            return (False, {})
+        if hasattr(updated_intent, "to_row"):
+            row = dict(updated_intent.to_row())
+        elif isinstance(updated_intent, Mapping):
+            row = dict(updated_intent)
+        else:
+            row = {}
+        return (ok, row)
+
+    def _record_ack_unknown_probe(
+        self,
+        strategy_order_uuid: str,
+        *,
+        current_count: int = 0,
+        current_first_ts: int = 0,
+    ) -> dict[str, object]:
+        now = time.time()
+        state = dict(self._ack_unknown_tracker.get(strategy_order_uuid) or {})
+        first_ts = float(state.get("first_ts") or current_first_ts or now)
+        count = int(max(int(state.get("count") or 0), int(current_count or 0)))
+        if now - first_ts > self._ack_unknown_window_seconds():
+            first_ts = now
+            count = 0
+        count += 1
+        manual_required = count > self._ack_unknown_max_probes()
+        state.update({
+            "first_ts": first_ts,
+            "count": count,
+            "manual_required": manual_required,
+        })
+        self._ack_unknown_tracker[strategy_order_uuid] = state
+        return state
+
+    def _normalize_claim_result(self, raw_result: object, default_intent: dict[str, object]) -> tuple[str, dict[str, object]]:
+        claim_status = STORAGE_ERROR
+        intent = dict(default_intent)
+        if isinstance(raw_result, tuple) and len(raw_result) >= 2:
+            claim_status = str(raw_result[0] or STORAGE_ERROR)
+            if hasattr(raw_result[1], "to_row"):
+                intent.update(dict(raw_result[1].to_row()))
+            elif isinstance(raw_result[1], Mapping):
+                intent.update(dict(raw_result[1]))
+        elif isinstance(raw_result, Mapping):
+            claim_status = str(raw_result.get("claim_status") or raw_result.get("status") or STORAGE_ERROR)
+            intent_payload = raw_result.get("intent") or raw_result
+            if isinstance(intent_payload, Mapping):
+                intent.update(dict(intent_payload))
+
+        payload = dict(intent.get("payload") or {})
+        intent_status = normalize_intent_status(intent.get("status") or INTENT_STATUS_NEW)
+        ack_count = int(payload.get("ack_unknown_count") or intent.get("ack_unknown_count") or intent.get("ack_count") or 0)
+        ack_first_ts = int(payload.get("ack_unknown_first_ts") or intent.get("ack_unknown_first_ts") or intent.get("ack_first_ts") or 0)
+        now_ts = int(time.time())
+        within_window = ack_first_ts == 0 or (now_ts - ack_first_ts) <= self._ack_unknown_window_seconds()
+        if ack_count > self._ack_unknown_max_probes() and within_window:
+            intent_status = INTENT_STATUS_MANUAL_REQUIRED
+        tracker = self._ack_unknown_tracker.get(str(intent.get("strategy_order_uuid") or "")) or {}
+        if bool(tracker.get("manual_required")):
+            intent_status = INTENT_STATUS_MANUAL_REQUIRED
+        intent["status"] = intent_status or INTENT_STATUS_NEW
+        if ack_count:
+            intent["ack_unknown_count"] = ack_count
+        if ack_first_ts:
+            intent["ack_unknown_first_ts"] = ack_first_ts
+        return (claim_status, intent)
+
+    def _claim_or_load_intent(
+        self,
+        *,
+        signal: Signal,
+        notional_usd: float,
+        identity: Mapping[str, object],
+    ) -> tuple[str, dict[str, object]]:
+        strategy_order_uuid = str(identity.get("strategy_order_uuid") or "")
+        idempotency_key = str(identity.get("idempotency_key") or "")
+        signal_bucket = int(identity.get("signal_bucket") or 0)
+        intent = {
+            "strategy_order_uuid": strategy_order_uuid,
+            "idempotency_key": idempotency_key,
+            "intent_id": str(identity.get("intent_id") or strategy_order_uuid),
+            "strategy_name": str(identity.get("strategy_name") or ""),
+            "signal_source": str(identity.get("signal_source") or ""),
+            "signal_fingerprint": str(identity.get("signal_fingerprint") or ""),
+            "token_id": str(signal.token_id or ""),
+            "condition_id": str(signal.condition_id or ""),
+            "side": str(signal.side or ""),
+            "status": INTENT_STATUS_NEW,
+            "payload": {
+                "signal_id": str(signal.signal_id or ""),
+                "trace_id": str(signal.trace_id or ""),
+                "wallet": str(signal.wallet or ""),
+                "requested_notional": float(notional_usd),
+                "requested_price": float(signal.price_hint or 0.0),
+                "signal_bucket": signal_bucket,
+                "ack_unknown_count": 0,
+                "ack_unknown_first_ts": 0,
+            },
+        }
+        if not bool(getattr(self.settings, "idempotency_enabled", False)):
+            return (CLAIMED_NEW, intent)
+        if self._state_store is None:
+            return (STORAGE_ERROR, intent)
+
+        claim_fn = getattr(self._state_store, "claim_or_load_intent", None)
+        if callable(claim_fn):
+            try:
+                raw_result = claim_fn(
+                    idempotency_key=idempotency_key,
+                    intent_id=str(intent["intent_id"]),
+                    strategy_name=str(intent.get("strategy_name") or ""),
+                    signal_source=str(intent.get("signal_source") or ""),
+                    signal_fingerprint=str(intent.get("signal_fingerprint") or ""),
+                    strategy_order_uuid=strategy_order_uuid,
+                    token_id=str(signal.token_id or ""),
+                    side=str(signal.side or ""),
+                    condition_id=str(signal.condition_id or ""),
+                    status=INTENT_STATUS_NEW,
+                    payload=dict(intent.get("payload") or {}),
+                )
+                return self._normalize_claim_result(raw_result, intent)
+            except Exception as exc:
+                self.log.error("claim_or_load_intent failed uuid=%s err=%s", strategy_order_uuid, exc)
+                return (STORAGE_ERROR, intent | {"error": str(exc)})
+
+        return (STORAGE_ERROR, intent)
+
+    @staticmethod
+    def _is_ack_unknown_result(result: ExecutionResult) -> bool:
+        status = normalize_intent_status(getattr(result, "status", ""))
+        metadata = dict(getattr(result, "metadata", {}) or {})
+        if bool(metadata.get("ack_unknown")):
+            return True
+        if result.ok and not str(result.broker_order_id or "").strip():
+            return True
+        if status in {"ack_unknown", "unknown", "timeout"}:
+            return True
+        if not result.ok and status not in {"rejected", "failed", "canceled", "unmatched"} and str(result.broker_order_id or "").strip():
+            return True
+        return False
+
+    @staticmethod
+    def _strategy_order_uuid(signal: Signal, notional_usd: float) -> str:
+        try:
+            normalized_notional = float(notional_usd)
+        except Exception:
+            normalized_notional = 0.0
+        normalized = "|".join(
+            [
+                str(signal.wallet or "").strip().lower(),
+                str(signal.condition_id or "").strip().lower(),
+                str(signal.token_id or "").strip().lower(),
+                str(signal.side or "").upper(),
+                f"{normalized_notional:.4f}",
+                str(signal.market_slug or "").strip().lower(),
+                str(signal.signal_id or "").strip().lower(),
+            ]
+        )
+        digest = hashlib.sha1(normalized.encode("utf-8"), usedforsecurity=False).hexdigest()
+        return f"so-{digest[:20]}"
 
     def _pending_order_conflicts_with_signal(
         self,
@@ -641,6 +1447,69 @@ class Trader:
         }
         return list(points)
 
+    def _candidate_effective_expiry_ts(
+        self,
+        *,
+        created_ts: int,
+        market_slug: str = "",
+        market_end_ts: object = None,
+    ) -> int:
+        base_ts = int(created_ts or 0)
+        if base_ts <= 0:
+            return 0
+        expires_ts = base_ts + int(self.settings.candidate_lifetime_seconds)
+        resolved_market_end_ts = int(market_end_ts or 0) if market_end_ts not in (None, "") else 0
+        if resolved_market_end_ts <= 0:
+            _, _, legacy_market_end_ts = self._market_window_bounds(str(market_slug or ""))
+            resolved_market_end_ts = int(legacy_market_end_ts or 0)
+        if resolved_market_end_ts > 0:
+            expires_ts = min(expires_ts, resolved_market_end_ts)
+        return expires_ts
+
+    def _candidate_is_expired(
+        self,
+        candidate: Mapping[str, object],
+        *,
+        now_ts: int,
+    ) -> tuple[bool, int]:
+        created_ts = int(candidate.get("created_ts") or 0)
+        expires_ts = self._candidate_effective_expiry_ts(
+            created_ts=created_ts,
+            market_slug=str(candidate.get("market_slug") or ""),
+            market_end_ts=candidate.get("expires_ts"),
+        )
+        if expires_ts <= 0:
+            return False, 0
+        return expires_ts <= int(now_ts), expires_ts
+
+    def _expire_candidate_record(
+        self,
+        candidate_id: str,
+        *,
+        now_ts: int,
+        block_layer: str,
+        note: str,
+    ) -> dict[str, object] | None:
+        if self.candidate_store is None or not candidate_id:
+            return None
+        candidate = self.candidate_store.get_candidate(candidate_id)
+        if candidate is None:
+            return None
+        expired_now, expires_ts = self._candidate_is_expired(candidate, now_ts=now_ts)
+        if not expired_now:
+            return None
+        return self.candidate_store.update_candidate_status(
+            candidate_id,
+            status="expired",
+            note=note,
+            result_tag=REASON_CANDIDATE_LIFETIME_EXPIRED,
+            block_reason=REASON_CANDIDATE_LIFETIME_EXPIRED,
+            block_layer=block_layer,
+            lifecycle_state="expired_discarded",
+            expires_ts=expires_ts if expires_ts > 0 else None,
+            updated_ts=now_ts,
+        )
+
     @staticmethod
     def _normalize_price_history_point(row: object) -> tuple[int, float] | None:
         if isinstance(row, PriceHistoryPoint):
@@ -737,6 +1606,9 @@ class Trader:
         *,
         existing: Mapping[str, object] | None = None,
     ) -> str | None:
+        repeat_entry_reason = self._repeat_entry_block_reason(signal, existing)
+        if repeat_entry_reason:
+            return repeat_entry_reason
         has_orderbook = (
             market_context.get("current_best_ask") not in (None, "")
             or market_context.get("current_best_bid") not in (None, "")
@@ -764,11 +1636,6 @@ class Trader:
         market_closed = market_context.get("market_closed")
         market_active = market_context.get("market_active")
         market_accepting_orders = market_context.get("market_accepting_orders")
-        if signal.side == "BUY" and existing:
-            entry_wallet = str(existing.get("entry_wallet") or "").strip().lower()
-            signal_wallet = str(signal.wallet or "").strip().lower()
-            if entry_wallet and signal_wallet and entry_wallet != signal_wallet:
-                return "existing_position_conflict"
         if signal.side == "BUY":
             if market_closed is True:
                 return "market_closed"
@@ -825,7 +1692,7 @@ class Trader:
             return "close_partial"
         if skip_reason:
             return "watch"
-        if existing and float(existing.get("notional") or 0.0) > 0.0:
+        if existing and float(existing.get("notional") or 0.0) > 0.0 and not self._same_wallet_add_allowed(signal, existing):
             return "watch"
         if score >= 84.0 and str(signal.wallet_tier or "").upper() in {"HIGH", "CORE"}:
             return "follow"
@@ -864,6 +1731,12 @@ class Trader:
             return i18n_t("runner.candidateRecommendation.chaseTooHigh")
         if skip_reason == "momentum_too_weak":
             return i18n_t("runner.candidateRecommendation.momentumTooWeak")
+        if skip_reason == REASON_REPEAT_ENTRY_BLOCKED_EXISTING_POSITION:
+            return i18n_t("runner.candidateRecommendation.repeatEntryBlockedExistingPosition")
+        if skip_reason == REASON_SAME_WALLET_ADD_NOT_ALLOWED:
+            return i18n_t("runner.candidateRecommendation.sameWalletAddNotAllowed")
+        if skip_reason == REASON_CROSS_WALLET_REPEAT_ENTRY_BLOCKED:
+            return i18n_t("runner.candidateRecommendation.crossWalletRepeatEntryBlocked")
         if skip_reason == "existing_position_conflict":
             return i18n_t("runner.candidateRecommendation.existingPositionConflict")
         if signal.side == "SELL":
@@ -1047,14 +1920,14 @@ class Trader:
 
         if existing and float(existing.get("notional") or 0.0) > 0.0:
             current_notional = float(existing.get("notional") or 0.0)
-            direction = "bearish" if skip_reason == "existing_position_conflict" else "neutral"
+            direction = "bearish" if skip_reason in REPEAT_ENTRY_BLOCK_REASONS or skip_reason == "existing_position_conflict" else "neutral"
             factors.append(
                 self._candidate_reason_factor(
                     "existing_position",
                     i18n_t("runner.candidateFactor.existingPosition.label"),
                     f"{current_notional:.2f}U",
                     direction=direction,
-                    weight=-6.0 if skip_reason == "existing_position_conflict" else 0.0,
+                    weight=-6.0 if skip_reason in REPEAT_ENTRY_BLOCK_REASONS or skip_reason == "existing_position_conflict" else 0.0,
                     detail=str(existing.get("entry_reason") or existing.get("reason") or i18n_t("runner.candidateFactor.existingPosition.detailDefault")),
                 )
             )
@@ -1173,7 +2046,7 @@ class Trader:
         if chase_pct not in (None, "") and signal.side == "BUY":
             market_bits.append(i18n_t("runner.candidateExplanation.marketBit.chase", {"value": f"{float(chase_pct):.2f}%"}))
         if market_bits:
-            notes.append(i18n_t("runner.candidateExplanation.marketPrefix", {"bits": self._notification_separator().join(market_bits)}))
+            notes.append(i18n_t("runner.candidateExplanation.marketPrefix", {"bits": Trader._notification_separator().join(market_bits)}))
         market_status_bits: list[str] = []
         if market_context.get("market_closed") is True:
             market_status_bits.append(i18n_t("runner.candidateExplanation.marketStatusBit.closed"))
@@ -1181,9 +2054,11 @@ class Trader:
             market_status_bits.append(i18n_t("runner.candidateExplanation.marketStatusBit.inactive"))
         elif market_context.get("market_accepting_orders") is False:
             market_status_bits.append(i18n_t("runner.candidateExplanation.marketStatusBit.acceptingOrdersFalse"))
+            market_status_bits.append("acceptingOrders=false")
         market_time_source = str(market_context.get("market_time_source") or "").strip()
         if market_time_source:
             market_status_bits.append(i18n_t("runner.candidateExplanation.marketStatusBit.timeSource", {"value": market_time_source}))
+            market_status_bits.append(f"time={market_time_source}")
         market_end_date = str(market_context.get("market_end_date") or "").strip()
         if market_end_date:
             market_status_bits.append(i18n_t("runner.candidateExplanation.marketStatusBit.endDate", {"value": market_end_date}))
@@ -1191,7 +2066,7 @@ class Trader:
         if market_remaining_seconds not in (None, ""):
             market_status_bits.append(i18n_t("runner.candidateExplanation.marketStatusBit.remainSeconds", {"seconds": int(market_remaining_seconds)}))
         if market_status_bits:
-            notes.append(i18n_t("runner.candidateExplanation.marketStatusPrefix", {"bits": self._notification_separator().join(market_status_bits)}))
+            notes.append(i18n_t("runner.candidateExplanation.marketStatusPrefix", {"bits": Trader._notification_separator().join(market_status_bits)}))
         if history_points > 0:
             notes.append(
                 i18n_t(
@@ -1266,7 +2141,7 @@ class Trader:
         market_context: Mapping[str, object] | None = None,
     ) -> Candidate:
         if existing is None:
-            existing = self.positions_book.get(signal.token_id)
+            existing = self._position_truth_for_token(signal.token_id)
         if market_context is None:
             market_context = self._candidate_market_context(
                 signal.token_id,
@@ -1307,11 +2182,12 @@ class Trader:
             existing=existing,
         )
         source_wallet_count = max(1, int(signal.exit_wallet_count or 0)) if bool(signal.cross_wallet_exit) else 1
-        created_ts = int(signal.timestamp.timestamp()) if isinstance(signal.timestamp, datetime) else now
-        expires_ts = created_ts + max(60, int(self.settings.candidate_ttl_seconds))
-        market_end_ts = market_context.get("market_end_ts")
-        if market_end_ts not in (None, ""):
-            expires_ts = min(expires_ts, int(market_end_ts))
+        created_ts = int(now or time.time())
+        expires_ts = self._candidate_effective_expiry_ts(
+            created_ts=created_ts,
+            market_slug=str(signal.market_slug or ""),
+            market_end_ts=market_context.get("market_end_ts"),
+        )
         status = "watched" if skip_reason or suggested_action == "watch" else "pending"
         return Candidate(
             id=str(signal.signal_id or ""),
@@ -1350,9 +2226,12 @@ class Trader:
             explanation=explanation,
             reason_factors=reason_factors,
             has_existing_position=existing is not None and float(existing.get("notional") or 0.0) > 0.0,
-            existing_position_conflict=skip_reason == "existing_position_conflict",
+            existing_position_conflict=skip_reason in REPEAT_ENTRY_BLOCK_REASONS or skip_reason == "existing_position_conflict",
             existing_position_notional=float((existing or {}).get("notional") or 0.0),
+            block_reason=str(skip_reason or ""),
+            block_layer="candidate" if skip_reason else "",
             status=status,
+            lifecycle_state="active",
             created_ts=created_ts,
             expires_ts=expires_ts,
             updated_ts=now,
@@ -1397,15 +2276,37 @@ class Trader:
     def _refresh_active_pending_candidates(self, *, now: int) -> None:
         if self.candidate_store is None:
             return
-        pending_candidates = list(self.candidate_store.list_candidates(statuses=["pending"], limit=1000) or [])
-        if not pending_candidates:
+        active_candidates = list(
+            self.candidate_store.list_candidates(
+                statuses=["pending", "approved", "queued", "watched", "requested", "submitted"],
+                limit=1000,
+                include_expired=True,
+            )
+            or []
+        )
+        if not active_candidates:
             return
 
         refreshed = 0
         expired = 0
-        for payload in pending_candidates:
+        for payload in active_candidates:
             candidate_id = str(payload.get("id") or "")
             if not candidate_id:
+                continue
+            expired_now, expires_ts = self._candidate_is_expired(payload, now_ts=now)
+            if expired_now:
+                self.candidate_store.update_candidate_status(
+                    candidate_id,
+                    status="expired",
+                    note="candidate_lifecycle:expired",
+                    result_tag=REASON_CANDIDATE_LIFETIME_EXPIRED,
+                    block_reason=REASON_CANDIDATE_LIFETIME_EXPIRED,
+                    block_layer="candidate",
+                    lifecycle_state="expired_discarded",
+                    expires_ts=expires_ts if expires_ts > 0 else None,
+                    updated_ts=now,
+                )
+                expired += 1
                 continue
             signal = self._candidate_to_signal(payload)
             if signal is None:
@@ -1414,14 +2315,19 @@ class Trader:
                     status="expired",
                     note="candidate_refresh:snapshot_missing",
                     result_tag="candidate_snapshot_missing",
+                    block_reason="candidate_snapshot_missing",
+                    block_layer="candidate",
+                    lifecycle_state="expired_discarded",
                     updated_ts=now,
                 )
                 expired += 1
                 continue
             if str(signal.side or "").upper() != "BUY":
                 continue
+            if str(payload.get("status") or "").strip().lower() != "pending":
+                continue
 
-            existing = self.positions_book.get(signal.token_id)
+            existing = self._position_truth_for_token(signal.token_id)
             market_context = self._candidate_market_context(
                 signal.token_id,
                 price_hint=float(signal.price_hint or 0.0),
@@ -1437,9 +2343,11 @@ class Trader:
             refreshed_candidate.id = candidate_id
             refreshed_candidate.signal_id = str(payload.get("signal_id") or refreshed_candidate.signal_id or candidate_id)
             refreshed_candidate.status = str(payload.get("status") or refreshed_candidate.status or "pending")
+            refreshed_candidate.lifecycle_state = str(payload.get("lifecycle_state") or refreshed_candidate.lifecycle_state or "active")
             refreshed_candidate.selected_action = str(payload.get("selected_action") or refreshed_candidate.selected_action or "")
             refreshed_candidate.note = str(payload.get("note") or refreshed_candidate.note or "")
             refreshed_candidate.created_ts = int(payload.get("created_ts") or refreshed_candidate.created_ts or now)
+            refreshed_candidate.expires_ts = expires_ts if expires_ts > 0 else refreshed_candidate.expires_ts
             refreshed_candidate.updated_ts = now
 
             if refreshed_candidate.skip_reason:
@@ -1449,6 +2357,10 @@ class Trader:
                     selected_action=refreshed_candidate.suggested_action,
                     note=f"candidate_refresh:{refreshed_candidate.skip_reason}",
                     result_tag=f"candidate_revalidated_{refreshed_candidate.skip_reason}",
+                    block_reason=str(refreshed_candidate.skip_reason or ""),
+                    block_layer="candidate",
+                    lifecycle_state="expired_discarded",
+                    expires_ts=refreshed_candidate.expires_ts,
                     updated_ts=now,
                 )
                 expired += 1
@@ -1649,7 +2561,15 @@ class Trader:
     ) -> None:
         now_ts = int(now or time.time())
         mode = str(trading_mode_state.get("mode") or "NORMAL").upper() or "NORMAL"
-        reasons = {str(value or "").strip() for value in trading_mode_state.get("reason_codes", []) if str(value or "").strip()}
+        reasons = {
+            str(value or "").strip()
+            for value in (
+                self._admission_decision.reason_codes
+                if self._admission_decision and self._admission_decision.reason_codes
+                else tuple(trading_mode_state.get("reason_codes", []) or [])
+            )
+            if str(value or "").strip()
+        }
         if mode == "NORMAL":
             return
 
@@ -1669,6 +2589,7 @@ class Trader:
                 "error": str(failure.get("message") or i18n_t("notification.tradingMode.persistenceFault.errorUnknown")),
             }
             title = i18n_t("notification.tradingMode.persistenceFault.title", title_params)
+            title = f"{title} | halted"
             body = i18n_t("notification.tradingMode.persistenceFault.body", body_params)
             self._notify_critical_condition(
                 key=f"persistence_fault:{str(failure.get('kind') or 'unknown')}",
@@ -1688,13 +2609,14 @@ class Trader:
                 now=now_ts,
             )
 
-        if "startup_not_ready" in reasons:
+        if REASON_STARTUP_CHECKS_FAIL in reasons:
             title_params = {"mode": mode_label}
             body_params = {
                 "failures": int(self.startup_failure_count or 0),
                 "warnings": int(self.startup_warning_count or 0),
             }
             title = i18n_t("notification.tradingMode.startupGateBlocked.title", title_params)
+            title = f"{title} | startup gate blocked"
             body = i18n_t("notification.tradingMode.startupGateBlocked.body", body_params)
             self._notify_critical_condition(
                 key="startup_gate_blocked",
@@ -1715,7 +2637,10 @@ class Trader:
                 now=now_ts,
             )
 
-        if "account_state_unknown" in reasons or "account_state_stale" in reasons:
+        if (
+            REASON_STALE_ACCOUNT_SNAPSHOT in reasons
+            or REASON_STALE_BROKER_EVENT_STREAM in reasons
+        ):
             title_params = {"mode": mode_label}
             body_params = {
                 "accountState": i18n_enum_label("enum.accountState", str(self.account_state_status or "unknown"), fallback=i18n_humanize_identifier(str(self.account_state_status or "unknown"))),
@@ -1743,6 +2668,10 @@ class Trader:
         if (
             "reconciliation_fail" in reasons
             or "reconciliation_warn" in reasons
+            or REASON_LEDGER_DIFF_EXCEEDED in reasons
+            or REASON_AMBIGUOUS_PENDING_UNRESOLVED in reasons
+            or REASON_RECOVERY_CONFLICT_UNRESOLVED in reasons
+            or REASON_RECOVERY_CONFLICT_UNRESOLVED_MANUAL in reasons
             or ambiguous_pending_orders > 0
         ):
             issue_text = self._format_notification_issues(issues)
@@ -1753,7 +2682,9 @@ class Trader:
                 "issues": issue_text,
             }
             title = i18n_t("notification.tradingMode.reconciliationProtect.title", title_params)
+            title = f"{title} | reconciliation protect"
             body = i18n_t("notification.tradingMode.reconciliationProtect.body", body_params)
+            body = f"{body} | ambiguous_pending_orders={ambiguous_pending_orders}"
             self._notify_critical_condition(
                 key=(
                     "reconciliation:"
@@ -1911,13 +2842,32 @@ class Trader:
         if self.candidate_store is None:
             return []
         plans: list[dict[str, object]] = []
+        now_ts = int(time.time())
         for candidate in self.candidate_store.list_candidates(statuses=["approved"], limit=self.settings.max_signals_per_cycle):
+            expired_now, expires_ts = self._candidate_is_expired(candidate, now_ts=now_ts)
+            if expired_now:
+                self.candidate_store.update_candidate_status(
+                    str(candidate.get("id") or ""),
+                    status="expired",
+                    note="candidate_lifecycle:approved_queue_expired",
+                    result_tag=REASON_CANDIDATE_LIFETIME_EXPIRED,
+                    block_reason=REASON_CANDIDATE_LIFETIME_EXPIRED,
+                    block_layer="decision",
+                    lifecycle_state="expired_discarded",
+                    expires_ts=expires_ts if expires_ts > 0 else None,
+                    updated_ts=now_ts,
+                )
+                continue
             signal = self._candidate_to_signal(candidate)
             if signal is None:
                 self.candidate_store.update_candidate_status(
                     str(candidate.get("id") or ""),
                     status="expired",
                     result_tag="candidate_snapshot_missing",
+                    block_reason="candidate_snapshot_missing",
+                    block_layer="decision",
+                    lifecycle_state="expired_discarded",
+                    updated_ts=now_ts,
                 )
                 continue
             candidate_id = str(candidate.get("id") or "")
@@ -1925,7 +2875,8 @@ class Trader:
                 candidate_id,
                 status="queued",
                 selected_action=str(candidate.get("selected_action") or ""),
-                updated_ts=int(time.time()),
+                lifecycle_state="active",
+                updated_ts=now_ts,
             )
             plans.append(
                 {
@@ -2227,9 +3178,18 @@ class Trader:
         )
 
     def _apply_realized_pnl(self, realized_pnl: float, *, ts: int) -> None:
-        if abs(realized_pnl) <= 1e-9:
-            return
         self._roll_daily_state_if_needed(ts)
+        current_breaker = RiskBreakerState.from_payload(self._risk_breaker_state)
+        epsilon = 1e-9
+        if realized_pnl < -epsilon:
+            current_breaker.loss_streak_count = int(current_breaker.loss_streak_count or 0) + 1
+        elif realized_pnl > epsilon:
+            current_breaker.loss_streak_count = 0
+        current_breaker.loss_streak_limit = max(1, int(getattr(self.settings, "loss_streak_breaker_limit", 1) or 1))
+        current_breaker.loss_streak_blocked = current_breaker.loss_streak_count >= current_breaker.loss_streak_limit
+        self._risk_breaker_state = current_breaker.to_payload()
+        if abs(realized_pnl) <= epsilon:
+            return
         self.state.daily_realized_pnl += realized_pnl
 
     def _apply_reconciled_realized_pnl(
@@ -2564,6 +3524,21 @@ class Trader:
             if not broker_check_names.intersection({"operator_prechecks", "live_admission"}):
                 raw_checks.append(self._live_admission_startup_check())
             raw_checks.append(self._network_smoke_startup_check())
+            cap_check = self._hot_wallet_cap_startup_check()
+            if isinstance(cap_check, dict):
+                raw_checks.append(cap_check)
+        if self._recovery_block_buy_latched:
+            raw_checks.append(
+                {
+                    "name": "recovery_conflict",
+                    "status": "FAIL",
+                    "message": f"startup recovery has unresolved conflicts ({len(self._recovery_conflicts)})",
+                    "details": {
+                        "count": int(len(self._recovery_conflicts)),
+                        "conflicts": list(self._recovery_conflicts),
+                    },
+                }
+            )
 
         normalized = []
         for row in raw_checks:
@@ -2665,6 +3640,9 @@ class Trader:
             if status != "fail":
                 status = "warn"
             issues.append(f"ambiguous_pending_orders={ambiguous_pending_orders}")
+        if self._recovery_block_buy_latched:
+            status = "fail"
+            issues.append(f"recovery_conflicts={len(self._recovery_conflicts)}")
         if (
             not self.settings.dry_run
             and account_snapshot_age_seconds > max(600, int(self.settings.account_sync_refresh_seconds) * 2)
@@ -2695,6 +3673,7 @@ class Trader:
             "day_key": day_key,
             "status": status,
             "issues": issues,
+            "recovery_conflicts": list(self._recovery_conflicts),
             "startup_ready": bool(self.startup_ready),
             "internal_realized_pnl": internal_pnl,
             "ledger_realized_pnl": ledger_pnl,
@@ -2739,12 +3718,134 @@ class Trader:
             return "stale"
         return "fresh"
 
+    def _refresh_signer_security_snapshot(self) -> None:
+        raw_key_detected = bool(
+            (not bool(getattr(self.settings, "dry_run", True)))
+            and str(getattr(self.settings, "private_key", "") or "").strip()
+        )
+        summary: dict[str, object] = {}
+        broker_summary = getattr(self.broker, "security_summary", None)
+        if callable(broker_summary):
+            try:
+                payload = broker_summary()
+                if isinstance(payload, dict):
+                    summary = dict(payload)
+            except Exception:
+                summary = {}
+        snapshot = SignerStatusSnapshot(
+            live_mode=not bool(getattr(self.settings, "dry_run", True)),
+            signer_required=not bool(getattr(self.settings, "dry_run", True)),
+            signer_mode=str(summary.get("signer_mode") or ("none" if bool(getattr(self.settings, "dry_run", True)) else "unknown")),
+            signer_healthy=bool(summary.get("signer_healthy", bool(getattr(self.settings, "dry_run", True)))),
+            signer_identity_matched=bool(summary.get("signer_identity_matched", bool(getattr(self.settings, "dry_run", True)))),
+            api_identity_matched=bool(summary.get("api_identity_matched", bool(getattr(self.settings, "dry_run", True)))),
+            broker_identity_matched=bool(
+                summary.get(
+                    "broker_identity_matched",
+                    bool(str(getattr(self.settings, "funder_address", "") or "").strip() or getattr(self.settings, "dry_run", True)),
+                )
+            ),
+            raw_key_detected=raw_key_detected,
+            funder_identity_present=bool(str(getattr(self.settings, "funder_address", "") or "").strip()),
+            api_creds_configured=bool(summary.get("api_creds_configured", bool(getattr(self.settings, "dry_run", True)))),
+            hot_wallet_cap_enabled=bool(summary.get("hot_wallet_cap_enabled", False)),
+            hot_wallet_cap_ok=bool(summary.get("hot_wallet_cap_ok", True)),
+            hot_wallet_cap_limit_usd=float(summary.get("hot_wallet_cap_limit_usd") or 0.0),
+            hot_wallet_cap_value_usd=float(summary.get("hot_wallet_cap_value_usd") or 0.0),
+            reason_codes=list(summary.get("reason_codes") or []),
+            last_checked_ts=int(summary.get("last_checked_ts") or int(time.time())),
+        )
+        payload = snapshot.as_state_payload()
+        if raw_key_detected:
+            reason_codes = list(payload.get("reason_codes") or [])
+            if "raw_private_key_forbidden_live" not in reason_codes:
+                reason_codes.append("raw_private_key_forbidden_live")
+            payload["reason_codes"] = reason_codes
+            payload["signer_healthy"] = False
+        self._signer_security_snapshot = payload
+
+    def signer_security_state(self) -> dict[str, object]:
+        return dict(self._signer_security_snapshot or {})
+
+    def _hot_wallet_cap_threshold_usd(self) -> float:
+        return max(0.0, float(getattr(self.settings, "live_hot_wallet_balance_cap_usd", 0.0) or 0.0))
+
+    def _hot_wallet_cap_state(self, *, now: int | None = None) -> dict[str, object]:
+        now_ts = int(now or time.time())
+        cap = self._hot_wallet_cap_threshold_usd()
+        equity = max(0.0, float(self.state.equity_usd or 0.0))
+        if equity <= 0.0:
+            equity = max(
+                0.0,
+                float(self.state.cash_balance_usd or 0.0) + float(self.state.positions_value_usd or 0.0),
+            )
+        enabled = (not bool(self.settings.dry_run)) and cap > 0.0
+        exceeded = bool(enabled and equity > cap)
+        return {
+            "enabled": bool(enabled),
+            "exceeded": bool(exceeded),
+            "cap_usd": float(cap),
+            "equity_usd": float(equity),
+            "now_ts": now_ts,
+        }
+
+    def _hot_wallet_cap_startup_check(self, *, now: int | None = None) -> dict[str, object] | None:
+        state = self._hot_wallet_cap_state(now=now)
+        if not bool(state.get("enabled", False)):
+            return None
+        cap_usd = float(state.get("cap_usd") or 0.0)
+        equity_usd = float(state.get("equity_usd") or 0.0)
+        exceeded = bool(state.get("exceeded", False))
+        return {
+            "name": "hot_wallet_cap",
+            "status": "FAIL" if exceeded else "PASS",
+            "message": (
+                f"hot wallet equity {equity_usd:.2f} exceeds cap {cap_usd:.2f}"
+                if exceeded
+                else f"hot wallet cap ok ({equity_usd:.2f}/{cap_usd:.2f})"
+            ),
+            "details": {
+                "cap_usd": cap_usd,
+                "equity_usd": equity_usd,
+                "exceeded": exceeded,
+            },
+        }
+
+    def _enforce_hot_wallet_cap(self, *, now: int | None = None) -> None:
+        state = self._hot_wallet_cap_state(now=now)
+        signer_security = dict(self._signer_security_snapshot or {})
+        signer_security["hot_wallet_cap_enabled"] = bool(state.get("enabled", False))
+        signer_security["hot_wallet_cap_ok"] = not bool(state.get("exceeded", False))
+        signer_security["hot_wallet_cap_limit_usd"] = float(state.get("cap_usd") or 0.0)
+        signer_security["hot_wallet_cap_value_usd"] = float(state.get("equity_usd") or 0.0)
+        signer_security["last_checked_ts"] = int(state.get("now_ts") or int(time.time()))
+        reason_codes = list(signer_security.get("reason_codes") or [])
+        if bool(state.get("exceeded", False)):
+            if "hot_wallet_cap_exceeded" not in reason_codes:
+                reason_codes.append("hot_wallet_cap_exceeded")
+        else:
+            reason_codes = [code for code in reason_codes if str(code) != "hot_wallet_cap_exceeded"]
+        signer_security["reason_codes"] = reason_codes
+        self._signer_security_snapshot = signer_security
+        if not bool(state.get("enabled", False)) or not bool(state.get("exceeded", False)):
+            return
+        if self._hot_wallet_cap_conflict_latched:
+            return
+        self._record_recovery_conflict(
+            category="HOT_WALLET_CAP_EXCEEDED",
+            details=f"equity={float(state.get('equity_usd') or 0.0):.2f} cap={float(state.get('cap_usd') or 0.0):.2f}",
+        )
+        self._hot_wallet_cap_conflict_latched = True
+
     def persistence_state(self) -> dict[str, object]:
         return {
             "status": str(self.persistence_status or "ok"),
             "failure_count": int(self.persistence_failure_count or 0),
             "last_failure": dict(self.last_persistence_failure),
         }
+
+    def runner_heartbeat_state(self) -> dict[str, object]:
+        return normalize_runner_heartbeat(self._runner_heartbeat)
 
     def _record_persistence_fault(
         self,
@@ -2781,17 +3882,212 @@ class Trader:
         return self._record_persistence_fault(kind=kind, path=path, error=error)
 
     def trading_mode_state(self) -> dict[str, object]:
-        mode = str(self.trading_mode or "NORMAL").upper() or "NORMAL"
+        mode = str(self.trading_mode or MODE_NORMAL).upper() or MODE_NORMAL
         return {
             "mode": mode,
-            "opening_allowed": mode == "NORMAL",
+            "opening_allowed": bool(self.admission_opening_allowed),
             "reason_codes": list(self.trading_mode_reasons),
             "updated_ts": int(self.trading_mode_updated_ts or 0),
-            "source": "runner",
+            "source": "admission_gate_projection",
             "account_state_status": str(self.account_state_status or "unknown"),
             "reconciliation_status": str(self.reconciliation_status or "unknown"),
             "persistence_status": str(self.persistence_status or "ok"),
         }
+
+    def admission_state(self) -> dict[str, object]:
+        decision = self._admission_decision
+        return {
+            "mode": str(decision.mode or MODE_REDUCE_ONLY),
+            "opening_allowed": bool(decision.opening_allowed),
+            "reduce_only": bool(decision.reduce_only),
+            "halted": bool(decision.halted),
+            "auto_recover": bool(decision.auto_recover),
+            "manual_confirmation_required": bool(decision.manual_confirmation_required),
+            "reason_codes": list(decision.reason_codes),
+            "action_whitelist": list(decision.action_whitelist),
+            "latch_kind": str(decision.latch_kind or "none"),
+            "trusted": bool(decision.trusted),
+            "trusted_consecutive_cycles": int(decision.trusted_consecutive_cycles or 0),
+            "evidence_summary": dict(decision.evidence_summary or {}),
+            "updated_ts": int(decision.evaluated_ts or 0),
+        }
+
+    def _account_snapshot_stale_threshold_seconds(self) -> int:
+        configured = int(getattr(self.settings, "fail_closed_account_snapshot_stale_seconds", 0) or 0)
+        if configured > 0:
+            return configured
+        return max(600, int(self.settings.account_sync_refresh_seconds) * 2)
+
+    def _event_stream_stale_threshold_seconds(self) -> int:
+        configured = int(getattr(self.settings, "fail_closed_event_stream_stale_seconds", 0) or 0)
+        if configured > 0:
+            return configured
+        return max(120, int(self.settings.poll_interval_seconds) * 2)
+
+    def _ledger_diff_fail_threshold_usd(self) -> float:
+        return max(0.0, float(getattr(self.settings, "fail_closed_ledger_diff_threshold_usd", 0.01) or 0.01))
+
+    @staticmethod
+    def _recovery_conflict_requires_manual(conflicts: list[dict[str, object]]) -> bool:
+        if not conflicts:
+            return False
+        auto_resolvable_categories = {"AMBIGUOUS_PENDING"}
+        for row in conflicts:
+            category = str((row or {}).get("category") or "").strip().upper()
+            if category and category not in auto_resolvable_categories:
+                return True
+        return False
+
+    def _bootstrap_admission_evidence_fresh(self, *, reconciliation_payload: Mapping[str, object], now_ts: int) -> bool:
+        if self.settings.dry_run:
+            return True
+        if int(self.startup_failure_count or 0) > 0:
+            return True
+        account_snapshot_ts = int(self.state.account_snapshot_ts or 0)
+        if account_snapshot_ts <= 0:
+            return False
+        account_age = max(0, now_ts - account_snapshot_ts)
+        if account_age > self._account_snapshot_stale_threshold_seconds():
+            return False
+        reconciliation_status = str(reconciliation_payload.get("status") or "unknown").strip().lower()
+        if reconciliation_status not in {"ok", "warn", "fail"}:
+            return False
+        if self.pending_orders and int(self._last_broker_event_sync_ts or 0) <= 0:
+            return False
+        return True
+
+    def _evaluate_admission_decision(
+        self,
+        *,
+        control: ControlState,
+        now_ts: int,
+        reconciliation_payload: Mapping[str, object],
+    ) -> AdmissionDecision:
+        try:
+            evidence = AdmissionEvidence(
+                startup_ready=bool(self.startup_ready),
+                startup_failure_count=int(self.startup_failure_count or 0),
+                reconciliation_status=str(reconciliation_payload.get("status") or "unknown"),
+                account_snapshot_age_seconds=int(reconciliation_payload.get("account_snapshot_age_seconds") or 0),
+                account_snapshot_stale_threshold_seconds=self._account_snapshot_stale_threshold_seconds(),
+                broker_event_sync_age_seconds=int(reconciliation_payload.get("broker_event_sync_age_seconds") or 0),
+                broker_event_stale_threshold_seconds=self._event_stream_stale_threshold_seconds(),
+                ledger_diff=float(reconciliation_payload.get("internal_vs_ledger_diff") or 0.0),
+                ledger_diff_threshold_usd=self._ledger_diff_fail_threshold_usd(),
+                ambiguous_pending_orders=int(reconciliation_payload.get("ambiguous_pending_orders") or 0),
+                recovery_conflict_count=int(len(self._recovery_conflicts)),
+                recovery_conflict_requires_manual=self._recovery_conflict_requires_manual(self._recovery_conflicts),
+                persistence_status=str(self.persistence_status or "ok"),
+                risk_ledger_status=str(self.state.risk_ledger_status or "ok"),
+                risk_breaker_status=str(self.state.risk_breaker_status or "ok"),
+                operator_pause_opening=bool(control.pause_opening),
+                operator_reduce_only=bool(control.reduce_only),
+                operator_emergency_stop=bool(control.emergency_stop),
+                dry_run=bool(self.settings.dry_run),
+                bootstrap_protected=bool(self._admission_bootstrap_protected),
+                bootstrap_evidence_fresh=self._bootstrap_admission_evidence_fresh(
+                    reconciliation_payload=reconciliation_payload,
+                    now_ts=now_ts,
+                ),
+            )
+            decision = evaluate_admission(
+                now_ts=now_ts,
+                evidence=evidence,
+                previous_auto_latch_active=bool(self._admission_auto_latch_active),
+                previous_trusted_consecutive_cycles=int(self._admission_trusted_consecutive_cycles or 0),
+                auto_recover_min_healthy_cycles=int(
+                    getattr(self.settings, "fail_closed_recover_consecutive_cycles", 1) or 1
+                ),
+            )
+            if self._admission_internal_error_latched and REASON_ADMISSION_GATE_INTERNAL_ERROR not in decision.reason_codes:
+                reason_codes = tuple(list(decision.reason_codes) + [REASON_ADMISSION_GATE_INTERNAL_ERROR])
+                decision = AdmissionDecision(
+                    mode=MODE_HALTED,
+                    opening_allowed=False,
+                    reduce_only=True,
+                    halted=True,
+                    auto_recover=False,
+                    manual_confirmation_required=True,
+                    reason_codes=reason_codes,
+                    action_whitelist=("sync_read", "state_evaluation", "cancel_pending_buy", "persist_state_update"),
+                    latch_kind="manual",
+                    trusted=False,
+                    trusted_consecutive_cycles=0,
+                    evidence_summary=dict(decision.evidence_summary or {}),
+                    evaluated_ts=int(decision.evaluated_ts or now_ts),
+                    auto_latch_active=False,
+                    manual_latch_active=True,
+                )
+            return decision
+        except Exception:
+            self._admission_internal_error_latched = True
+            return AdmissionDecision(
+                mode=MODE_HALTED,
+                opening_allowed=False,
+                reduce_only=True,
+                halted=True,
+                auto_recover=False,
+                manual_confirmation_required=True,
+                reason_codes=(REASON_ADMISSION_GATE_INTERNAL_ERROR,),
+                action_whitelist=("sync_read", "state_evaluation", "cancel_pending_buy", "persist_state_update"),
+                latch_kind="manual",
+                trusted=False,
+                trusted_consecutive_cycles=0,
+                evidence_summary={
+                    "startup_ready": bool(self.startup_ready),
+                    "startup_failure_count": int(self.startup_failure_count or 0),
+                    "reconciliation_status": str(reconciliation_payload.get("status") or "unknown"),
+                    "account_snapshot_age_seconds": int(reconciliation_payload.get("account_snapshot_age_seconds") or 0),
+                    "broker_event_sync_age_seconds": int(reconciliation_payload.get("broker_event_sync_age_seconds") or 0),
+                    "ledger_diff": float(reconciliation_payload.get("internal_vs_ledger_diff") or 0.0),
+                    "ledger_diff_threshold_usd": self._ledger_diff_fail_threshold_usd(),
+                    "ambiguous_pending_orders": int(reconciliation_payload.get("ambiguous_pending_orders") or 0),
+                    "recovery_conflict_count": int(len(self._recovery_conflicts)),
+                    "persistence_status": str(self.persistence_status or "ok"),
+                    "risk_ledger_status": str(self.state.risk_ledger_status or "ok"),
+                    "risk_breaker_status": str(self.state.risk_breaker_status or "ok"),
+                },
+                evaluated_ts=now_ts,
+                auto_latch_active=False,
+                manual_latch_active=True,
+            )
+
+    def _apply_admission_decision(
+        self,
+        *,
+        decision: AdmissionDecision,
+        reconciliation_payload: Mapping[str, object],
+    ) -> None:
+        self._admission_decision = decision
+        self.admission_opening_allowed = bool(decision.opening_allowed)
+        self.admission_reduce_only = bool(decision.reduce_only)
+        self.admission_halted = bool(decision.halted)
+        self.admission_auto_recover = bool(decision.auto_recover)
+        self.admission_manual_confirmation_required = bool(decision.manual_confirmation_required)
+        self.admission_latch_kind = str(decision.latch_kind or "none")
+        self.admission_action_whitelist = tuple(decision.action_whitelist)
+        self.admission_evidence_summary = dict(decision.evidence_summary or {})
+        self._admission_auto_latch_active = bool(decision.auto_latch_active)
+        self._admission_trusted_consecutive_cycles = int(decision.trusted_consecutive_cycles or 0)
+        if decision.evidence_summary and bool(decision.evidence_summary.get("startup_ready", False)):
+            self._admission_bootstrap_protected = False
+        if REASON_ADMISSION_GATE_INTERNAL_ERROR not in decision.reason_codes:
+            self._admission_internal_error_latched = False
+        self._sync_legacy_trading_mode_projection(decision, reconciliation_payload=reconciliation_payload)
+
+    def _sync_legacy_trading_mode_projection(
+        self,
+        decision: AdmissionDecision,
+        *,
+        reconciliation_payload: Mapping[str, object],
+    ) -> None:
+        self.trading_mode = str(decision.mode or MODE_REDUCE_ONLY).upper()
+        self.trading_mode_reasons = _legacy_trading_mode_reasons(tuple(decision.reason_codes))
+        self.trading_mode_updated_ts = int(decision.evaluated_ts or int(time.time()))
+        self.account_state_status = self._account_state_status(now=int(decision.evaluated_ts or time.time()))
+        self.reconciliation_status = (
+            str(reconciliation_payload.get("status") or "unknown").strip().lower() or "unknown"
+        )
 
     def _update_trading_mode(
         self,
@@ -2802,54 +4098,24 @@ class Trader:
     ) -> dict[str, object]:
         now_ts = int(now or time.time())
         reconciliation_payload = dict(reconciliation or self.reconciliation_summary(now=now_ts))
-        reconciliation_status = str(reconciliation_payload.get("status") or "unknown").strip().lower() or "unknown"
-        account_state_status = self._account_state_status(now=now_ts)
-
-        reason_codes: list[str] = []
-        if bool(control.emergency_stop):
-            reason_codes.append("operator_emergency_stop")
-        if bool(control.pause_opening):
-            reason_codes.append("operator_pause_opening")
-        if bool(control.reduce_only):
-            reason_codes.append("operator_reduce_only")
-        if not self.startup_ready:
-            reason_codes.append("startup_not_ready")
-        if account_state_status == "unknown":
-            reason_codes.append("account_state_unknown")
-        elif account_state_status == "stale":
-            reason_codes.append("account_state_stale")
-        if reconciliation_status == "fail":
-            reason_codes.append("reconciliation_fail")
-        elif reconciliation_status == "warn":
-            reason_codes.append("reconciliation_warn")
-        if str(self.persistence_status or "ok") != "ok":
-            reason_codes.append("persistence_fault")
-
-        mode = "NORMAL"
-        if reason_codes:
-            mode = "REDUCE_ONLY"
-        if str(self.persistence_status or "ok") != "ok":
-            mode = "HALTED"
-        if bool(control.emergency_stop):
-            mode = "HALTED"
-
+        decision = self._evaluate_admission_decision(
+            control=control,
+            now_ts=now_ts,
+            reconciliation_payload=reconciliation_payload,
+        )
+        self._apply_admission_decision(decision=decision, reconciliation_payload=reconciliation_payload)
         signature = (
-            mode,
-            tuple(reason_codes),
-            account_state_status,
-            reconciliation_status,
+            str(self.trading_mode or MODE_NORMAL),
+            tuple(self.trading_mode_reasons),
+            str(self.account_state_status or "unknown"),
+            str(self.reconciliation_status or "unknown"),
             str(self.persistence_status or "ok"),
         )
-        self.trading_mode = mode
-        self.trading_mode_reasons = list(reason_codes)
-        self.trading_mode_updated_ts = now_ts
-        self.account_state_status = account_state_status
-        self.reconciliation_status = reconciliation_status
+        trading_mode_state = self.trading_mode_state()
         if signature != self._last_trading_mode_signature:
             self._last_trading_mode_signature = signature
-            trading_mode_state = self.trading_mode_state()
             self._append_event("trading_mode", trading_mode_state)
-            log_level = self.log.warning if mode != "NORMAL" else self.log.info
+            log_level = self.log.warning if trading_mode_state["mode"] != MODE_NORMAL else self.log.info
             log_level(
                 "TRADING_MODE mode=%s opening_allowed=%s reasons=%s account_state=%s reconciliation=%s",
                 trading_mode_state["mode"],
@@ -2863,44 +4129,491 @@ class Trader:
                 reconciliation=reconciliation_payload,
                 now=now_ts,
             )
-        return self.trading_mode_state()
+        return trading_mode_state
+
+    def kill_switch_state(self) -> dict[str, object]:
+        return normalize_kill_switch_state(self._kill_switch_state)
+
+    def _kill_switch_terminal_timeout_seconds(self) -> int:
+        return max(30, int(getattr(self.settings, "kill_switch_terminal_timeout_seconds", 600) or 600))
+
+    def _kill_switch_query_error_threshold(self) -> int:
+        return max(1, int(getattr(self.settings, "kill_switch_query_error_threshold", 3) or 3))
+
+    def _kill_switch_cancel_retry_seconds(self) -> int:
+        return max(
+            5,
+            int(getattr(self.settings, "kill_switch_cancel_retry_seconds", self._pending_cancel_retry_seconds()) or 5),
+        )
+
+    def _persist_kill_switch_state(self) -> None:
+        if self._state_store is None:
+            return
+        try:
+            self._state_store.save_kill_switch_state(self._kill_switch_state)
+        except Exception as exc:
+            self.log.error("Kill switch state persist failed db=%s err=%s", self.settings.state_store_path, exc)
+            self._record_persistence_fault(kind="kill_switch_state_write", path=self.settings.state_store_path, error=exc)
+
+    def _set_kill_switch_state(self, payload: Mapping[str, object], *, now: int, persist: bool = True) -> None:
+        next_state = normalize_kill_switch_state(payload)
+        next_state["updated_ts"] = int(now)
+        previous = normalize_kill_switch_state(self._kill_switch_state)
+        if next_state == previous:
+            self._kill_switch_state = next_state
+            return
+        self._kill_switch_state = next_state
+        self._append_event("kill_switch", self.kill_switch_state())
+        if persist:
+            self._persist_kill_switch_state()
+
+    @staticmethod
+    def _kill_switch_reason(reason_codes: list[str], code: str) -> None:
+        normalized = str(code or "").strip()
+        if not normalized:
+            return
+        if normalized not in reason_codes:
+            reason_codes.append(normalized)
+
+    def _kill_switch_pending_buy_context(self) -> dict[str, object]:
+        pending_keys: list[str] = []
+        pending_order_ids: set[str] = set()
+        cancel_requested_order_ids: set[str] = set()
+        unresolved_local_ids: set[str] = set()
+
+        for key, order in self.pending_orders.items():
+            if str(order.get("side") or "").upper() != "BUY":
+                continue
+            pending_keys.append(str(key))
+            broker_status = str(order.get("broker_status") or "").strip().lower()
+            if broker_status == "cancelled":
+                broker_status = "canceled"
+            order_id = str(order.get("order_id") or "").strip()
+            if not order_id:
+                unresolved_local_ids.add(f"local:{key}")
+                continue
+            if broker_status in {"cancel_requested", "requested", "queued", "pending_cancel"}:
+                cancel_requested_order_ids.add(order_id)
+            if kill_switch_status_is_terminal(broker_status):
+                continue
+            pending_order_ids.add(order_id)
+
+        return {
+            "pending_keys": sorted({key for key in pending_keys if key}),
+            "pending_order_ids": sorted(pending_order_ids),
+            "cancel_requested_order_ids": sorted(cancel_requested_order_ids),
+            "unresolved_local_ids": sorted(unresolved_local_ids),
+        }
+
+    def _kill_switch_load_open_buy_orders(self) -> tuple[list[OpenOrderSnapshot], str]:
+        open_orders = self._load_broker_open_orders()
+        if open_orders is None:
+            if self.settings.dry_run:
+                return ([], "")
+            return ([], "broker_open_orders_unavailable")
+        buy_open = [
+            order
+            for order in open_orders
+            if str(order.side or "").strip().upper() == "BUY"
+            and not kill_switch_status_is_terminal(order.lifecycle_status)
+        ]
+        return (buy_open, "")
+
+    def _kill_switch_issue_cancel_requests(
+        self,
+        *,
+        state: dict[str, object],
+        now: int,
+        action_reason: str,
+    ) -> tuple[dict[str, object], str]:
+        next_state = normalize_kill_switch_state(state)
+        pending_context = self._kill_switch_pending_buy_context()
+        tracked_ids = {str(item).strip() for item in list(next_state.get("tracked_buy_order_ids") or []) if str(item).strip()}
+        cancel_requested = {
+            str(item).strip()
+            for item in list(next_state.get("cancel_requested_order_ids") or [])
+            if str(item).strip()
+        }
+        for order_id in list(pending_context.get("pending_order_ids") or []):
+            tracked_ids.add(str(order_id))
+        for local_id in list(pending_context.get("unresolved_local_ids") or []):
+            tracked_ids.add(str(local_id))
+
+        retry_seconds = self._kill_switch_cancel_retry_seconds()
+        failures: list[str] = []
+        attempts = 0
+
+        remaining: dict[str, dict[str, object]] = {}
+        for key, order in sorted(self.pending_orders.items(), key=lambda item: int(item[1].get("ts") or 0)):
+            if str(order.get("side") or "").upper() != "BUY":
+                remaining[key] = order
+                continue
+            order_id = str(order.get("order_id") or "").strip()
+            if not order_id:
+                remaining[key] = order
+                continue
+            tracked_ids.add(order_id)
+            last_request_ts = int(order.get("cancel_requested_ts") or 0)
+            if last_request_ts > 0 and (now - last_request_ts) < retry_seconds:
+                if str(order.get("broker_status") or "").strip().lower() in {"cancel_requested", "requested", "queued"}:
+                    cancel_requested.add(order_id)
+                remaining[key] = order
+                continue
+            attempts += 1
+            outcome, updated = self._cancel_pending_order(
+                order=order,
+                now=now,
+                position_lookup=self.positions_book,
+                action_reason=action_reason,
+                force=False,
+            )
+            if outcome == "failed":
+                failures.append(f"pending_cancel_failed:{order_id}")
+                remaining[key] = updated
+                continue
+            if outcome == "requested":
+                cancel_requested.add(order_id)
+                remaining[key] = updated
+                continue
+            if outcome == "canceled":
+                continue
+            remaining[key] = updated
+        self.pending_orders = remaining
+        self._refresh_risk_state()
+
+        open_buys, open_err = self._kill_switch_load_open_buy_orders()
+        if open_err:
+            return (next_state, open_err)
+        for order in open_buys:
+            order_id = str(order.order_id or "").strip()
+            if not order_id:
+                continue
+            tracked_ids.add(order_id)
+            attempts += 1
+            response = self.broker.cancel_order(order_id)
+            status, ok, message = self._normalize_cancel_status(response if isinstance(response, Mapping) else None)
+            if status == "requested" and ok:
+                cancel_requested.add(order_id)
+                continue
+            if status == "canceled" and ok:
+                continue
+            failures.append(
+                f"open_buy_cancel_failed:{order_id}:{message or status}"
+            )
+
+        next_state["cancel_attempts"] = int(next_state.get("cancel_attempts") or 0) + int(attempts)
+        next_state["pending_buy_order_keys"] = list(pending_context.get("pending_keys") or [])
+        next_state["tracked_buy_order_ids"] = sorted(tracked_ids)
+        next_state["cancel_requested_order_ids"] = sorted(cancel_requested)
+        next_state["open_buy_order_ids"] = sorted({str(order.order_id or "").strip() for order in open_buys if str(order.order_id or "").strip()})
+        if failures:
+            return (next_state, ";".join(failures))
+        return (next_state, "")
+
+    def _kill_switch_probe_terminal(
+        self,
+        *,
+        state: dict[str, object],
+        now: int,
+    ) -> tuple[dict[str, object], str]:
+        next_state = normalize_kill_switch_state(state)
+        pending_context = self._kill_switch_pending_buy_context()
+        open_buys, open_err = self._kill_switch_load_open_buy_orders()
+        if open_err:
+            return (next_state, open_err)
+
+        open_buy_ids = {str(order.order_id or "").strip() for order in open_buys if str(order.order_id or "").strip()}
+        tracked_ids = {str(item).strip() for item in list(next_state.get("tracked_buy_order_ids") or []) if str(item).strip()}
+        for order_id in list(pending_context.get("pending_order_ids") or []):
+            tracked_ids.add(str(order_id))
+        for order_id in open_buy_ids:
+            tracked_ids.add(order_id)
+        for item in list(next_state.get("cancel_requested_order_ids") or []):
+            if str(item).strip():
+                tracked_ids.add(str(item).strip())
+
+        non_terminal_ids: set[str] = set()
+        cancel_requested_ids: set[str] = set()
+        errors: list[str] = []
+
+        for local_id in list(pending_context.get("unresolved_local_ids") or []):
+            non_terminal_ids.add(str(local_id))
+
+        for order_id in sorted(tracked_ids):
+            if order_id.startswith("local:"):
+                non_terminal_ids.add(order_id)
+                continue
+            if order_id in open_buy_ids:
+                non_terminal_ids.add(order_id)
+                continue
+            snapshot: OrderStatusSnapshot | None
+            try:
+                snapshot = self.broker.get_order_status(order_id)
+            except Exception as exc:
+                errors.append(f"order_status_error:{order_id}:{exc}")
+                continue
+            if snapshot is None:
+                non_terminal_ids.add(order_id)
+                continue
+            lifecycle_status = str(snapshot.lifecycle_status or snapshot.normalized_status or "").strip().lower()
+            if lifecycle_status in {"cancel_requested", "requested", "queued"}:
+                cancel_requested_ids.add(order_id)
+                non_terminal_ids.add(order_id)
+                continue
+            if not snapshot.is_terminal:
+                non_terminal_ids.add(order_id)
+
+        next_state["last_broker_check_ts"] = int(now)
+        next_state["open_buy_order_ids"] = sorted(open_buy_ids)
+        next_state["non_terminal_buy_order_ids"] = sorted(non_terminal_ids)
+        next_state["cancel_requested_order_ids"] = sorted(cancel_requested_ids)
+        next_state["tracked_buy_order_ids"] = sorted(tracked_ids)
+        next_state["pending_buy_order_keys"] = list(pending_context.get("pending_keys") or [])
+        if errors:
+            return (next_state, ";".join(errors))
+        return (next_state, "")
+
+    def _advance_kill_switch_state(self, control: ControlState, *, now: int) -> None:
+        state = normalize_kill_switch_state(self._kill_switch_state)
+        requested_mode = requested_kill_switch_mode(
+            pause_opening=bool(control.pause_opening),
+            reduce_only=bool(control.reduce_only),
+            emergency_stop=bool(control.emergency_stop),
+        )
+        mode_requested = str(state.get("mode_requested") or KILL_SWITCH_MODE_NONE)
+        phase = str(state.get("phase") or KILL_SWITCH_PHASE_IDLE)
+        reason_codes = [str(item) for item in list(state.get("reason_codes") or []) if str(item).strip()]
+
+        if requested_mode != KILL_SWITCH_MODE_NONE and (mode_requested != requested_mode or phase == KILL_SWITCH_PHASE_IDLE):
+            state = default_kill_switch_state(now_ts=now)
+            state["mode_requested"] = requested_mode
+            state["phase"] = KILL_SWITCH_PHASE_REQUESTED
+            state["requested_ts"] = int(now)
+            mode_requested = requested_mode
+            phase = KILL_SWITCH_PHASE_REQUESTED
+            reason_codes = []
+
+        if requested_mode != KILL_SWITCH_MODE_NONE:
+            self._kill_switch_reason(reason_codes, f"operator_{requested_mode}")
+            state["mode_requested"] = requested_mode
+            mode_requested = requested_mode
+        elif mode_requested == KILL_SWITCH_MODE_NONE:
+            reason_codes = []
+
+        if mode_requested == KILL_SWITCH_MODE_PAUSE_OPENING:
+            state["phase"] = KILL_SWITCH_PHASE_SAFE_CONFIRMED
+            state["broker_safe_confirmed"] = True
+            state["safe_confirmed_ts"] = int(now)
+
+        if mode_requested in {KILL_SWITCH_MODE_REDUCE_ONLY, KILL_SWITCH_MODE_EMERGENCY_STOP}:
+            if phase in {KILL_SWITCH_PHASE_REQUESTED, KILL_SWITCH_PHASE_CANCELING_BUY}:
+                state["phase"] = KILL_SWITCH_PHASE_CANCELING_BUY
+                state, cancel_err = self._kill_switch_issue_cancel_requests(
+                    state=state,
+                    now=now,
+                    action_reason=f"kill_switch_{mode_requested}",
+                )
+                if cancel_err:
+                    self._kill_switch_reason(reason_codes, "kill_switch_cancel_error")
+                    state["phase"] = KILL_SWITCH_PHASE_FAILED_MANUAL_REQUIRED
+                    state["manual_required"] = True
+                    state["last_error"] = str(cancel_err)
+                else:
+                    state["phase"] = KILL_SWITCH_PHASE_WAITING_BROKER_TERMINAL
+            if str(state.get("phase") or "") == KILL_SWITCH_PHASE_WAITING_BROKER_TERMINAL:
+                state, probe_err = self._kill_switch_probe_terminal(state=state, now=now)
+                elapsed = max(0, int(now) - int(state.get("requested_ts") or now))
+                if probe_err:
+                    self._kill_switch_reason(reason_codes, "kill_switch_query_error")
+                    state["query_error_count"] = int(state.get("query_error_count") or 0) + 1
+                    state["last_error"] = str(probe_err)
+                else:
+                    state["query_error_count"] = 0
+                    state["last_error"] = ""
+                    if not list(state.get("open_buy_order_ids") or []) and not list(state.get("non_terminal_buy_order_ids") or []):
+                        state["phase"] = KILL_SWITCH_PHASE_SAFE_CONFIRMED
+                        state["broker_safe_confirmed"] = True
+                        state["safe_confirmed_ts"] = int(now)
+                    else:
+                        state["broker_safe_confirmed"] = False
+
+                if str(state.get("phase") or "") == KILL_SWITCH_PHASE_WAITING_BROKER_TERMINAL:
+                    if elapsed >= self._kill_switch_terminal_timeout_seconds():
+                        self._kill_switch_reason(reason_codes, "kill_switch_cancel_timeout")
+                        state["phase"] = KILL_SWITCH_PHASE_FAILED_MANUAL_REQUIRED
+                        state["manual_required"] = True
+                    elif int(state.get("query_error_count") or 0) >= self._kill_switch_query_error_threshold():
+                        self._kill_switch_reason(reason_codes, "kill_switch_query_unavailable")
+                        state["phase"] = KILL_SWITCH_PHASE_FAILED_MANUAL_REQUIRED
+                        state["manual_required"] = True
+
+        if str(state.get("phase") or "") == KILL_SWITCH_PHASE_FAILED_MANUAL_REQUIRED:
+            state["manual_required"] = True
+            state["broker_safe_confirmed"] = False
+            self._kill_switch_reason(reason_codes, "kill_switch_manual_required")
+
+        if str(state.get("phase") or "") == KILL_SWITCH_PHASE_SAFE_CONFIRMED and requested_mode == KILL_SWITCH_MODE_NONE:
+            if not bool(state.get("manual_required")):
+                state = default_kill_switch_state(now_ts=now)
+                reason_codes = []
+
+        phase = str(state.get("phase") or KILL_SWITCH_PHASE_IDLE)
+        mode_requested = str(state.get("mode_requested") or KILL_SWITCH_MODE_NONE)
+        manual_required = bool(state.get("manual_required"))
+        active_requested = requested_mode != KILL_SWITCH_MODE_NONE
+        in_flight = phase in {
+            KILL_SWITCH_PHASE_REQUESTED,
+            KILL_SWITCH_PHASE_CANCELING_BUY,
+            KILL_SWITCH_PHASE_WAITING_BROKER_TERMINAL,
+        }
+
+        if phase == KILL_SWITCH_PHASE_IDLE:
+            state["opening_allowed"] = True
+            state["reduce_only"] = False
+            state["halted"] = False
+            state["latched"] = False
+            state["broker_safe_confirmed"] = True
+            state["reason_codes"] = []
+        else:
+            state["opening_allowed"] = False
+            state["reduce_only"] = mode_requested in {KILL_SWITCH_MODE_REDUCE_ONLY, KILL_SWITCH_MODE_EMERGENCY_STOP}
+            state["halted"] = mode_requested == KILL_SWITCH_MODE_EMERGENCY_STOP
+            state["latched"] = bool(
+                manual_required
+                or mode_requested == KILL_SWITCH_MODE_EMERGENCY_STOP
+                or in_flight
+                or active_requested
+            )
+            state["reason_codes"] = reason_codes
+        state["auto_recover"] = bool(
+            phase in {KILL_SWITCH_PHASE_WAITING_BROKER_TERMINAL, KILL_SWITCH_PHASE_SAFE_CONFIRMED}
+            and not bool(state.get("manual_required"))
+        )
+        self._set_kill_switch_state(state, now=now, persist=True)
 
     def _buy_gate_reason(self) -> str:
-        if str(self.trading_mode or "NORMAL").upper() == "NORMAL":
-            return ""
-        for reason in self.trading_mode_reasons:
-            if reason == "operator_pause_opening":
+        kill_switch = self.kill_switch_state()
+        if not bool(kill_switch.get("opening_allowed", True)):
+            phase = str(kill_switch.get("phase") or "")
+            mode_requested = str(kill_switch.get("mode_requested") or "")
+            reason_codes = [str(item) for item in list(kill_switch.get("reason_codes") or []) if str(item).strip()]
+            if phase == KILL_SWITCH_PHASE_FAILED_MANUAL_REQUIRED or bool(kill_switch.get("manual_required")):
+                return "kill_switch_manual_required"
+            if mode_requested == KILL_SWITCH_MODE_PAUSE_OPENING:
                 return "pause_opening"
-            if reason == "operator_reduce_only":
-                return "reduce_only"
-            if reason == "startup_not_ready":
+            if mode_requested == KILL_SWITCH_MODE_EMERGENCY_STOP:
+                return "emergency_stop"
+            if "kill_switch_cancel_timeout" in reason_codes:
+                return "kill_switch_cancel_timeout"
+            if "kill_switch_query_unavailable" in reason_codes:
+                return "kill_switch_query_unavailable"
+            if "kill_switch_query_error" in reason_codes:
+                return "kill_switch_query_error"
+            return "kill_switch_waiting_broker_terminal"
+        decision = self._admission_decision
+        if bool(decision.opening_allowed):
+            return ""
+        for reason in decision.reason_codes:
+            if reason in {"operator_pause_opening", "operator_manual_reduce_only"}:
+                return "pause_opening"
+            if reason == "startup_checks_fail":
                 return "startup_not_ready"
-            if reason in {"account_state_unknown", "account_state_stale"}:
-                return reason
+            if reason == "stale_account_snapshot":
+                return "account_state_stale"
             if reason in {"reconciliation_fail", "reconciliation_warn"}:
                 return reason
-            if reason == "persistence_fault":
+            if reason == REASON_PERSISTENCE_FAULT:
                 return "persistence_fault"
-            if reason == "operator_emergency_stop":
+            if reason in {REASON_RECOVERY_CONFLICT_UNRESOLVED_MANUAL, "recovery_conflict_unresolved"}:
+                return "recovery_conflict"
+            if reason == "stale_broker_event_stream":
+                return "broker_event_stream_stale"
+            if reason == "ledger_diff_exceeded":
+                return "ledger_diff_exceeded"
+            if reason == "ambiguous_pending_unresolved":
+                return "ambiguous_pending_unresolved"
+            if reason in {"operator_emergency_stop", REASON_ADMISSION_GATE_INTERNAL_ERROR}:
                 return "emergency_stop"
-        return "system_halted" if str(self.trading_mode or "").upper() == "HALTED" else "system_reduce_only"
+        return "system_halted" if bool(decision.halted) else "system_reduce_only"
+
+    def _refresh_buy_blocked_state(self, *, now_ts: int) -> None:
+        reason = self._buy_gate_reason()
+        if reason:
+            if int(self._buy_blocked_since_ts or 0) <= 0:
+                self._buy_blocked_since_ts = int(now_ts or time.time())
+            return
+        self._buy_blocked_since_ts = 0
+
+    def buy_blocked_state(self, *, now_ts: int | None = None) -> dict[str, object]:
+        ts = int(now_ts or time.time())
+        reason = self._buy_gate_reason()
+        active = bool(reason)
+        since_ts = int(self._buy_blocked_since_ts or 0) if active else 0
+        duration_seconds = max(0, ts - since_ts) if (active and since_ts > 0) else 0
+        return {
+            "active": active,
+            "reason_code": reason,
+            "since_ts": since_ts,
+            "duration_seconds": int(duration_seconds),
+            "updated_ts": ts,
+        }
+
+    def _writer_active_for_runtime(self) -> bool:
+        if not bool(getattr(self.settings, "enable_single_writer", False)):
+            return True
+        try:
+            self._assert_writer_active()
+        except Exception:
+            return False
+        return True
+
+    def _update_runner_heartbeat(
+        self,
+        *,
+        now_ts: int | None = None,
+        loop_status: str | None = None,
+        cycle_started: bool = False,
+        cycle_finished: bool = False,
+    ) -> None:
+        if not self._writer_active_for_runtime():
+            return
+        ts = int(now_ts or time.time())
+        heartbeat = normalize_runner_heartbeat(self._runner_heartbeat)
+        heartbeat["writer_active"] = True
+        heartbeat["last_seen_ts"] = ts
+        if cycle_started:
+            heartbeat["cycle_seq"] = max(0, int(heartbeat.get("cycle_seq") or 0)) + 1
+            heartbeat["last_cycle_started_ts"] = ts
+            if loop_status is None:
+                loop_status = RUNNER_LOOP_STATUS_RUNNING
+        if cycle_finished:
+            heartbeat["last_cycle_finished_ts"] = ts
+            if loop_status is None:
+                loop_status = RUNNER_LOOP_STATUS_RUNNING
+        if loop_status:
+            heartbeat["loop_status"] = str(loop_status)
+        self._runner_heartbeat = heartbeat
 
     def _pending_entry_cancel_reason(self, control: ControlState) -> str:
         if control.emergency_stop:
             return "emergency_stop_cancel_pending_entry"
         if control.reduce_only:
             return "reduce_only_cancel_pending_entry"
+        kill_switch = self.kill_switch_state()
+        if not bool(kill_switch.get("opening_allowed", True)):
+            mode_requested = str(kill_switch.get("mode_requested") or "")
+            phase = str(kill_switch.get("phase") or "")
+            if mode_requested in {KILL_SWITCH_MODE_REDUCE_ONLY, KILL_SWITCH_MODE_EMERGENCY_STOP} and phase in {
+                KILL_SWITCH_PHASE_REQUESTED,
+                KILL_SWITCH_PHASE_CANCELING_BUY,
+                KILL_SWITCH_PHASE_WAITING_BROKER_TERMINAL,
+                KILL_SWITCH_PHASE_FAILED_MANUAL_REQUIRED,
+            }:
+                return "kill_switch_cancel_pending_entry"
         if not self.pending_orders:
             return ""
 
-        system_reduce_only_reasons = {
-            "startup_not_ready",
-            "account_state_unknown",
-            "account_state_stale",
-            "reconciliation_fail",
-            "persistence_fault",
-        }
-        if any(reason in system_reduce_only_reasons for reason in self.trading_mode_reasons):
+        if not bool(self._admission_decision.opening_allowed):
             return "trading_mode_cancel_pending_entry"
         return ""
 
@@ -2937,6 +4650,61 @@ class Trader:
         if float(signal.exit_fraction or 0.0) >= 0.95:
             return ("exit", self._action_tag_label("exit"))
         return ("trim", self._action_tag_label("trim"))
+
+    @staticmethod
+    def _normalize_wallet_address(value: object) -> str:
+        return str(value or "").strip().lower()
+
+    @staticmethod
+    def _normalize_token_id(value: object) -> str:
+        return str(value or "").strip()
+
+    def _position_truth_for_token(self, token_id: object) -> dict[str, object] | None:
+        normalized = self._normalize_token_id(token_id)
+        if not normalized:
+            return None
+        position = self.positions_book.get(normalized)
+        if position is not None:
+            return position
+        lowered = normalized.lower()
+        for key, candidate in self.positions_book.items():
+            if str(key or "").strip().lower() == lowered:
+                return candidate
+        return None
+
+    def _same_wallet_add_allowlist(self) -> set[str]:
+        raw = str(self.settings.same_wallet_add_allowlist or "")
+        return {
+            token
+            for token in (self._normalize_wallet_address(part) for part in re.split(r"[\s,]+", raw))
+            if token
+        }
+
+    def _same_wallet_add_allowed(self, signal: Signal, existing: Mapping[str, object] | None) -> bool:
+        if signal.side != "BUY" or existing is None:
+            return False
+        signal_wallet = self._normalize_wallet_address(signal.wallet)
+        entry_wallet = self._normalize_wallet_address(existing.get("entry_wallet"))
+        if not signal_wallet or not entry_wallet or signal_wallet != entry_wallet:
+            return False
+        if not bool(self.settings.same_wallet_add_enabled):
+            return False
+        return signal_wallet in self._same_wallet_add_allowlist()
+
+    def _repeat_entry_block_reason(self, signal: Signal, existing: Mapping[str, object] | None) -> str:
+        if signal.side != "BUY" or existing is None:
+            return ""
+        if float(existing.get("notional") or 0.0) <= 0.0:
+            return ""
+        if self._same_wallet_add_allowed(signal, existing):
+            return ""
+        signal_wallet = self._normalize_wallet_address(signal.wallet)
+        entry_wallet = self._normalize_wallet_address(existing.get("entry_wallet"))
+        if signal_wallet and entry_wallet:
+            if signal_wallet == entry_wallet:
+                return REASON_SAME_WALLET_ADD_NOT_ALLOWED
+            return REASON_CROSS_WALLET_REPEAT_ENTRY_BLOCKED
+        return REASON_REPEAT_ENTRY_BLOCKED_EXISTING_POSITION
 
     def _wallet_pool_snapshot(self) -> list[dict[str, object]]:
         latest_metrics = getattr(self.strategy, "latest_wallet_metrics", None)
@@ -3195,21 +4963,204 @@ class Trader:
             updater(metrics, refreshed_ts=refreshed_ts)
 
     def _load_runtime_snapshot(self) -> dict[str, object] | None:
-        path = str(Path(str(self.settings.runtime_state_path or "").strip()).expanduser())
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                payload = json.load(f)
-            if isinstance(payload, dict):
-                return payload
-        except FileNotFoundError:
+        if self._state_store is None:
             return None
+        try:
+            truth = self._state_store.load_runtime_truth()
         except Exception as exc:
-            self.log.warning(
-                "Load runtime snapshot failed path=%s err=%s",
-                path,
-                exc,
-            )
+            self.log.error("Load runtime truth failed db=%s err=%s", self.settings.state_store_path, exc)
+            self._record_persistence_fault(kind="runtime_truth_read", path=self.settings.state_store_path, error=exc)
+            self._recovery_block_buy_latched = True
+            return None
+        runtime_payload = truth.get("runtime")
+        if isinstance(runtime_payload, dict):
+            return runtime_payload
         return None
+
+    def _record_recovery_conflict(
+        self,
+        *,
+        category: str,
+        token_id: str = "",
+        order_id: str = "",
+        details: str = "",
+    ) -> None:
+        row = {
+            "category": str(category or "unknown"),
+            "token_id": str(token_id or ""),
+            "order_id": str(order_id or ""),
+            "details": str(details or ""),
+            "ts": int(time.time()),
+        }
+        self._recovery_conflicts.append(row)
+        self._recovery_block_buy_latched = True
+
+    def _control_payload_from_runtime(self, control: ControlState | None = None) -> dict[str, object]:
+        state = control or self.control_state
+        return {
+            "decision_mode": str(state.decision_mode or "manual"),
+            "pause_opening": bool(state.pause_opening),
+            "reduce_only": bool(state.reduce_only),
+            "emergency_stop": bool(state.emergency_stop),
+            "clear_stale_pending_requested_ts": int(state.clear_stale_pending_requested_ts or 0),
+            "clear_risk_breakers_requested_ts": int(state.clear_risk_breakers_requested_ts or 0),
+            "updated_ts": int(state.updated_ts or 0),
+        }
+
+    def _validate_control_payload(self, payload: Mapping[str, object]) -> list[str]:
+        errors: list[str] = []
+        mode = str(payload.get("decision_mode") or "").strip().lower()
+        if mode not in _VALID_DECISION_MODES:
+            errors.append(f"invalid_decision_mode={mode or 'empty'}")
+        pause_opening = bool(payload.get("pause_opening", False))
+        reduce_only = bool(payload.get("reduce_only", False))
+        emergency_stop = bool(payload.get("emergency_stop", False))
+        if pause_opening and reduce_only:
+            errors.append("mutually_exclusive_control_bits=pause_opening+reduce_only")
+        if emergency_stop and (pause_opening or reduce_only):
+            errors.append("mutually_exclusive_control_bits=emergency_stop_with_other_flags")
+        updated_ts = int(self._safe_float(payload.get("updated_ts"), 0))
+        now_ts = int(time.time())
+        if updated_ts < 0:
+            errors.append("invalid_updated_ts=negative")
+        if updated_ts > now_ts + 86400:
+            errors.append("invalid_updated_ts=future")
+        clear_ts = int(self._safe_float(payload.get("clear_stale_pending_requested_ts"), 0))
+        if clear_ts < 0:
+            errors.append("invalid_clear_stale_pending_requested_ts=negative")
+        if clear_ts > now_ts + 86400:
+            errors.append("invalid_clear_stale_pending_requested_ts=future")
+        clear_breaker_ts = int(self._safe_float(payload.get("clear_risk_breakers_requested_ts"), 0))
+        if clear_breaker_ts < 0:
+            errors.append("invalid_clear_risk_breakers_requested_ts=negative")
+        if clear_breaker_ts > now_ts + 86400:
+            errors.append("invalid_clear_risk_breakers_requested_ts=future")
+        return errors
+
+    @staticmethod
+    def _intent_pending_status_from_order(order: Mapping[str, object]) -> str:
+        raw = str(order.get("broker_status") or "").strip().lower()
+        if raw in {"cancel_requested", "canceled", "failed", "rejected", "unmatched", "filled"}:
+            return raw
+        if raw in {"partially_filled", "partial"}:
+            return INTENT_STATUS_PARTIAL
+        if raw in {"posted", "submitted", "open", "live", "delayed"}:
+            return INTENT_STATUS_ACKED_PENDING
+        return raw or INTENT_STATUS_ACKED_PENDING
+
+    def _build_order_intents_from_pending(self, orders: list[dict[str, object]]) -> list[dict[str, object]]:
+        intents: list[dict[str, object]] = []
+        now_ts = int(time.time())
+        for order in orders:
+            signal_id = str(order.get("signal_id") or "").strip()
+            side = str(order.get("side") or "").strip().upper()
+            token_id = str(order.get("token_id") or "").strip()
+            if not signal_id or side not in {"BUY", "SELL"} or not token_id:
+                continue
+            intent_id = str(order.get("intent_id") or signal_id or order.get("key") or order.get("order_id") or "").strip()
+            if not intent_id:
+                continue
+            created_ts = int(self._safe_float(order.get("ts"), now_ts))
+            updated_ts = max(now_ts, int(self._safe_float(order.get("last_heartbeat_ts"), 0)), created_ts)
+            intents.append(
+                {
+                    "intent_id": intent_id,
+                    "idempotency_key": str(order.get("idempotency_key") or ""),
+                    "strategy_name": str(order.get("strategy_name") or ""),
+                    "signal_source": str(order.get("signal_source") or ""),
+                    "signal_fingerprint": str(order.get("signal_fingerprint") or ""),
+                    "strategy_order_uuid": str(order.get("strategy_order_uuid") or ""),
+                    "broker_order_id": str(order.get("order_id") or ""),
+                    "token_id": token_id,
+                    "condition_id": str(order.get("condition_id") or ""),
+                    "side": side,
+                    "status": self._intent_pending_status_from_order(order),
+                    "recovered_source": str(order.get("recovery_source") or ""),
+                    "recovery_reason": str(order.get("recovery_status") or ""),
+                    "payload": dict(order),
+                    "created_ts": created_ts,
+                    "updated_ts": updated_ts,
+                }
+            )
+        return intents
+
+    def _build_order_intents_snapshot(self) -> list[dict[str, object]]:
+        intents_by_id: dict[str, dict[str, object]] = {}
+        for row in self._build_order_intents_from_pending([dict(order) for order in self.pending_orders.values()]):
+            intents_by_id[str(row.get("intent_id") or "")] = row
+        now_ts = int(time.time())
+        for row in list(self.recent_orders):
+            signal_id = str(row.get("signal_id") or "").strip()
+            token_id = str(row.get("token_id") or "").strip()
+            side = str(row.get("side") or "").strip().upper()
+            if not signal_id or not token_id or side not in {"BUY", "SELL"}:
+                continue
+            status = str(row.get("status") or "").strip().lower() or "posted"
+            intent_id = signal_id
+            if intent_id in intents_by_id:
+                continue
+            intents_by_id[intent_id] = {
+                "intent_id": intent_id,
+                "idempotency_key": str(row.get("idempotency_key") or ""),
+                "strategy_name": str(row.get("strategy_name") or ""),
+                "signal_source": str(row.get("signal_source") or ""),
+                "signal_fingerprint": str(row.get("signal_fingerprint") or ""),
+                "strategy_order_uuid": str(row.get("strategy_order_uuid") or ""),
+                "broker_order_id": str(row.get("order_id") or ""),
+                "token_id": token_id,
+                "condition_id": str(row.get("condition_id") or ""),
+                "side": side,
+                "status": status,
+                "recovered_source": "runtime",
+                "recovery_reason": "recent_order_snapshot",
+                "payload": dict(row),
+                "created_ts": int(self._safe_float(row.get("ts"), now_ts)),
+                "updated_ts": now_ts,
+            }
+        return [row for _, row in sorted(intents_by_id.items(), key=lambda item: item[0])]
+
+    def _pending_record_from_order_intent(self, intent: Mapping[str, object]) -> dict[str, object] | None:
+        status = str(intent.get("status") or "").strip().lower()
+        if status in _ORDER_INTENT_TERMINAL_STATUSES:
+            return None
+        payload = dict(intent.get("payload") or {})
+        payload.setdefault("signal_id", str(intent.get("intent_id") or ""))
+        payload.setdefault("order_id", str(intent.get("broker_order_id") or ""))
+        payload.setdefault("token_id", str(intent.get("token_id") or ""))
+        payload.setdefault("condition_id", str(intent.get("condition_id") or ""))
+        payload.setdefault("side", str(intent.get("side") or ""))
+        payload.setdefault("broker_status", status or "posted")
+        payload.setdefault("recovery_source", str(intent.get("recovered_source") or "db"))
+        payload.setdefault("recovery_status", str(intent.get("recovery_reason") or "db_restore"))
+        payload.setdefault("strategy_order_uuid", str(intent.get("strategy_order_uuid") or ""))
+        payload.setdefault("idempotency_key", str(intent.get("idempotency_key") or ""))
+        payload.setdefault("strategy_name", str(intent.get("strategy_name") or ""))
+        payload.setdefault("signal_source", str(intent.get("signal_source") or ""))
+        payload.setdefault("signal_fingerprint", str(intent.get("signal_fingerprint") or ""))
+        restored = self._restore_pending_order(payload)
+        if restored is None:
+            return None
+        return restored
+
+    def _load_broker_open_orders(self) -> list[OpenOrderSnapshot] | None:
+        try:
+            rows = self.broker.list_open_orders()
+        except Exception as exc:
+            self.log.warning("Broker open orders unavailable during startup recovery err=%s", exc)
+            return None
+        if rows is None:
+            return None
+        return [row for row in rows if isinstance(row, OpenOrderSnapshot)]
+
+    def _load_broker_recent_fills(self) -> list[OrderFillSnapshot] | None:
+        try:
+            rows = self.broker.list_recent_fills(limit=400)
+        except Exception as exc:
+            self.log.warning("Broker recent fills unavailable during startup recovery err=%s", exc)
+            return None
+        if rows is None:
+            return None
+        return [row for row in rows if isinstance(row, OrderFillSnapshot)]
 
     def _normalize_position(self, row: dict[str, object]) -> dict[str, object] | None:
         token_id = str(row.get("token_id") or "").strip()
@@ -3249,6 +5200,7 @@ class Trader:
             "last_exit_label": str(row.get("last_exit_label") or ""),
             "last_exit_summary": str(row.get("last_exit_summary") or ""),
             "last_exit_ts": int(self._safe_float(row.get("last_exit_ts"))),
+            "time_exit_state": normalize_time_exit_state(row.get("time_exit_state")).to_payload(),
         }
 
     def _set_positions_book(self, positions: list[dict[str, object]]) -> int:
@@ -3316,130 +5268,58 @@ class Trader:
         return records
 
     def _reconcile_runtime_state(self) -> None:
-        source = "none"
-        positions: list[dict[str, object]] = []
-        broker_positions_loaded = False
-        snapshot: dict[str, object] | None = None
-        snapshot_positions_by_token: dict[str, dict[str, object]] = {}
-        recovered_risk_state: dict[str, object] | None = None
-        recovered_signal_cycles: list[dict[str, object]] = []
-        recovered_trace_records: list[dict[str, object]] = []
-        recovered_pending_orders: list[dict[str, object]] = []
-        recovered_operator_action: dict[str, object] | None = None
-
-        if not self.settings.dry_run:
-            broker_positions = self._load_broker_positions()
-            if broker_positions is not None:
-                broker_positions_loaded = True
-                positions = broker_positions
-                if positions:
-                    source = "broker"
-
-        snapshot = self._load_runtime_snapshot()
-        if isinstance(snapshot, dict):
-            risk_state_raw = snapshot.get("risk_state")
-            if isinstance(risk_state_raw, dict):
-                recovered_risk_state = risk_state_raw
-            signal_cycles_raw = snapshot.get("signal_cycles")
-            if isinstance(signal_cycles_raw, list):
-                recovered_signal_cycles = [row for row in signal_cycles_raw if isinstance(row, dict)]
-            trace_records_raw = snapshot.get("trace_registry")
-            if isinstance(trace_records_raw, list):
-                recovered_trace_records = [row for row in trace_records_raw if isinstance(row, dict)]
-            pending_orders_raw = snapshot.get("pending_orders")
-            if isinstance(pending_orders_raw, list):
-                recovered_pending_orders = [row for row in pending_orders_raw if isinstance(row, dict)]
-            operator_action_raw = snapshot.get("last_operator_action")
-            if isinstance(operator_action_raw, dict):
-                recovered_operator_action = operator_action_raw
+        source = "db"
+        self._recovery_conflicts = []
+        self._recovery_block_buy_latched = False
+        truth_payload = dict(self._state_store.load_runtime_truth() if self._state_store is not None else {})
+        runtime_snapshot = dict(truth_payload.get("runtime") or {})
+        recovered_risk_state = dict(truth_payload.get("risk") or {})
+        recovered_reconciliation = dict(truth_payload.get("reconciliation") or {})
+        recovered_risk_breakers = dict(truth_payload.get("risk_breakers") or {})
+        recovered_exposure_ledger = [
+            dict(row) for row in list(truth_payload.get("exposure_ledger") or []) if isinstance(row, dict)
+        ]
+        recovered_positions = [
+            dict(row) for row in list(truth_payload.get("positions") or []) if isinstance(row, dict)
+        ]
+        recovered_intents = [
+            dict(row) for row in list(truth_payload.get("order_intents") or []) if isinstance(row, dict)
+        ]
+        recovered_control = dict(truth_payload.get("control") or {})
+        if runtime_snapshot:
             self._last_broker_event_sync_ts = int(
                 self._safe_float(
-                    snapshot.get("broker_event_sync_ts"),
+                    runtime_snapshot.get("broker_event_sync_ts"),
                     self._last_broker_event_sync_ts,
                 )
             )
-            self._restore_recent_order_keys(snapshot.get("recent_order_keys"))
-            recovered = snapshot.get("positions")
-            if isinstance(recovered, list):
-                normalized_snapshot_positions: list[dict[str, object]] = []
-                for row in recovered:
-                    if not isinstance(row, dict):
-                        continue
-                    normalized = self._normalize_position(row)
-                    if not normalized:
-                        continue
-                    snapshot_positions_by_token[str(normalized["token_id"])] = normalized
-                    normalized_snapshot_positions.append(normalized)
-                if (not positions) and (not broker_positions_loaded) and normalized_snapshot_positions:
-                    positions = normalized_snapshot_positions
-                    source = "snapshot"
-
-        recovered_pending_orders = self._restore_pending_orders_from_broker(recovered_pending_orders)
-
-        if broker_positions_loaded and positions:
-            restored_pending_buys_by_token: dict[str, dict[str, object]] = {}
-            for row in sorted(recovered_pending_orders, key=lambda item: int(self._safe_float(item.get("ts")))):
-                restored_pending = self._restore_pending_order(row)
-                if not restored_pending:
-                    continue
-                if str(restored_pending.get("side") or "").upper() != "BUY":
-                    continue
-                token_id = str(restored_pending.get("token_id") or "")
-                if token_id and token_id not in restored_pending_buys_by_token:
-                    restored_pending_buys_by_token[token_id] = restored_pending
-
-            merged_positions: list[dict[str, object]] = []
-            merged_count = 0
-            scaled_count = 0
-            seeded_from_pending_count = 0
-            for row in positions:
-                normalized = self._normalize_position(row)
-                if not normalized:
-                    continue
-                token_id = str(normalized["token_id"])
-                snapshot_position = snapshot_positions_by_token.get(token_id)
-                if snapshot_position:
-                    merged = self._merge_recovered_position(
-                        normalized,
-                        snapshot_position,
-                        recovery_source="runtime_snapshot",
-                    )
-                    if (
-                        abs(float(normalized.get("quantity") or 0.0) - float(snapshot_position.get("quantity") or 0.0)) > 1e-6
-                        and abs(
-                            float(merged.get("cost_basis_notional") or 0.0)
-                            - float(snapshot_position.get("cost_basis_notional") or snapshot_position.get("notional") or 0.0)
-                        ) > 1e-6
-                    ):
-                        scaled_count += 1
-                    normalized = merged
-                    merged_count += 1
-                else:
-                    pending_buy = restored_pending_buys_by_token.get(token_id)
-                    if pending_buy is not None:
-                        normalized = self._seed_position_from_pending_order(normalized, pending_buy)
-                        seeded_from_pending_count += 1
-                merged_positions.append(normalized)
-            positions = merged_positions
-            if merged_count > 0 or seeded_from_pending_count > 0:
-                source = "broker+snapshot" if merged_count > 0 else "broker+pending"
-                self.log.info(
-                    "Recovered broker positions with startup metadata merged=%d scaled_cost_basis=%d seeded_from_pending=%d",
-                    merged_count,
-                    scaled_count,
-                    seeded_from_pending_count,
+            self._restore_recent_order_keys(runtime_snapshot.get("recent_order_keys"))
+            signal_cycles_raw = runtime_snapshot.get("signal_cycles")
+            if isinstance(signal_cycles_raw, list):
+                self.recent_signal_cycles = deque(
+                    [row for row in signal_cycles_raw if isinstance(row, dict)][-24:],
+                    maxlen=24,
                 )
-                self._append_event(
-                    "runtime_reconcile",
-                    {
-                        "source": "broker_startup_merge",
-                        "merged_positions": merged_count,
-                        "scaled_cost_basis": scaled_count,
-                        "seeded_from_pending": seeded_from_pending_count,
-                    },
-                )
+            trace_records_raw = runtime_snapshot.get("trace_registry")
+            if isinstance(trace_records_raw, list):
+                self._trace_registry = {}
+                self._trace_order = deque(maxlen=64)
+                for row in trace_records_raw[-64:]:
+                    trace_id = str(row.get("trace_id") or "").strip()
+                    if not trace_id:
+                        continue
+                    self._trace_registry[trace_id] = dict(row)
+                    self._trace_order.append(trace_id)
+            operator_action_raw = runtime_snapshot.get("last_operator_action")
+            if isinstance(operator_action_raw, dict):
+                self.last_operator_action = dict(operator_action_raw)
+            kill_switch_raw = runtime_snapshot.get("kill_switch")
+            if isinstance(kill_switch_raw, dict):
+                self._kill_switch_state = normalize_kill_switch_state(kill_switch_raw)
+            self._runner_heartbeat = normalize_runner_heartbeat(runtime_snapshot.get("runner_heartbeat"))
+            self._buy_blocked_since_ts = max(0, int(self._safe_float(runtime_snapshot.get("buy_blocked_since_ts"), 0)))
 
-        if recovered_risk_state is not None:
+        if recovered_risk_state:
             recovered_day_key = str(recovered_risk_state.get("day_key") or "").strip()
             if not recovered_day_key or recovered_day_key == self._active_day_key:
                 self.state.daily_realized_pnl = self._safe_float(
@@ -3468,50 +5348,269 @@ class Trader:
                     self.state.account_snapshot_ts,
                 )
             )
-        if recovered_signal_cycles:
-            self.recent_signal_cycles = deque(recovered_signal_cycles[-24:], maxlen=24)
-        if recovered_trace_records:
-            self._trace_registry = {}
-            self._trace_order = deque(maxlen=64)
-            for row in recovered_trace_records[-64:]:
-                trace_id = str(row.get("trace_id") or "").strip()
-                if not trace_id:
+            self._risk_ledger_status = str(recovered_risk_state.get("risk_ledger_status") or self._risk_ledger_status or "ok")
+            self._risk_breaker_status = str(
+                recovered_risk_state.get("risk_breaker_status") or self._risk_breaker_status or "ok"
+            )
+
+        if recovered_risk_breakers:
+            self._risk_breaker_state = RiskBreakerState.from_payload(recovered_risk_breakers).to_payload()
+        else:
+            self._risk_breaker_state = default_risk_breaker_state(day_key=self._risk_day_key(), now_ts=int(time.time()))
+
+        if recovered_exposure_ledger:
+            recovered_rows: dict[tuple[str, str], dict[str, object]] = {}
+            for row in recovered_exposure_ledger:
+                normalized = ExposureLedgerEntry.from_payload(row).to_payload()
+                scope_type = str(normalized.get("scope_type") or "").strip().lower()
+                scope_key = str(normalized.get("scope_key") or "").strip()
+                if not scope_type or not scope_key:
                     continue
-                self._trace_registry[trace_id] = dict(row)
-                self._trace_order.append(trace_id)
-        if recovered_pending_orders:
-            self.pending_orders = {}
-            for row in recovered_pending_orders:
-                restored = self._restore_pending_order(row)
-                if not restored:
-                    continue
-                self.pending_orders[str(restored["key"])] = restored
-        if recovered_operator_action is not None:
-            self.last_operator_action = dict(recovered_operator_action)
+                recovered_rows[(scope_type, scope_key)] = normalized
+            self._exposure_ledger = recovered_rows
+
+        db_positions_by_token: dict[str, dict[str, object]] = {}
+        for row in recovered_positions:
+            normalized = self._normalize_position(row)
+            if normalized is None:
+                continue
+            db_positions_by_token[str(normalized["token_id"])] = normalized
+
+        intents: list[dict[str, object]] = []
+        for row in recovered_intents:
+            token_id = str(row.get("token_id") or "").strip()
+            side = str(row.get("side") or "").strip().upper()
+            intent_id = str(row.get("intent_id") or "").strip()
+            if not token_id or side not in {"BUY", "SELL"} or not intent_id:
+                continue
+            intents.append(row)
+
+        if recovered_control:
+            self.control_state = ControlState.from_payload(recovered_control)
+
+        if not self.settings.dry_run:
+            broker_positions = self._load_broker_positions()
+            broker_open_orders = self._load_broker_open_orders()
+            broker_fills = list(self._load_broker_recent_fills() or [])
+            if broker_positions is None or broker_open_orders is None:
+                self._record_recovery_conflict(
+                    category="BROKER_UNAVAILABLE",
+                    details="broker positions or open orders unavailable during startup recovery",
+                )
+            else:
+                source = "broker+db"
+                broker_positions_by_token: dict[str, dict[str, object]] = {}
+                for row in broker_positions:
+                    normalized = self._normalize_position(row)
+                    if normalized is None:
+                        continue
+                    broker_positions_by_token[str(normalized["token_id"])] = normalized
+
+                merged_positions: dict[str, dict[str, object]] = {}
+                for token_id, broker_row in broker_positions_by_token.items():
+                    db_row = db_positions_by_token.get(token_id)
+                    if db_row is not None:
+                        merged_positions[token_id] = self._merge_recovered_position(
+                            broker_row,
+                            db_row,
+                            recovery_source="db_snapshot",
+                        )
+                    else:
+                        pending_buy_intent = next(
+                            (
+                                intent
+                                for intent in intents
+                                if str(intent.get("token_id") or "") == token_id
+                                and str(intent.get("side") or "").upper() == "BUY"
+                                and str(intent.get("status") or "").lower() not in _ORDER_INTENT_TERMINAL_STATUSES
+                            ),
+                            None,
+                        )
+                        if pending_buy_intent is not None:
+                            pending_payload = dict(pending_buy_intent.get("payload") or {})
+                            pending_payload.setdefault("token_id", token_id)
+                            pending_payload.setdefault("side", "BUY")
+                            merged_positions[token_id] = self._seed_position_from_pending_order(
+                                dict(broker_row),
+                                pending_payload,
+                            )
+                        else:
+                            merged_positions[token_id] = dict(broker_row)
+
+                for token_id, db_row in db_positions_by_token.items():
+                    if token_id in merged_positions:
+                        continue
+                    close_evidence = any(
+                        str(fill.token_id or "") == token_id and str(fill.side or "").upper() == "SELL"
+                        for fill in broker_fills
+                    )
+                    if close_evidence:
+                        continue
+                    self._record_recovery_conflict(
+                        category="AMBIGUOUS_POSITION",
+                        token_id=token_id,
+                        details="db_position_without_broker_and_without_close_evidence",
+                    )
+                    merged_positions[token_id] = dict(db_row)
+
+                open_by_order_id = {
+                    str(item.order_id or "").strip(): item
+                    for item in broker_open_orders
+                    if str(item.order_id or "").strip()
+                }
+                next_intents: list[dict[str, object]] = []
+                seen_open_order_ids: set[str] = set()
+                for intent in intents:
+                    broker_order_id = str(intent.get("broker_order_id") or "").strip()
+                    status = str(intent.get("status") or "posted").strip().lower() or "posted"
+                    token_id = str(intent.get("token_id") or "").strip()
+                    side = str(intent.get("side") or "").strip().upper()
+                    if status in _ORDER_INTENT_TERMINAL_STATUSES:
+                        next_intents.append(intent)
+                        continue
+                    open_order = open_by_order_id.get(broker_order_id)
+                    if open_order is not None:
+                        seen_open_order_ids.add(broker_order_id)
+                        status = str(open_order.lifecycle_status or "posted").strip().lower() or "posted"
+                        updated_payload = dict(intent.get("payload") or {})
+                        updated_payload.update(
+                            {
+                                "order_id": str(open_order.order_id or ""),
+                                "token_id": str(open_order.token_id or token_id),
+                                "condition_id": str(open_order.condition_id or intent.get("condition_id") or ""),
+                                "side": str(open_order.side or side).upper(),
+                                "broker_status": status,
+                                "requested_price": float(open_order.price or 0.0),
+                                "requested_notional": float(open_order.requested_notional or 0.0),
+                                "matched_size_hint": float(open_order.matched_size or 0.0),
+                                "matched_notional_hint": float(open_order.matched_notional or 0.0),
+                                "recovery_source": "broker",
+                                "recovery_status": "broker_open_order",
+                            }
+                        )
+                        intent["status"] = status
+                        intent["payload"] = updated_payload
+                        intent["updated_ts"] = int(time.time())
+                        next_intents.append(intent)
+                        continue
+                    has_fill_evidence = False
+                    for fill in broker_fills:
+                        if broker_order_id and str(fill.order_id or "").strip() == broker_order_id:
+                            has_fill_evidence = True
+                            break
+                        if not broker_order_id and token_id and str(fill.token_id or "").strip() == token_id and str(fill.side or "").upper() == side:
+                            has_fill_evidence = True
+                            break
+                    if has_fill_evidence:
+                        intent["status"] = "filled"
+                        intent["updated_ts"] = int(time.time())
+                        next_intents.append(intent)
+                        continue
+                    self._record_recovery_conflict(
+                        category="AMBIGUOUS_PENDING",
+                        token_id=token_id,
+                        order_id=broker_order_id,
+                        details="db_pending_without_broker_open_and_without_fill_evidence",
+                    )
+                    conflict_ts = int(time.time())
+                    conflict_reason = "db_pending_without_broker_open_and_without_fill_evidence"
+                    updated_payload = dict(intent.get("payload") or {})
+                    updated_payload["recovery_source"] = "db"
+                    updated_payload["recovery_status"] = conflict_reason
+                    updated_payload["reconcile_ambiguous_reason"] = conflict_reason
+                    updated_payload["reconcile_ambiguous_ts"] = conflict_ts
+                    intent["status"] = "posted"
+                    intent["recovered_source"] = "db"
+                    intent["recovery_reason"] = conflict_reason
+                    intent["payload"] = updated_payload
+                    intent["updated_ts"] = conflict_ts
+                    next_intents.append(intent)
+
+                for order_id, open_order in open_by_order_id.items():
+                    if order_id in seen_open_order_ids:
+                        continue
+                    intent_id = f"broker-recovered:{order_id}"
+                    status = str(open_order.lifecycle_status or "posted").strip().lower() or "posted"
+                    payload = {
+                        "key": intent_id,
+                        "signal_id": intent_id,
+                        "order_id": order_id,
+                        "token_id": str(open_order.token_id or ""),
+                        "condition_id": str(open_order.condition_id or ""),
+                        "market_slug": str(open_order.market_slug or ""),
+                        "outcome": str(open_order.outcome or "YES"),
+                        "side": str(open_order.side or "").upper(),
+                        "broker_status": status,
+                        "requested_price": float(open_order.price or 0.0),
+                        "requested_notional": float(open_order.requested_notional or 0.0),
+                        "matched_size_hint": float(open_order.matched_size or 0.0),
+                        "matched_notional_hint": float(open_order.matched_notional or 0.0),
+                        "ts": int(open_order.created_ts or time.time()),
+                        "recovery_source": "broker",
+                        "recovery_status": "broker_open_without_db_intent",
+                        "message": "broker recovered open order",
+                        "reason": "broker recovered open order",
+                    }
+                    next_intents.append(
+                        {
+                            "intent_id": intent_id,
+                            "strategy_order_uuid": "",
+                            "broker_order_id": order_id,
+                            "token_id": str(open_order.token_id or ""),
+                            "condition_id": str(open_order.condition_id or ""),
+                            "side": str(open_order.side or "").upper(),
+                            "status": status,
+                            "recovered_source": "broker",
+                            "recovery_reason": "broker_open_without_db_intent",
+                            "payload": payload,
+                            "created_ts": int(open_order.created_ts or time.time()),
+                            "updated_ts": int(time.time()),
+                        }
+                    )
+                    self._record_recovery_conflict(
+                        category="BROKER_OPEN_WITHOUT_INTENT",
+                        token_id=str(open_order.token_id or ""),
+                        order_id=order_id,
+                        details="broker open order recovered from exchange without db intent",
+                    )
+
+                intents = next_intents
+                db_positions_by_token = merged_positions
+
+        self.pending_orders = {}
+        for intent in intents:
+            restored = self._pending_record_from_order_intent(intent)
+            if restored is None:
+                continue
+            self.pending_orders[str(restored["key"])] = restored
+
+        if db_positions_by_token:
+            self._set_positions_book(list(db_positions_by_token.values()))
+            self.log.info("Recovered positions source=%s count=%d", source, len(db_positions_by_token))
+        else:
+            self.positions_book = {}
+            self._refresh_risk_state()
+            self.log.info("No positions found for startup reconcile")
+
+        if recovered_reconciliation:
+            self.reconciliation_status = str(recovered_reconciliation.get("status") or self.reconciliation_status or "unknown")
 
         ledger_realized_pnl = self._recover_daily_realized_pnl_from_ledger(self._active_day_key)
         if ledger_realized_pnl is not None:
             self.state.daily_realized_pnl = float(ledger_realized_pnl)
 
-        if positions:
-            count = self._set_positions_book(positions)
-            self.log.info("Recovered positions source=%s count=%d", source, count)
-            self._append_event(
-                "runtime_reconcile",
-                {
-                    "source": source,
-                    "count": count,
-                },
-            )
-            return
-
+        self._append_event(
+            "runtime_reconcile",
+            {
+                "source": source,
+                "position_count": int(len(self.positions_book)),
+                "pending_count": int(len(self.pending_orders)),
+                "recovery_conflicts": list(self._recovery_conflicts),
+            },
+        )
+        self._load_control_state()
+        self._kill_switch_state = normalize_kill_switch_state(self._kill_switch_state)
         self._refresh_risk_state()
-        if recovered_risk_state is not None and source == "snapshot":
-            self.log.info(
-                "Recovered runtime risk_state without active positions; keeping pnl and clearing open_positions"
-            )
-        else:
-            self.log.info("No positions found for startup reconcile")
 
     def _reconcile_runtime_with_broker(self) -> None:
         dry_run_pending_reconcile = self._supports_dry_run_pending_reconcile()
@@ -3998,6 +6097,70 @@ class Trader:
         }
 
     @staticmethod
+    def _time_exit_state(position: dict[str, object] | None) -> dict[str, object]:
+        source = position or {}
+        return normalize_time_exit_state(source.get("time_exit_state")).to_payload()
+
+    @staticmethod
+    def _set_time_exit_state(position: dict[str, object], state: object) -> dict[str, object]:
+        payload = normalize_time_exit_state(state).to_payload()
+        position["time_exit_state"] = payload
+        return payload
+
+    def _time_exit_market_snapshot(self, position: dict[str, object]) -> tuple[float, float, float]:
+        token_id = str(position.get("token_id") or "")
+        if not token_id:
+            return 0.0, 0.0, 0.0
+        best_bid = 0.0
+        best_ask = 0.0
+        midpoint = 0.0
+        try:
+            order_book = self.data_client.get_order_book(token_id)
+        except Exception:
+            order_book = None
+        if order_book is not None:
+            best_bid = self._safe_float(getattr(order_book, "best_bid", 0.0))
+            best_ask = self._safe_float(getattr(order_book, "best_ask", 0.0))
+        try:
+            midpoint = self._safe_float(self.data_client.get_midpoint_price(token_id))
+        except Exception:
+            midpoint = 0.0
+        if midpoint <= 0.0 and best_bid > 0.0 and best_ask > 0.0:
+            midpoint = (best_bid + best_ask) / 2.0
+        return best_bid, best_ask, midpoint
+
+    def _time_exit_priority_state(
+        self,
+        position: dict[str, object],
+        *,
+        now: int,
+    ) -> dict[str, object]:
+        current_state = normalize_time_exit_state(position.get("time_exit_state"))
+        best_bid, best_ask, midpoint = self._time_exit_market_snapshot(position)
+        volatility_bps = estimate_time_exit_volatility_bps(
+            best_bid=best_bid,
+            best_ask=best_ask,
+            midpoint=midpoint,
+            reference_price=self._safe_float(position.get("price"), 0.0),
+        )
+        next_state = begin_time_exit_attempt(
+            current_state,
+            now_ts=now,
+            market_volatility_bps=volatility_bps,
+            volatility_step_bps=float(self.settings.time_exit_priority_volatility_step_bps),
+        )
+        return {
+            "state": next_state,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "midpoint": midpoint,
+            "volatility_bps": volatility_bps,
+            "force_exit": next_state.stage == TIME_EXIT_STAGE_FORCE_EXIT,
+            "priority": int(next_state.priority),
+            "priority_reason": str(next_state.priority_reason or ""),
+        }
+
+    @staticmethod
     def _signal_entry_context(signal: Signal, reason: str) -> dict[str, object]:
         return {
             "entry_wallet": str(signal.wallet or ""),
@@ -4281,6 +6444,7 @@ class Trader:
             "reconciled_notional_hint": float(order.get("reconciled_notional_hint") or 0.0),
             "reconciled_size_hint": float(order.get("reconciled_size_hint") or 0.0),
             "last_fill_ts_hint": int(order.get("last_fill_ts_hint") or 0),
+            "strategy_order_uuid": str(order.get("strategy_order_uuid") or ""),
         }
 
     @staticmethod
@@ -4557,6 +6721,11 @@ class Trader:
             "last_fill_tx_hash": "",
             "message": str(result.message or order_reason),
             "reason": str(order_reason or result.message or ""),
+            "strategy_order_uuid": str(order_meta.get("strategy_order_uuid") or ""),
+            "idempotency_key": str(order_meta.get("idempotency_key") or ""),
+            "strategy_name": str(order_meta.get("strategy_name") or ""),
+            "signal_source": str(order_meta.get("signal_source") or ""),
+            "signal_fingerprint": str(order_meta.get("signal_fingerprint") or ""),
             "previous_notional": float(previous.get("notional") or 0.0),
             "previous_quantity": float(previous.get("quantity") or 0.0),
             "entry_wallet": str(entry_context.get("entry_wallet") or ""),
@@ -4839,6 +7008,7 @@ class Trader:
             "last_exit_label",
             "last_exit_summary",
             "last_exit_ts",
+            "time_exit_state",
         ):
             value = source.get(key)
             if value not in (None, "", 0, 0.0):
@@ -5542,7 +7712,13 @@ class Trader:
         candidate_id: str = "",
         candidate_action: str = "",
         candidate_origin: str = "",
+        block_reason: str = "",
+        block_layer: str = "",
     ) -> dict[str, object]:
+        normalized_block_reason = str(
+            block_reason or skip_reason or (decision.reason if decision and not decision.allowed else "")
+        ).strip()
+        normalized_block_layer = str(block_layer or ("decision" if normalized_block_reason else "")).strip()
         snapshot = {
             "control": {
                 "decision_mode": str(control.decision_mode or self.decision_mode or self.settings.decision_mode or "manual"),
@@ -5577,6 +7753,8 @@ class Trader:
             "netting_limited": bool(netting_limited),
             "duplicate": bool(duplicate),
             "skip_reason": str(skip_reason or ""),
+            "block_reason": normalized_block_reason,
+            "block_layer": normalized_block_layer,
             "candidate_id": str(candidate_id or ""),
             "candidate_action": str(candidate_action or ""),
             "candidate_origin": str(candidate_origin or ""),
@@ -5678,15 +7856,26 @@ class Trader:
                     "last_exit_label": str(pos.get("last_exit_label") or ""),
                     "last_exit_summary": str(pos.get("last_exit_summary") or ""),
                     "last_exit_ts": int(pos.get("last_exit_ts") or 0),
+                    "time_exit_state": self._time_exit_state(pos),
                 }
             )
 
         return {
             "ts": int(time.time()),
-            "runtime_version": 7,
+            "runtime_version": 9,
             "broker_event_sync_ts": int(self._last_broker_event_sync_ts),
             "trading_mode": self.trading_mode_state(),
+            "admission": self.admission_state(),
+            "kill_switch": self.kill_switch_state(),
+            "signer_security": self.signer_security_state(),
+            "runner_heartbeat": normalize_runner_heartbeat(self._runner_heartbeat),
+            "buy_blocked_since_ts": int(self._buy_blocked_since_ts or 0),
+            "buy_blocked": self.buy_blocked_state(),
             "persistence": self.persistence_state(),
+            "recovery": {
+                "blocked_buy": bool(self._recovery_block_buy_latched),
+                "conflicts": list(self._recovery_conflicts),
+            },
             "startup": {
                 "ready": bool(self.startup_ready),
                 "warning_count": int(self.startup_warning_count),
@@ -5707,7 +7896,52 @@ class Trader:
                 "cash_balance_usd": float(self.state.cash_balance_usd),
                 "positions_value_usd": float(self.state.positions_value_usd),
                 "account_snapshot_ts": int(self.state.account_snapshot_ts),
+                "valuation_currency": "USD",
+                "risk_ledger_status": str(self.state.risk_ledger_status or "ok"),
+                "risk_breaker_status": str(self.state.risk_breaker_status or "ok"),
+                "wallet_exposure_committed_usd": float(self.state.wallet_exposure_committed_usd),
+                "wallet_exposure_cap_usd": float(self.state.wallet_exposure_cap_usd),
+                "wallet_exposure_usage_pct": (
+                    float(self.state.wallet_exposure_committed_usd) / float(self.state.wallet_exposure_cap_usd)
+                    if float(self.state.wallet_exposure_cap_usd) > 0.0
+                    else 0.0
+                ),
+                "portfolio_exposure_committed_usd": float(self.state.portfolio_exposure_committed_usd),
+                "portfolio_exposure_cap_usd": float(self.state.portfolio_exposure_cap_usd),
+                "portfolio_exposure_usage_pct": (
+                    float(self.state.portfolio_exposure_committed_usd) / float(self.state.portfolio_exposure_cap_usd)
+                    if float(self.state.portfolio_exposure_cap_usd) > 0.0
+                    else 0.0
+                ),
+                "condition_exposure_key": str(self.state.condition_exposure_key or ""),
+                "condition_exposure_committed_usd": float(self.state.condition_exposure_committed_usd),
+                "condition_exposure_cap_usd": float(self.state.condition_exposure_cap_usd),
+                "condition_exposure_usage_pct": (
+                    float(self.state.condition_exposure_committed_usd) / float(self.state.condition_exposure_cap_usd)
+                    if float(self.state.condition_exposure_cap_usd) > 0.0
+                    else 0.0
+                ),
+                "loss_streak_count": int(self.state.loss_streak_count),
+                "loss_streak_current": int(self.state.loss_streak_count),
+                "loss_streak_limit": int(self.state.loss_streak_limit),
+                "loss_streak_blocked": bool(self.state.loss_streak_blocked),
+                "intraday_drawdown_pct": float(self.state.intraday_drawdown_pct),
+                "intraday_drawdown_current": float(self.state.intraday_drawdown_pct),
+                "intraday_drawdown_limit_pct": float(self.state.intraday_drawdown_limit_pct),
+                "intraday_drawdown_blocked": bool(self.state.intraday_drawdown_blocked),
+                "risk_breaker_opening_allowed": bool(self.state.risk_breaker_opening_allowed),
+                "risk_breaker_reason_codes": list(self.state.risk_breaker_reason_codes),
+                "reason_codes": list(self.state.risk_breaker_reason_codes),
+                "breaker_latched": bool(
+                    bool(self.state.loss_streak_blocked)
+                    or bool(self.state.intraday_drawdown_blocked)
+                    or not bool(self.state.risk_breaker_opening_allowed)
+                ),
+                "risk_day_key": str(self.state.risk_day_key or ""),
+                "risk_breaker_timezone": str(getattr(self.settings, "risk_breaker_timezone", "UTC") or "UTC"),
             },
+            "risk_breakers": dict(self._risk_breaker_state or {}),
+            "exposure_ledger": [dict(row) for row in self._exposure_ledger.values()],
             "positions": positions,
             "pending_orders": list(self.pending_orders.values()),
             "recent_order_keys": dict(self._recent_order_keys),
@@ -5718,6 +7952,24 @@ class Trader:
 
     def persist_runtime_state(self, path: str) -> None:
         payload = self._dump_runtime_state()
+        try:
+            if self._state_store is None:
+                raise RuntimeError("runtime truth store unavailable")
+            self._state_store.save_runtime_truth(
+                {
+                    "runtime": dict(payload),
+                    "control": self._control_payload_from_runtime(self.control_state),
+                    "risk": dict(payload.get("risk_state") or {}),
+                    "reconciliation": dict(self.reconciliation_summary(now=int(time.time()))),
+                    "risk_breakers": dict(self._risk_breaker_state or {}),
+                    "exposure_ledger": [dict(row) for row in self._exposure_ledger.values()],
+                    "positions": [dict(row) for row in list(payload.get("positions") or []) if isinstance(row, dict)],
+                    "order_intents": self._build_order_intents_snapshot(),
+                }
+            )
+        except Exception as exc:
+            self._record_persistence_fault(kind="runtime_truth_write", path=self.settings.state_store_path, error=exc)
+            raise
         resolved_path = str(Path(path).expanduser())
         parent = Path(resolved_path).parent
         if str(parent) not in {"", "."}:
@@ -5728,30 +7980,69 @@ class Trader:
                 json.dump(payload, f, ensure_ascii=False)
             os.replace(tmp_path, resolved_path)
         except Exception as exc:
-            self._record_persistence_fault(kind="runtime_state_write", path=resolved_path, error=exc)
-            raise
+            self.log.warning("Runtime export write failed path=%s err=%s", resolved_path, exc)
 
     def _load_control_state(self) -> ControlState:
         payload: dict[str, object] = {}
-        try:
-            with open(self.settings.control_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                payload = data
-        except FileNotFoundError:
-            payload = {}
-        except Exception as exc:
-            self.log.warning("Control state read failed path=%s err=%s", self.settings.control_path, exc)
-            payload = {}
+        read_failed = False
+        if self._state_store is not None:
+            try:
+                payload = dict(self._state_store.load_control_state() or {})
+            except Exception as exc:
+                self.log.error("Control state read failed db=%s err=%s", self.settings.state_store_path, exc)
+                self._record_persistence_fault(kind="control_state_read", path=self.settings.state_store_path, error=exc)
+                read_failed = True
+                payload = {}
+        if read_failed:
+            self._recovery_block_buy_latched = True
+            self._record_recovery_conflict(
+                category="CONTROL_STATE_UNAVAILABLE",
+                details="control state read failed",
+            )
+            payload = {
+                "decision_mode": "manual",
+                "pause_opening": True,
+                "reduce_only": True,
+                "emergency_stop": False,
+                "clear_stale_pending_requested_ts": 0,
+                "clear_risk_breakers_requested_ts": 0,
+                "updated_ts": int(time.time()),
+            }
+        elif not payload:
+            payload = {
+                "decision_mode": self._normalize_decision_mode(self.settings.decision_mode),
+                "pause_opening": False,
+                "reduce_only": False,
+                "emergency_stop": False,
+                "clear_stale_pending_requested_ts": 0,
+                "clear_risk_breakers_requested_ts": 0,
+                "updated_ts": 0,
+            }
 
-        state = ControlState(
-            decision_mode=self._normalize_decision_mode(payload.get("decision_mode", self.settings.decision_mode)),
-            pause_opening=bool(payload.get("pause_opening", False)),
-            reduce_only=bool(payload.get("reduce_only", False)),
-            emergency_stop=bool(payload.get("emergency_stop", False)),
-            clear_stale_pending_requested_ts=int(payload.get("clear_stale_pending_requested_ts") or 0),
-            updated_ts=int(payload.get("updated_ts") or 0),
-        )
+        validation_errors = self._validate_control_payload(payload)
+        if validation_errors:
+            self._recovery_block_buy_latched = True
+            self._record_recovery_conflict(
+                category="CONTROL_STATE_INVALID",
+                details=";".join(validation_errors),
+            )
+            payload = {
+                "decision_mode": "manual",
+                "pause_opening": True,
+                "reduce_only": True,
+                "emergency_stop": False,
+                "clear_stale_pending_requested_ts": 0,
+                "clear_risk_breakers_requested_ts": 0,
+                "updated_ts": int(time.time()),
+            }
+            if self._state_store is not None:
+                try:
+                    self._state_store.save_control_state(payload)
+                except Exception as exc:
+                    self.log.error("Persist fail-closed control state failed db=%s err=%s", self.settings.state_store_path, exc)
+
+        state = ControlState.from_payload(payload)
+        state.decision_mode = self._normalize_decision_mode(state.decision_mode)
 
         signature = (
             state.decision_mode,
@@ -5759,17 +8050,19 @@ class Trader:
             state.reduce_only,
             state.emergency_stop,
             state.clear_stale_pending_requested_ts,
+            state.clear_risk_breakers_requested_ts,
             state.updated_ts,
         )
         if signature != self._last_control_signature:
             self._last_control_signature = signature
             self.log.info(
-                "CONTROL decision_mode=%s pause_opening=%s reduce_only=%s emergency_stop=%s clear_stale_pending_requested_ts=%d updated_ts=%d",
+                "CONTROL decision_mode=%s pause_opening=%s reduce_only=%s emergency_stop=%s clear_stale_pending_requested_ts=%d clear_risk_breakers_requested_ts=%d updated_ts=%d",
                 state.decision_mode,
                 state.pause_opening,
                 state.reduce_only,
                 state.emergency_stop,
                 state.clear_stale_pending_requested_ts,
+                state.clear_risk_breakers_requested_ts,
                 state.updated_ts,
             )
 
@@ -5872,6 +8165,39 @@ class Trader:
                     "pending_orders": len(self.pending_orders),
                 },
             )
+
+    def _apply_operator_clear_risk_breakers(self, control: ControlState) -> None:
+        request_ts = int(control.clear_risk_breakers_requested_ts or 0)
+        if request_ts <= 0 or request_ts <= self._last_operator_risk_breaker_clear_ts:
+            return
+        self._last_operator_risk_breaker_clear_ts = request_ts
+        current = RiskBreakerState.from_payload(self._risk_breaker_state)
+        current.loss_streak_count = 0
+        current.loss_streak_blocked = False
+        current.intraday_drawdown_blocked = False
+        current.intraday_drawdown_pct = 0.0
+        current.reason_codes = tuple()
+        current.opening_allowed = True
+        current.manual_lock = False
+        current.manual_required = False
+        current.updated_ts = int(time.time())
+        self._risk_breaker_state = current.to_payload()
+        self.last_operator_action = {
+            "name": "clear_risk_breakers",
+            "requested_ts": request_ts,
+            "processed_ts": int(time.time()),
+            "status": "cleared",
+            "message": "loss streak and intraday drawdown breakers cleared",
+        }
+        self._append_event(
+            "operator_clear_risk_breakers",
+            {
+                "requested_ts": request_ts,
+                "day_key": str(current.day_key or ""),
+                "loss_streak_count": int(current.loss_streak_count or 0),
+            },
+        )
+        self._refresh_risk_state()
 
     def _apply_emergency_exit(self) -> None:
         if not self.positions_book:
@@ -6408,7 +8734,7 @@ class Trader:
             "candidates": [],
         }
         cycle_has_candidates = False
-
+        time_exit_plan: list[dict[str, object]] = []
         for token_id in list(self.positions_book.keys()):
             position = self.positions_book.get(token_id)
             if not position:
@@ -6418,21 +8744,80 @@ class Trader:
             if now - opened_ts < stale_seconds:
                 continue
 
+            current_notional = float(position.get("notional") or 0.0)
+            current_qty = float(position.get("quantity") or 0.0)
+            if current_notional <= 0.0 or current_qty <= 0.0:
+                continue
+
+            current_state = normalize_time_exit_state(position.get("time_exit_state"))
+            if not should_attempt_time_exit(current_state, now_ts=now):
+                continue
+
             last_trim_ts = int(position.get("last_trim_ts") or 0)
-            if now - last_trim_ts < trim_cooldown:
+            if current_state.stage != TIME_EXIT_STAGE_FORCE_EXIT and now - last_trim_ts < trim_cooldown:
+                continue
+
+            priority_state = self._time_exit_priority_state(position, now=now)
+            force_exit_active = bool(priority_state["force_exit"])
+            full_close = current_notional <= close_notional or force_exit_active
+            exit_fraction = 1.0 if full_close else trim_pct
+            target_notional = current_notional if full_close else (current_notional * trim_pct)
+            if target_notional <= 0.0:
+                continue
+            if not force_exit_active and target_notional < actionable_floor:
+                continue
+
+            time_exit_plan.append(
+                {
+                    "token_id": token_id,
+                    "position": position,
+                    "priority_state": priority_state,
+                    "priority": int(priority_state["priority"]),
+                    "hold_minutes": self._position_hold_minutes(position, now),
+                    "target_notional": float(target_notional),
+                    "full_close": bool(full_close),
+                    "exit_fraction": float(exit_fraction),
+                    "force_exit_active": force_exit_active,
+                }
+            )
+
+        time_exit_plan.sort(
+            key=lambda row: (
+                int(row["priority"]),
+                int(row["hold_minutes"]),
+                float(row["target_notional"]),
+            ),
+            reverse=True,
+        )
+
+        for plan in time_exit_plan:
+            token_id = str(plan["token_id"])
+            position = self.positions_book.get(token_id)
+            if not position:
                 continue
 
             current_notional = float(position.get("notional") or 0.0)
             current_qty = float(position.get("quantity") or 0.0)
-            if current_notional <= 0 or current_qty <= 0:
+            if current_notional <= 0.0 or current_qty <= 0.0:
                 continue
 
-            full_close = current_notional <= close_notional
+            current_state = begin_time_exit_attempt(
+                normalize_time_exit_state(position.get("time_exit_state")),
+                now_ts=now,
+                market_volatility_bps=float(plan["priority_state"]["volatility_bps"]),
+                volatility_step_bps=float(self.settings.time_exit_priority_volatility_step_bps),
+            )
+            state_payload = self._set_time_exit_state(position, current_state)
+            force_exit_active = current_state.stage == TIME_EXIT_STAGE_FORCE_EXIT
+            full_close = current_notional <= close_notional or force_exit_active
             exit_fraction = 1.0 if full_close else trim_pct
             target_notional = current_notional if full_close else (current_notional * trim_pct)
-            if target_notional < actionable_floor:
+            if target_notional <= 0.0:
+                continue
+            if not force_exit_active and target_notional < actionable_floor:
                 continue
 
+            exit_summary = "time-exit force-exit" if force_exit_active else "time-exit"
             sig = Signal(
                 signal_id=self._new_signal_id(now),
                 trace_id=str(position.get("trace_id") or self._new_trace_id(token_id, now)),
@@ -6447,6 +8832,7 @@ class Trader:
                 observed_size=current_qty if full_close else (current_qty * trim_pct),
                 observed_notional=target_notional,
                 timestamp=datetime.now(tz=timezone.utc),
+                exit_reason=exit_summary,
                 position_action="exit" if full_close or exit_fraction >= 0.95 else "trim",
                 position_action_label=time_exit_label if full_close or exit_fraction >= 0.95 else time_trim_label,
             )
@@ -6474,6 +8860,13 @@ class Trader:
                 "trim_cooldown": int(trim_cooldown),
                 "close_notional_threshold": float(close_notional),
                 "target_notional": float(target_notional),
+                "time_exit_stage": str(state_payload.get("stage") or TIME_EXIT_STAGE_IDLE),
+                "time_exit_failures": int(state_payload.get("consecutive_failures") or 0),
+                "time_exit_priority": int(state_payload.get("priority") or 0),
+                "time_exit_priority_reason": str(state_payload.get("priority_reason") or ""),
+                "time_exit_market_volatility_bps": float(state_payload.get("market_volatility_bps") or 0.0),
+                "time_exit_force_exit": bool(force_exit_active),
+                "time_exit_next_retry_ts": int(state_payload.get("next_retry_ts") or 0),
             }
             result = self.broker.execute(sig, target_notional)
             if not result.ok:
@@ -6498,6 +8891,28 @@ class Trader:
                         reason=str(result.message or ""),
                         now=now,
                     )
+                next_state = current_state if retired else record_time_exit_failure(
+                    current_state,
+                    now_ts=now,
+                    retry_limit=int(self.settings.time_exit_retry_limit),
+                    retry_cooldown_seconds=int(self.settings.time_exit_retry_cooldown_seconds),
+                    volatility_step_bps=float(self.settings.time_exit_priority_volatility_step_bps),
+                    error_message=str(result.message or ""),
+                )
+                if not retired:
+                    self._set_time_exit_state(position, next_state)
+                    if current_state.stage != TIME_EXIT_STAGE_FORCE_EXIT and next_state.stage == TIME_EXIT_STAGE_FORCE_EXIT:
+                        self._append_event(
+                            "time_exit_force_armed",
+                            {
+                                "token_id": token_id,
+                                "market_slug": sig.market_slug,
+                                "trace_id": sig.trace_id,
+                                "priority": int(next_state.priority),
+                                "failure_count": int(next_state.consecutive_failures),
+                                "cycle_id": cycle_id,
+                            },
+                        )
                 entry_context = self._position_entry_context(position)
                 self._append_event(
                     "time_exit_fail",
@@ -6520,6 +8935,12 @@ class Trader:
                         "wallet_score": 0.0,
                         "wallet_tier": "SYSTEM",
                         "position_retired": bool(retired),
+                        "time_exit_stage": str(next_state.stage),
+                        "time_exit_failure_count": int(next_state.consecutive_failures),
+                        "exit_priority": int(next_state.priority),
+                        "exit_priority_reason": str(next_state.priority_reason or ""),
+                        "market_volatility_bps": float(next_state.market_volatility_bps or 0.0),
+                        "force_exit_active": bool(next_state.stage == TIME_EXIT_STAGE_FORCE_EXIT),
                     },
                 )
                 self.recent_orders.appendleft(
@@ -6533,7 +8954,7 @@ class Trader:
                         "outcome": sig.outcome,
                         "side": sig.side,
                         "status": "REJECTED",
-                        "retry_count": 0,
+                        "retry_count": int(next_state.consecutive_failures),
                         "latency_ms": 0,
                         "reason": f"time-exit failed: {result.message}",
                         "source_wallet": "system-time-exit",
@@ -6544,13 +8965,19 @@ class Trader:
                         "wallet_tier": "SYSTEM",
                         "position_action": sig.position_action,
                         "position_action_label": sig.position_action_label,
+                        "time_exit_stage": str(next_state.stage),
+                        "time_exit_failure_count": int(next_state.consecutive_failures),
+                        "exit_priority": int(next_state.priority),
+                        "exit_priority_reason": str(next_state.priority_reason or ""),
+                        "market_volatility_bps": float(next_state.market_volatility_bps or 0.0),
+                        "force_exit_active": bool(next_state.stage == TIME_EXIT_STAGE_FORCE_EXIT),
                         **entry_context,
                         **self._exit_result_meta(exit_kind="time_exit", ok=False),
                         **self._order_meta(
                             "SELL",
                             exit_kind="time_exit",
                             exit_label=time_exit_label,
-                            exit_summary="time-exit retired" if retired else "time-exit failed",
+                            exit_summary="time-exit retired" if retired else exit_summary,
                         ),
                     }
                 )
@@ -6573,16 +9000,27 @@ class Trader:
                         result.message,
                     )
                 else:
-                    self.log.error("TIME_EXIT_FAIL slug=%s token=%s reason=%s", sig.market_slug, sig.token_id, result.message)
+                    self.log.error(
+                        "TIME_EXIT_FAIL stage=%s priority=%d slug=%s token=%s reason=%s",
+                        next_state.stage,
+                        int(next_state.priority),
+                        sig.market_slug,
+                        sig.token_id,
+                        result.message,
+                    )
                 continue
 
             if result.is_pending:
+                pending_state = dict(state_payload)
+                pending_state["last_result"] = "pending"
+                pending_state["last_error"] = ""
+                self._set_time_exit_state(position, pending_state)
                 entry_context = self._position_entry_context(position)
                 pending_record = self._register_pending_order(
                     signal=sig,
                     cycle_id=cycle_id,
                     result=result,
-                    order_meta=self._order_meta("SELL", exit_kind="time_exit", exit_label=time_exit_label, exit_summary="time-exit"),
+                    order_meta=self._order_meta("SELL", exit_kind="time_exit", exit_label=time_exit_label, exit_summary=exit_summary),
                     entry_context=entry_context,
                     previous_position=position,
                     order_reason=result.message,
@@ -6608,6 +9046,12 @@ class Trader:
                         "broker_status": result.lifecycle_status,
                         "reason": result.message,
                         "cycle_id": cycle_id,
+                        "time_exit_stage": str(pending_state.get("stage") or TIME_EXIT_STAGE_IDLE),
+                        "time_exit_failure_count": int(pending_state.get("consecutive_failures") or 0),
+                        "exit_priority": int(pending_state.get("priority") or 0),
+                        "exit_priority_reason": str(pending_state.get("priority_reason") or ""),
+                        "market_volatility_bps": float(pending_state.get("market_volatility_bps") or 0.0),
+                        "force_exit_active": bool(force_exit_active),
                     },
                 )
                 self.recent_orders.appendleft(
@@ -6623,7 +9067,7 @@ class Trader:
                         "status": self._recent_order_status(result),
                         "order_id": result.broker_order_id or "",
                         "broker_status": result.lifecycle_status,
-                        "retry_count": 0,
+                        "retry_count": int(pending_state.get("consecutive_failures") or 0),
                         "latency_ms": 0,
                         "reason": f"time-exit pending: {result.message}",
                         "source_wallet": "system-time-exit",
@@ -6634,9 +9078,15 @@ class Trader:
                         "wallet_tier": "SYSTEM",
                         "position_action": sig.position_action,
                         "position_action_label": sig.position_action_label,
+                        "time_exit_stage": str(pending_state.get("stage") or TIME_EXIT_STAGE_IDLE),
+                        "time_exit_failure_count": int(pending_state.get("consecutive_failures") or 0),
+                        "exit_priority": int(pending_state.get("priority") or 0),
+                        "exit_priority_reason": str(pending_state.get("priority_reason") or ""),
+                        "market_volatility_bps": float(pending_state.get("market_volatility_bps") or 0.0),
+                        "force_exit_active": bool(force_exit_active),
                         **entry_context,
                         **self._pending_exit_result_meta(sig.side),
-                        **self._order_meta("SELL", exit_kind="time_exit", exit_label=time_exit_label, exit_summary="time-exit"),
+                        **self._order_meta("SELL", exit_kind="time_exit", exit_label=time_exit_label, exit_summary=exit_summary),
                         **self._pending_order_snapshot(pending_record),
                     }
                 )
@@ -6652,7 +9102,9 @@ class Trader:
                     opened_ts=now,
                 )
                 self.log.info(
-                    "TIME_EXIT_POSTED mode=%s slug=%s token=%s notional=%.2f status=%s order_id=%s",
+                    "TIME_EXIT_POSTED stage=%s priority=%d mode=%s slug=%s token=%s notional=%.2f status=%s order_id=%s",
+                    pending_state.get("stage") or TIME_EXIT_STAGE_IDLE,
+                    int(pending_state.get("priority") or 0),
                     "congested" if congested else "normal",
                     sig.market_slug,
                     sig.token_id,
@@ -6662,6 +9114,7 @@ class Trader:
                 )
                 continue
 
+            success_state = record_time_exit_success(current_state, now_ts=now)
             filled_qty = result.filled_notional / max(0.01, result.filled_price)
             remaining_notional = max(0.0, current_notional - result.filled_notional)
             remaining_qty = max(0.0, current_qty - filled_qty)
@@ -6670,11 +9123,12 @@ class Trader:
             position["last_trim_ts"] = now
             position["price"] = result.filled_price
             position["last_signal_id"] = sig.signal_id
+            self._set_time_exit_state(position, success_state)
             self._apply_position_exit_meta(
                 position,
                 exit_kind="time_exit",
                 exit_label=time_exit_label,
-                exit_summary="time-exit trim",
+                exit_summary=exit_summary,
                 ts=now,
             )
             self._append_event(
@@ -6702,6 +9156,12 @@ class Trader:
                     "cycle_id": cycle_id,
                     "wallet_score": 0.0,
                     "wallet_tier": "SYSTEM",
+                    "time_exit_stage": str(success_state.stage),
+                    "time_exit_failure_count": int(success_state.consecutive_failures),
+                    "exit_priority": int(current_state.priority),
+                    "exit_priority_reason": str(current_state.priority_reason or ""),
+                    "market_volatility_bps": float(current_state.market_volatility_bps or 0.0),
+                    "force_exit_active": bool(force_exit_active),
                 },
             )
 
@@ -6716,9 +9176,9 @@ class Trader:
                     "outcome": sig.outcome,
                     "side": sig.side,
                     "status": "FILLED",
-                    "retry_count": 0,
+                    "retry_count": int(current_state.consecutive_failures),
                     "latency_ms": 0,
-                    "reason": "time-exit trim",
+                    "reason": exit_summary,
                     "source_wallet": "system-time-exit",
                     "hold_minutes": self._position_hold_minutes(position, now),
                     "topic_label": str(position.get("entry_topic_label") or ""),
@@ -6727,6 +9187,12 @@ class Trader:
                     "wallet_tier": "SYSTEM",
                     "position_action": sig.position_action,
                     "position_action_label": sig.position_action_label,
+                    "time_exit_stage": str(success_state.stage),
+                    "time_exit_failure_count": int(success_state.consecutive_failures),
+                    "exit_priority": int(current_state.priority),
+                    "exit_priority_reason": str(current_state.priority_reason or ""),
+                    "market_volatility_bps": float(current_state.market_volatility_bps or 0.0),
+                    "force_exit_active": bool(force_exit_active),
                     **self._position_entry_context(position),
                     **self._exit_result_meta(
                         exit_kind="time_exit",
@@ -6734,7 +9200,7 @@ class Trader:
                         remaining_notional=remaining_notional,
                         remaining_qty=remaining_qty,
                     ),
-                    **self._order_meta("SELL", exit_kind="time_exit", exit_label=time_exit_label, exit_summary="time-exit trim"),
+                    **self._order_meta("SELL", exit_kind="time_exit", exit_label=time_exit_label, exit_summary=exit_summary),
                 }
             )
             position_snapshot = self._position_trace_snapshot(
@@ -6755,7 +9221,9 @@ class Trader:
                 opened_ts=now,
             )
             self.log.info(
-                "TIME_EXIT mode=%s slug=%s token=%s trim_notional=%.2f remain_notional=%.2f",
+                "TIME_EXIT stage=%s priority=%d mode=%s slug=%s token=%s trim_notional=%.2f remain_notional=%.2f",
+                current_state.stage,
+                int(current_state.priority),
                 "congested" if congested else "normal",
                 sig.market_slug,
                 sig.token_id,
@@ -6773,13 +9241,15 @@ class Trader:
                         "market_slug": sig.market_slug,
                         "remaining_notional": remaining_notional,
                         "action": "position_closed",
+                        "force_exit_active": bool(force_exit_active),
                     },
                 )
                 if self.settings.token_reentry_cooldown_seconds > 0:
                     self.token_reentry_until[token_id] = now + self.settings.token_reentry_cooldown_seconds
                 self._mark_trace_closed(str(sig.trace_id or ""), now)
                 self.log.info(
-                    "TIME_EXIT_CLOSE slug=%s token=%s open_positions=%d",
+                    "TIME_EXIT_CLOSE stage=%s slug=%s token=%s open_positions=%d",
+                    current_state.stage,
                     sig.market_slug,
                     sig.token_id,
                     self.state.open_positions,
@@ -6792,10 +9262,14 @@ class Trader:
         self._maybe_reconcile_runtime()
         self._roll_daily_state_if_needed()
         self._maybe_sync_account_state()
+        self._enforce_hot_wallet_cap()
         control = self._load_control_state()
+        self._apply_operator_clear_risk_breakers(control)
         cycle_start_ts = int(time.time())
         reconciliation = self.reconciliation_summary(now=cycle_start_ts)
         self._update_trading_mode(control, now=cycle_start_ts, reconciliation=reconciliation)
+        self._advance_kill_switch_state(control, now=cycle_start_ts)
+        self._refresh_buy_blocked_state(now_ts=cycle_start_ts)
         self._refresh_risk_state()
         self._apply_operator_clear_stale_pending(control)
         self._apply_control_pending_entry_cancels(control, now=cycle_start_ts)
@@ -6808,6 +9282,22 @@ class Trader:
                 self.state.open_positions,
             )
             self._append_event("emergency_stop_skip", {"reason": "control_flag"})
+            return
+
+        if bool(self._admission_decision.halted):
+            self.last_wallets = []
+            self.last_signals = []
+            self.log.warning(
+                "HALTED_MODE active, skip automatic trading actions reasons=%s",
+                ",".join(self._admission_decision.reason_codes) or "none",
+            )
+            self._append_event(
+                "admission_halted_skip",
+                {
+                    "reason_codes": list(self._admission_decision.reason_codes),
+                    "action_whitelist": list(self._admission_decision.action_whitelist),
+                },
+            )
             return
 
         self._apply_time_exit()
@@ -6831,7 +9321,7 @@ class Trader:
         fresh_candidates: list[Candidate] = []
         precheck_skipped = 0
         for sig in fresh_signals:
-            existing = self.positions_book.get(sig.token_id)
+            existing = self._position_truth_for_token(sig.token_id)
             sig.signal_id = self._new_signal_id(cycle_now)
             sig.trace_id = self._trace_id_for_signal(sig, existing, cycle_now)
             action, action_label = self._position_action_for_signal(sig, existing)
@@ -6884,6 +9374,7 @@ class Trader:
                         control=control,
                         existing=existing,
                         skip_reason=skip_reason,
+                        block_layer="candidate",
                     )
                     decision_snapshot["market_time_source"] = str(market_context.get("market_time_source") or "")
                     decision_snapshot["market_metadata_hit"] = bool(market_context.get("market_metadata_hit", False))
@@ -6924,7 +9415,7 @@ class Trader:
             signal_id = str(sig.signal_id or "")
             if signal_id and signal_id in signal_record_by_id:
                 continue
-            existing = self.positions_book.get(sig.token_id)
+            existing = self._position_truth_for_token(sig.token_id)
             if not str(sig.signal_id or "").strip():
                 sig.signal_id = self._new_signal_id(cycle_now)
             if not str(sig.trace_id or "").strip():
@@ -7007,7 +9498,49 @@ class Trader:
             candidate_note = str(execution_meta.get("candidate_note") or "")
             candidate_origin = str(execution_meta.get("origin") or "runtime")
             order_meta = self._signal_order_meta(sig)
-            existing = self.positions_book.get(sig.token_id)
+            existing = self._position_truth_for_token(sig.token_id)
+            now = int(time.time())
+            if candidate_id:
+                expired_candidate = self._expire_candidate_record(
+                    candidate_id,
+                    now_ts=now,
+                    block_layer="execution_precheck",
+                    note="candidate_lifecycle:execution_precheck_expired",
+                )
+                if expired_candidate is not None:
+                    self._append_event(
+                        "signal_skip",
+                        {
+                            "wallet": sig.wallet,
+                            "market_slug": sig.market_slug,
+                            "token_id": sig.token_id,
+                            "reason": REASON_CANDIDATE_LIFETIME_EXPIRED,
+                        },
+                    )
+                    finalize_signal(
+                        sig,
+                        final_status="skipped",
+                        decision_snapshot=self._decision_snapshot(
+                            signal=sig,
+                            control=control,
+                            existing=existing,
+                            candidate_id=candidate_id,
+                            candidate_action=candidate_action,
+                            candidate_origin=candidate_origin,
+                            skip_reason=REASON_CANDIDATE_LIFETIME_EXPIRED,
+                            block_layer="execution_precheck",
+                        ),
+                        now_ts=now,
+                    )
+                    self._record_candidate_result(
+                        candidate_id,
+                        action=candidate_action or "ignore",
+                        status="expired",
+                        rationale=candidate_note or REASON_CANDIDATE_LIFETIME_EXPIRED,
+                        result_tag=REASON_CANDIDATE_LIFETIME_EXPIRED,
+                        signal=sig,
+                    )
+                    continue
             opening_block_reason = self._buy_gate_reason() if sig.side == "BUY" else ""
             if opening_block_reason:
                 self.log.info(
@@ -7035,6 +9568,7 @@ class Trader:
                         control=control,
                         existing=existing,
                         skip_reason=opening_block_reason,
+                        block_layer="execution_precheck",
                     ),
                     now_ts=int(time.time()),
                 )
@@ -7084,6 +9618,7 @@ class Trader:
                         existing=existing,
                         skip_reason="token_reentry_cooldown",
                         cooldown_remaining=cooldown_until - now,
+                        block_layer="execution_precheck",
                     ),
                     now_ts=now,
                 )
@@ -7098,7 +9633,41 @@ class Trader:
                     )
                 continue
 
-            existing = self.positions_book.get(sig.token_id)
+            existing = self._position_truth_for_token(sig.token_id)
+            if sig.side == "BUY":
+                repeat_entry_reason = self._repeat_entry_block_reason(sig, existing)
+                if repeat_entry_reason:
+                    self._append_event(
+                        "signal_skip",
+                        {
+                            "wallet": sig.wallet,
+                            "market_slug": sig.market_slug,
+                            "token_id": sig.token_id,
+                            "reason": repeat_entry_reason,
+                        },
+                    )
+                    finalize_signal(
+                        sig,
+                        final_status="skipped",
+                        decision_snapshot=self._decision_snapshot(
+                            signal=sig,
+                            control=control,
+                            existing=existing,
+                            skip_reason=repeat_entry_reason,
+                            block_layer="execution_precheck",
+                        ),
+                        now_ts=now,
+                    )
+                    if candidate_id:
+                        self._record_candidate_result(
+                            candidate_id,
+                            action=candidate_action or "ignore",
+                            status="skipped",
+                            rationale=candidate_note or repeat_entry_reason,
+                            result_tag=repeat_entry_reason,
+                            signal=sig,
+                        )
+                    continue
             if sig.side == "SELL":
                 if sig.token_id in processed_sell_tokens:
                     self._append_event(
@@ -7118,6 +9687,7 @@ class Trader:
                             control=control,
                             existing=existing,
                             skip_reason="sell_already_processed_this_cycle",
+                            block_layer="execution_precheck",
                         ),
                         now_ts=now,
                     )
@@ -7149,6 +9719,7 @@ class Trader:
                             control=control,
                             existing=existing,
                             skip_reason="no_open_position",
+                            block_layer="execution_precheck",
                         ),
                         now_ts=now,
                     )
@@ -7186,6 +9757,7 @@ class Trader:
                             control=control,
                             existing=existing,
                             skip_reason="entry_wallet_mismatch",
+                            block_layer="execution_precheck",
                         ),
                         now_ts=now,
                     )
@@ -7228,6 +9800,7 @@ class Trader:
                             existing=existing,
                             skip_reason="token_add_cooldown",
                             add_cooldown_remaining=remain,
+                            block_layer="execution_precheck",
                         ),
                         now_ts=now,
                     )
@@ -7243,6 +9816,7 @@ class Trader:
                     continue
 
             self._refresh_risk_state()
+            self._hydrate_signal_condition_exposure(sig)
             decision = self.risk.evaluate(sig, self.state)
             if not decision.allowed:
                 self.log.info(
@@ -7369,22 +9943,133 @@ class Trader:
 
             duplicate_reason = ""
             duplicate_context: dict[str, object] = {}
-            pending_duplicate = self._find_pending_order_duplicate(sig) if sig.side == "BUY" else None
-            if pending_duplicate is not None:
-                duplicate_reason = "pending_order_duplicate"
-                duplicate_context = {
-                    "duplicate_source": str(pending_duplicate.get("recovery_source") or "pending_orders"),
-                    "duplicate_order_id": str(pending_duplicate.get("order_id") or ""),
-                    "duplicate_key": str(pending_duplicate.get("key") or ""),
-                    "duplicate_recovery_status": str(pending_duplicate.get("recovery_status") or ""),
-                }
-            else:
-                broker_open_order_duplicate = self._find_broker_open_order_duplicate(sig) if sig.side == "BUY" else None
-                if broker_open_order_duplicate is not None:
-                    duplicate_reason = "broker_open_order_duplicate"
-                    duplicate_context = dict(broker_open_order_duplicate)
-                elif self._is_order_duplicate(sig, notional_to_use):
-                    duplicate_reason = "recent_order_duplicate"
+            identity: dict[str, object] = self._build_intent_identity(sig, notional_to_use) if sig.side == "BUY" else {}
+            strategy_uuid: str | None = str(identity.get("strategy_order_uuid") or "") if sig.side == "BUY" else None
+            idempotency_key: str = str(identity.get("idempotency_key") or "") if sig.side == "BUY" else ""
+            claim_status = None
+            intent_status = INTENT_STATUS_NEW
+            intent_record: dict[str, object] = {}
+            recent_rate_limited = False
+            if sig.side == "BUY" and not duplicate_reason:
+                claim_status, intent_record = self._claim_or_load_intent(
+                    signal=sig,
+                    notional_usd=notional_to_use,
+                    identity=identity,
+                )
+                intent_status = normalize_intent_status(intent_record.get("status") or INTENT_STATUS_NEW)
+                ack_count = int(intent_record.get("ack_unknown_count") or 0)
+                ack_first_ts = int(intent_record.get("ack_unknown_first_ts") or 0)
+                if ack_count > self._ack_unknown_max_probes() and intent_status != INTENT_STATUS_MANUAL_REQUIRED:
+                    intent_status = INTENT_STATUS_MANUAL_REQUIRED
+                    intent_record["status"] = intent_status
+                duplicate_context.update(
+                    {
+                        "strategy_order_uuid": strategy_uuid or "",
+                        "idempotency_key": idempotency_key,
+                        "intent_status": intent_status,
+                        "claim_status": claim_status,
+                        "ack_unknown_count": ack_count,
+                        "ack_unknown_first_ts": ack_first_ts,
+                    }
+                )
+                if claim_status == STORAGE_ERROR:
+                    duplicate_reason = "intent_storage_error"
+                elif claim_status == EXISTING_TERMINAL and intent_status != INTENT_STATUS_NEW:
+                    duplicate_reason = "intent_existing_terminal"
+                elif claim_status == EXISTING_NON_TERMINAL:
+                    if intent_status in {INTENT_STATUS_SENDING, INTENT_STATUS_ACK_UNKNOWN}:
+                        # SENDING/ACK_UNKNOWN 只允许恢复探测，不允许直接重发。
+                        broker_open_order_duplicate = self._find_broker_open_order_duplicate(sig)
+                        if broker_open_order_duplicate is not None:
+                            self._set_intent_status(
+                                strategy_order_uuid=str(strategy_uuid or ""),
+                                idempotency_key=idempotency_key,
+                                status=INTENT_STATUS_ACKED_PENDING,
+                                broker_order_id=str(broker_open_order_duplicate.get("order_id") or ""),
+                                payload_updates={
+                                    "probe_source": "broker_open_orders",
+                                    "probe_ts": int(time.time()),
+                                },
+                                recovery_reason="broker_open_detected_during_probe",
+                            )
+                            duplicate_reason = "intent_recovery_pending"
+                            duplicate_context.update(dict(broker_open_order_duplicate))
+                        else:
+                            ack_state = self._record_ack_unknown_probe(
+                                str(strategy_uuid or ""),
+                                current_count=ack_count,
+                                current_first_ts=ack_first_ts,
+                            )
+                            probe_status = (
+                                INTENT_STATUS_MANUAL_REQUIRED
+                                if bool(ack_state.get("manual_required"))
+                                else INTENT_STATUS_ACK_UNKNOWN
+                            )
+                            self._set_intent_status(
+                                strategy_order_uuid=str(strategy_uuid or ""),
+                                idempotency_key=idempotency_key,
+                                status=probe_status,
+                                payload_updates={
+                                    "ack_unknown_count": int(ack_state.get("count") or 0),
+                                    "ack_unknown_first_ts": int(ack_state.get("first_ts") or 0),
+                                    "last_probe_ts": int(time.time()),
+                                },
+                                recovery_reason="ack_unknown_probe_without_broker_evidence",
+                            )
+                            duplicate_reason = (
+                                "intent_manual_required"
+                                if probe_status == INTENT_STATUS_MANUAL_REQUIRED
+                                else "intent_ack_unknown"
+                            )
+                    elif intent_status == INTENT_STATUS_MANUAL_REQUIRED:
+                        duplicate_reason = "intent_manual_required"
+                    elif intent_status in NON_TERMINAL_STATUSES and intent_status != INTENT_STATUS_NEW:
+                        duplicate_reason = "intent_existing_non_terminal"
+
+                if not duplicate_reason:
+                    pending_duplicate = self._find_pending_order_duplicate(sig)
+                    if pending_duplicate is not None:
+                        duplicate_reason = "pending_order_duplicate"
+                        duplicate_context.update(
+                            {
+                                "duplicate_source": str(pending_duplicate.get("recovery_source") or "pending_orders"),
+                                "duplicate_order_id": str(pending_duplicate.get("order_id") or ""),
+                                "duplicate_key": str(pending_duplicate.get("key") or ""),
+                                "duplicate_recovery_status": str(pending_duplicate.get("recovery_status") or ""),
+                            }
+                        )
+
+                if not duplicate_reason:
+                    broker_open_order_duplicate = self._find_broker_open_order_duplicate(sig)
+                    if broker_open_order_duplicate is not None:
+                        duplicate_reason = "broker_open_order_duplicate"
+                        duplicate_context.update(dict(broker_open_order_duplicate))
+
+                recent_rate_limited = self._is_order_duplicate(sig, notional_to_use)
+                duplicate_context["recent_rate_limited"] = bool(recent_rate_limited)
+                if recent_rate_limited:
+                    duplicate_context["rate_limit_ttl_seconds"] = int(self.settings.order_dedup_ttl_seconds)
+
+                if not duplicate_reason:
+                    # NEW(无论 CLAIMED_NEW 还是 EXISTING_NON_TERMINAL) 进入发送临界区前必须 CAS 到 SENDING。
+                    marked_sending, marked_payload = self._set_intent_status(
+                        strategy_order_uuid=str(strategy_uuid or ""),
+                        idempotency_key=idempotency_key,
+                        status=INTENT_STATUS_SENDING,
+                        expected_from_statuses=(INTENT_STATUS_NEW,),
+                        payload_updates={
+                            "requested_notional": float(notional_to_use),
+                            "requested_price": float(sig.price_hint or 0.0),
+                            "signal_id": str(sig.signal_id or ""),
+                            "trace_id": str(sig.trace_id or ""),
+                        },
+                        recovery_reason="sending_enter_critical_section",
+                    )
+                    if not marked_sending:
+                        duplicate_reason = "intent_claim_race"
+                    elif marked_payload:
+                        intent_record = dict(marked_payload)
+                        intent_status = normalize_intent_status(intent_record.get("status") or intent_status)
 
             if duplicate_reason:
                 self._append_event(
@@ -7398,6 +10083,8 @@ class Trader:
                         "wallet_score": sig.wallet_score,
                         "wallet_tier": sig.wallet_tier,
                         "reason": duplicate_reason,
+                        "strategy_order_uuid": strategy_uuid or "",
+                        "idempotency_key": idempotency_key,
                         **duplicate_context,
                     },
                 )
@@ -7441,11 +10128,111 @@ class Trader:
                     )
                 continue
 
-            result = self.broker.execute(sig, notional_to_use)
+            order_meta["strategy_order_uuid"] = strategy_uuid or ""
+            order_meta["idempotency_key"] = idempotency_key
+            if sig.side == "BUY":
+                order_meta["strategy_name"] = str(identity.get("strategy_name") or "")
+                order_meta["signal_source"] = str(identity.get("signal_source") or "")
+                order_meta["signal_fingerprint"] = str(identity.get("signal_fingerprint") or "")
+            result = self.broker.execute(sig, notional_to_use, strategy_order_uuid=order_meta["strategy_order_uuid"])
             market_context = self._market_context_from_result(result)
+            ack_unknown = self._is_ack_unknown_result(result)
+            if ack_unknown:
+                now = int(time.time())
+                ack_state = self._record_ack_unknown_probe(
+                    order_meta["strategy_order_uuid"],
+                    current_count=int(intent_record.get("ack_unknown_count") or 0),
+                    current_first_ts=int(intent_record.get("ack_unknown_first_ts") or 0),
+                )
+                ack_status = INTENT_STATUS_MANUAL_REQUIRED if ack_state.get("manual_required") else INTENT_STATUS_ACK_UNKNOWN
+                self._set_intent_status(
+                    strategy_order_uuid=order_meta["strategy_order_uuid"],
+                    idempotency_key=idempotency_key,
+                    status=ack_status,
+                    broker_order_id=str(result.broker_order_id or ""),
+                    payload_updates={
+                        "ack_unknown_count": int(ack_state.get("count") or 0),
+                        "ack_unknown_first_ts": int(ack_state.get("first_ts") or 0),
+                    },
+                    recovery_reason="broker_ack_unknown",
+                )
+                entry_context = (
+                    self._position_entry_context(existing)
+                    if sig.side == "SELL"
+                    else self._signal_entry_context(sig, self._order_reason(sig, result.message))
+                )
+                ack_result = ExecutionResult(
+                    ok=True,
+                    broker_order_id=result.broker_order_id,
+                    message=result.message,
+                    filled_notional=0.0,
+                    filled_price=0.0,
+                    status=ack_status,
+                    requested_notional=result.requested_notional or notional_to_use,
+                    requested_price=result.requested_price or 0.0,
+                    metadata=dict(getattr(result, "metadata", {}) or {}),
+                )
+                pending_record = self._register_pending_order(
+                    signal=sig,
+                    cycle_id=cycle_id,
+                    result=ack_result,
+                    order_meta=order_meta,
+                    entry_context=entry_context,
+                    previous_position=existing,
+                    order_reason=self._order_reason(sig, result.message),
+                    now=now,
+                )
+                pending_record["ack_unknown_count"] = int(ack_state.get("count") or 0)
+                pending_record["ack_unknown_first_ts"] = int(ack_state.get("first_ts") or 0)
+                pending_record["recovery_status"] = ack_status
+                self._append_event(
+                    "order_ack_unknown",
+                    {
+                        "wallet": sig.wallet,
+                        "market_slug": sig.market_slug,
+                        "token_id": sig.token_id,
+                        "side": sig.side,
+                        "notional": notional_to_use,
+                        "strategy_order_uuid": order_meta.get("strategy_order_uuid", ""),
+                        "ack_unknown_count": ack_state.get("count"),
+                        "ack_unknown_first_ts": ack_state.get("first_ts"),
+                        "intent_status": ack_status,
+                        **market_context,
+                    },
+                )
+                order_record = self._order_trace_snapshot(self._pending_order_snapshot(pending_record))
+                final_tag = "manual_required" if ack_status == INTENT_STATUS_MANUAL_REQUIRED else "ack_unknown"
+                finalize_signal(
+                    sig,
+                    final_status="manual_required" if ack_status == INTENT_STATUS_MANUAL_REQUIRED else "order_ack_unknown",
+                    decision_snapshot=self._decision_snapshot(
+                        signal=sig,
+                        control=control,
+                        existing=existing,
+                        decision=decision,
+                        sized_notional=sized_notional,
+                        final_notional=notional_to_use,
+                        budget_limited=budget_limited,
+                        netting_limited=netting_limited,
+                        netting_snapshot=netting_snapshot,
+                    ),
+                    order_snapshot=order_record,
+                    now_ts=now,
+                )
+                if candidate_id:
+                    self._record_candidate_result(
+                        candidate_id,
+                        action=candidate_action or "follow",
+                        status="manual_required" if ack_status == INTENT_STATUS_MANUAL_REQUIRED else "submitted",
+                        rationale=candidate_note or result.message,
+                        result_tag=final_tag,
+                        signal=sig,
+                    )
+                continue
+
             if result.ok:
                 now = int(time.time())
-                existing = self.positions_book.get(sig.token_id)
+                existing = self._position_truth_for_token(sig.token_id)
                 order_reason = self._order_reason(sig, result.message)
                 if result.is_pending:
                     entry_context = (
@@ -7462,6 +10249,13 @@ class Trader:
                         previous_position=existing,
                         order_reason=order_reason,
                         now=now,
+                    )
+                    self._set_intent_status(
+                        strategy_order_uuid=order_meta["strategy_order_uuid"],
+                        idempotency_key=idempotency_key,
+                        status=INTENT_STATUS_ACKED_PENDING,
+                        broker_order_id=str(result.broker_order_id or ""),
+                        recovery_reason="broker_ack_pending",
                     )
                     exit_result_meta = self._pending_exit_result_meta(sig.side)
                     self._append_event(
@@ -7573,6 +10367,14 @@ class Trader:
                 qty = result.filled_notional / max(0.01, result.filled_price)
                 position_action = sig.position_action
                 position_action_label = sig.position_action_label
+                filled_status = INTENT_STATUS_PARTIAL if result.lifecycle_status == "partially_filled" else INTENT_STATUS_FILLED
+                self._set_intent_status(
+                    strategy_order_uuid=order_meta["strategy_order_uuid"],
+                    idempotency_key=idempotency_key,
+                    status=filled_status,
+                    broker_order_id=str(result.broker_order_id or ""),
+                    recovery_reason="broker_filled",
+                )
                 position_snapshot: dict[str, object] = {}
                 realized_pnl = 0.0
                 if sig.side == "SELL":
@@ -7679,8 +10481,9 @@ class Trader:
                         "trace_id": sig.trace_id,
                         "origin_signal_id": sig.signal_id,
                         "last_signal_id": sig.signal_id,
+                        "time_exit_state": normalize_time_exit_state(None).to_payload(),
                     }
-                    position_snapshot = self._position_trace_snapshot(self.positions_book.get(sig.token_id), is_open=True)
+                    position_snapshot = self._position_trace_snapshot(self._position_truth_for_token(sig.token_id), is_open=True)
                 else:
                     entry_reason = str(existing.get("entry_reason") or order_reason)
                     prev_qty = float(existing.get("quantity") or 0.0)
@@ -7865,6 +10668,33 @@ class Trader:
                     )
             else:
                 now = int(time.time())
+                result_metadata = dict(getattr(result, "metadata", {}) or {})
+                if bool(result_metadata.get("security_fail_close")):
+                    security_category = str(result_metadata.get("security_category") or "SIGNER_SECURITY_FAILURE").strip().upper()
+                    security_reason = str(result_metadata.get("reason_code") or result.message or "security_fail_close").strip()
+                    if not any(
+                        str(item.get("category") or "").strip().upper() == security_category
+                        and str(item.get("details") or "").strip() == security_reason
+                        for item in self._recovery_conflicts
+                    ):
+                        self._record_recovery_conflict(
+                            category=security_category,
+                            token_id=str(sig.token_id or ""),
+                            details=security_reason,
+                        )
+                    self.log.error(
+                        "SECURITY_FAIL_CLOSED category=%s token=%s reason=%s",
+                        security_category,
+                        sig.token_id,
+                        security_reason,
+                    )
+                self._set_intent_status(
+                    strategy_order_uuid=str(order_meta.get("strategy_order_uuid") or ""),
+                    idempotency_key=idempotency_key,
+                    status=INTENT_STATUS_FAILED,
+                    broker_order_id=str(result.broker_order_id or ""),
+                    recovery_reason=str(result.message or "broker_rejected"),
+                )
                 entry_context = self._position_entry_context(existing)
                 exit_result_meta = (
                     self._exit_result_meta(
@@ -8004,9 +10834,20 @@ class Trader:
         self._refresh_risk_state()
 
     def run(self, once: bool = False) -> None:
+        self._update_runner_heartbeat(loop_status=RUNNER_LOOP_STATUS_IDLE)
         while True:
-            self.step()
-            self.persist_runtime_state(self.settings.runtime_state_path)
+            cycle_started_ts = int(time.time())
+            self._update_runner_heartbeat(now_ts=cycle_started_ts, cycle_started=True)
+            try:
+                self.step()
+                cycle_finished_ts = int(time.time())
+                self._update_runner_heartbeat(now_ts=cycle_finished_ts, cycle_finished=True)
+                self.persist_runtime_state(self.settings.runtime_state_path)
+            except Exception:
+                self._update_runner_heartbeat(loop_status=RUNNER_LOOP_STATUS_ERROR)
+                raise
             if once:
+                self._update_runner_heartbeat(loop_status=RUNNER_LOOP_STATUS_STOPPED)
+                self.persist_runtime_state(self.settings.runtime_state_path)
                 return
             time.sleep(self.settings.poll_interval_seconds)

@@ -11,6 +11,7 @@ from unittest.mock import patch
 from polymarket_bot.brokers.paper import PaperBroker
 from polymarket_bot.config import Settings
 from polymarket_bot.runner import Trader
+from polymarket_bot.state_store import StateStore
 from polymarket_bot.types import RiskDecision, Signal
 
 
@@ -88,7 +89,7 @@ class PaperBrokerTests(unittest.TestCase):
         ledger_file = tempfile.NamedTemporaryFile("w", delete=False, encoding="utf-8")
         ledger_file.close()
         candidate_db_path = str(Path(tempfile.mkdtemp()) / "terminal.db")
-        return Settings(
+        settings = Settings(
             _env_file=None,
             dry_run=bool(kwargs.get("dry_run", True)),
             decision_mode="auto",
@@ -106,6 +107,32 @@ class PaperBrokerTests(unittest.TestCase):
             paper_fill_complete_delay_seconds=int(kwargs.get("paper_fill_complete_delay_seconds", 0)),
             paper_cancel_fail_once=bool(kwargs.get("paper_cancel_fail_once", False)),
         )
+        try:
+            with open(control_path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                control_keys = {
+                    "decision_mode",
+                    "pause_opening",
+                    "reduce_only",
+                    "emergency_stop",
+                    "clear_stale_pending_requested_ts",
+                    "updated_ts",
+                }
+                if any(key in payload for key in control_keys):
+                    normalized = {
+                        "decision_mode": settings.decision_mode,
+                        "pause_opening": False,
+                        "reduce_only": False,
+                        "emergency_stop": False,
+                        "clear_stale_pending_requested_ts": 0,
+                        "updated_ts": 0,
+                    }
+                    normalized.update(payload)
+                    StateStore(settings.state_store_path).save_control_state(normalized)
+        except Exception:
+            pass
+        return settings
 
     def test_live_like_paper_broker_emits_partial_and_completion_fills(self):
         broker = PaperBroker(

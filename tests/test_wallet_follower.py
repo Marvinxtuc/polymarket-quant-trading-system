@@ -264,14 +264,14 @@ class WalletFollowerEventSignalTests(unittest.TestCase):
 
         self.assertEqual(len(signals), 1)
         signal = signals[0]
-        self.assertEqual(signal.wallet, "wallet-resonance")
-        self.assertEqual(signal.position_action_label, "共振买入")
+        self.assertEqual(signal.wallet, candidate_b.wallet)
+        self.assertEqual(signal.position_action_label, candidate_b.position_action_label)
         self.assertEqual(signal.side, "BUY")
         self.assertEqual(signal.topic_key, "macro")
-        self.assertIn("resonance 2 wallets", signal.wallet_score_summary)
-        self.assertGreater(signal.confidence, max(candidate_a.confidence, candidate_b.confidence))
-        self.assertAlmostEqual(signal.observed_notional, 145.0, places=4)
-        self.assertAlmostEqual(signal.price_hint, ((0.60 * 60.0) + (0.61 * 85.0)) / 145.0, places=6)
+        self.assertIn("buy resonance observed (2 wallets)", signal.wallet_score_summary)
+        self.assertAlmostEqual(signal.confidence, candidate_b.confidence, places=6)
+        self.assertAlmostEqual(signal.observed_notional, candidate_b.observed_notional, places=4)
+        self.assertAlmostEqual(signal.price_hint, candidate_b.price_hint, places=6)
         self.assertEqual(signal.timestamp, later)
 
     def test_select_live_signals_skips_buy_without_live_orderbook_and_backfills_next_ranked_buy(self):

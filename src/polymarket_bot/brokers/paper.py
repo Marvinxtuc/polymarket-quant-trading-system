@@ -217,7 +217,7 @@ class PaperBroker(Broker):
             }
         ]
 
-    def execute(self, signal: Signal, notional_usd: float) -> ExecutionResult:
+    def execute(self, signal: Signal, notional_usd: float, *, strategy_order_uuid: str | None = None) -> ExecutionResult:
         price = self._clamp_price(signal.price_hint)
         if not self._live_like_enabled:
             return ExecutionResult(
@@ -229,6 +229,7 @@ class PaperBroker(Broker):
                 status="filled",
                 requested_notional=notional_usd,
                 requested_price=price,
+                metadata={"strategy_order_uuid": strategy_order_uuid} if strategy_order_uuid else {},
             )
 
         created_ts = int(time.time())
@@ -263,6 +264,7 @@ class PaperBroker(Broker):
             status="live",
             requested_notional=notional_usd,
             requested_price=price,
+            metadata={"strategy_order_uuid": strategy_order_uuid} if strategy_order_uuid else {},
         )
 
     def cancel_order(self, order_id: str) -> dict[str, object] | None:

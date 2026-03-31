@@ -1045,7 +1045,7 @@ class WalletFollowerStrategy:
             position_action_label=candidate.position_action_label,
         )
 
-    def _boost_buy_resonance(
+    def _annotate_buy_resonance_observation(
         self,
         candidates: list[WalletCandidateContext],
     ) -> WalletCandidateContext:
@@ -1064,38 +1064,28 @@ class WalletFollowerStrategy:
         if wallet_count <= 1:
             return representative
 
-        boost = min(0.12, 0.04 * (wallet_count - 1) + min(0.04, sum(row.wallet_score for row in ordered) / 5000.0))
-        confidence = min(0.95, representative.confidence + boost)
-        observed_notional = sum(row.observed_notional for row in ordered)
-        observed_size = sum(row.observed_size for row in ordered)
-        weighted_price_base = sum(max(0.0, row.observed_notional) * max(0.01, row.price_hint) for row in ordered)
-        price_hint = (
-            weighted_price_base / observed_notional
-            if observed_notional > 0.0
-            else max(0.01, representative.price_hint)
-        )
-        timestamp = max((row.timestamp for row in ordered), default=representative.timestamp)
-        wallet_score = max(row.wallet_score for row in ordered)
-        wallet_tier = representative.wallet_tier
-        summary = f"resonance {wallet_count} wallets"
+        summary = f"buy resonance observed ({wallet_count} wallets)"
         if wallets:
             summary = f"{summary} | {', '.join(wallets[:3])}"
+        existing_summary = str(representative.wallet_score_summary or "").strip()
+        if existing_summary:
+            summary = f"{existing_summary} | {summary}"
 
         return WalletCandidateContext(
-            wallet="wallet-resonance",
+            wallet=representative.wallet,
             token_id=representative.token_id,
             condition_id=representative.condition_id,
             market_slug=representative.market_slug,
             outcome=representative.outcome,
             side="BUY",
-            trigger_type="multi_wallet_confirm",
-            confidence=confidence,
-            price_hint=price_hint,
-            observed_size=observed_size,
-            observed_notional=observed_notional,
-            timestamp=timestamp,
-            wallet_score=wallet_score,
-            wallet_tier=wallet_tier,
+            trigger_type=representative.trigger_type,
+            confidence=representative.confidence,
+            price_hint=representative.price_hint,
+            observed_size=representative.observed_size,
+            observed_notional=representative.observed_notional,
+            timestamp=representative.timestamp,
+            wallet_score=representative.wallet_score,
+            wallet_tier=representative.wallet_tier,
             wallet_score_summary=summary,
             topic_key=representative.topic_key,
             topic_label=representative.topic_label,
@@ -1104,12 +1094,14 @@ class WalletFollowerStrategy:
             topic_roi=representative.topic_roi,
             topic_resolved_win_rate=representative.topic_resolved_win_rate,
             topic_score_summary=representative.topic_score_summary,
-            position_action="entry",
-            position_action_label="共振买入",
+            position_action=representative.position_action,
+            position_action_label=representative.position_action_label,
             source_event=representative.source_event,
+            previous_position=representative.previous_position,
+            current_position=representative.current_position,
             source_wallet_count=wallet_count,
             resonance_wallets=wallets,
-            resonance_boost=boost,
+            resonance_boost=0.0,
         )
 
     def rank_candidates(self, candidates: list[WalletCandidateContext]) -> list[Signal]:
@@ -1141,8 +1133,8 @@ class WalletFollowerStrategy:
             if not deduped_rows:
                 continue
             if len(deduped_rows) > 1:
-                boosted = self._boost_buy_resonance(deduped_rows)
-                signals.append(self._candidate_to_signal(boosted))
+                observed = self._annotate_buy_resonance_observation(deduped_rows)
+                signals.append(self._candidate_to_signal(observed))
                 continue
             signals.append(self._candidate_to_signal(deduped_rows[0]))
 
