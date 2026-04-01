@@ -41,8 +41,8 @@ TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,re
 TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=bootstrap_protected_evidence_missing account_state=unknown reconciliation=ok
 .Startup checks failed failures=2 warnings=0 broker=_DummyBroker
 TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
-Failed to append ledger path=/var/folders/0b/jt231n3s39x_wwmp5n3qhbj40000gn/T/tmpg7wo67ut err=disk full
-PERSISTENCE_FAULT kind=ledger_append path=/var/folders/0b/jt231n3s39x_wwmp5n3qhbj40000gn/T/tmpg7wo67ut err=disk full count=1
+Failed to append ledger path=/private/tmp/<runtime-path> err=disk full
+PERSISTENCE_FAULT kind=ledger_append path=/private/tmp/<runtime-path> err=disk full count=1
 TRADING_MODE mode=HALTED opening_allowed=False reasons=persistence_fault account_state=fresh reconciliation=ok
 .TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=reconciliation_warn,account_state_stale,bootstrap_protected_evidence_missing account_state=stale reconciliation=warn
 .Startup checks failed failures=1 warnings=0 broker=_PendingBroker
@@ -120,7 +120,7 @@ TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,re
 TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=reconciliation_warn,broker_event_stream_stale account_state=fresh reconciliation=warn
 ...Startup checks failed failures=2 warnings=0 broker=_DummyBroker
 TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
-PERSISTENCE_FAULT kind=runtime_truth_write path=/var/folders/0b/jt231n3s39x_wwmp5n3qhbj40000gn/T/tmpnlaufta2-state.db err=disk full count=1
+PERSISTENCE_FAULT kind=runtime_truth_write path=/private/tmp/<runtime-path> err=disk full count=1
 TRADING_MODE mode=HALTED opening_allowed=False reasons=persistence_fault account_state=fresh reconciliation=ok
 .....Startup checks failed failures=3 warnings=0 broker=_DummyBroker
 TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail,ambiguous_pending_unresolved,recovery_conflict account_state=unknown reconciliation=fail
@@ -152,7 +152,7 @@ TIME_EXIT_RETIRE slug=stale-closed-market token=token-stale-closed reason=live p
 Ran 96 tests in 2.557s
 
 OK
-/opt/homebrew/Cellar/python@3.13/3.13.3/Frameworks/Python.framework/Versions/3.13/lib/python3.13/tempfile.py:940: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/var/folders/0b/jt231n3s39x_wwmp5n3qhbj40000gn/T/tmp_mwrjkke'>
+<python3.13>/tempfile.py:940: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/private/tmp/<runtime-path>>
   _warnings.warn(warn_message, ResourceWarning)
 ...........
 ----------------------------------------------------------------------

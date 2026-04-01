@@ -115,9 +115,9 @@ WEB_LOG="$(PYTHONPATH=src .venv/bin/python scripts/runtime_paths.py web_log_path
 
 值守交接与上线留痕统一使用以下模板：
 
-- [production_signoff_template.md](/Users/marvin.xa/Desktop/Polymarket/production_signoff_template.md)
-- [production_release_record_template.md](/Users/marvin.xa/Desktop/Polymarket/production_release_record_template.md)
-- [operations_handoff_template.md](/Users/marvin.xa/Desktop/Polymarket/operations_handoff_template.md)
+- [production_signoff_template.md](~/Desktop/Polymarket/production_signoff_template.md)
+- [production_release_record_template.md](~/Desktop/Polymarket/production_release_record_template.md)
+- [operations_handoff_template.md](~/Desktop/Polymarket/operations_handoff_template.md)
 
 ## 六、12 小时复盘模板（可直接粘贴）
 

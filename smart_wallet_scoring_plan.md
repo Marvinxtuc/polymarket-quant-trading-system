@@ -410,7 +410,7 @@ action_strength = base_action x size_boost x multi_wallet_boost x freshness_deca
 
 对应文件：
 
-- [src/polymarket_bot/clients/data_api.py](/Users/marvin.xa/Desktop/Polymarket/src/polymarket_bot/clients/data_api.py)
+- [src/polymarket_bot/clients/data_api.py](~/Desktop/Polymarket/src/polymarket_bot/clients/data_api.py)
 
 这意味着：
 
@@ -485,7 +485,7 @@ action_strength = base_action x size_boost x multi_wallet_boost x freshness_deca
 
 ## 1. Extend Data Client
 
-建议在 [src/polymarket_bot/clients/data_api.py](/Users/marvin.xa/Desktop/Polymarket/src/polymarket_bot/clients/data_api.py) 增加：
+建议在 [src/polymarket_bot/clients/data_api.py](~/Desktop/Polymarket/src/polymarket_bot/clients/data_api.py) 增加：
 
 - `get_wallet_trade_history(...)`
 - `get_wallet_resolved_history(...)`
@@ -518,7 +518,7 @@ action_strength = base_action x size_boost x multi_wallet_boost x freshness_deca
 
 ## 4. Change Wallet Resolution Flow
 
-当前 [src/polymarket_bot/runner.py](/Users/marvin.xa/Desktop/Polymarket/src/polymarket_bot/runner.py) 的 `_resolve_wallets()` 主要解决“找谁”。
+当前 [src/polymarket_bot/runner.py](~/Desktop/Polymarket/src/polymarket_bot/runner.py) 的 `_resolve_wallets()` 主要解决“找谁”。
 
 后续应该改成：
 

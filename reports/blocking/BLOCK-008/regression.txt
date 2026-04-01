@@ -1,6 +1,6 @@
 BLOCK-008 regression + gates rerun (evidence supplementation)
 Date: 2026-03-27
-Workspace: /Users/marvin.xa/Desktop/Polymarket
+Workspace: ~/Desktop/Polymarket
 
 Commands:
 1) bash scripts/gates/gate_static.sh BLOCK-008

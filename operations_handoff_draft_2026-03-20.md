@@ -43,7 +43,7 @@
 - 当前保护状态：`live_smoke_preflight` 已 ready，但还没有真实 smoke 执行摘要
 - 需要关注的指标：`live_smoke_execution_summary.json` 是否生成且返回 success
 - 对应证据路径：
-  [preprod_readiness_snapshot_2026-03-20.md](/Users/marvin.xa/Desktop/Polymarket/preprod_readiness_snapshot_2026-03-20.md)
+  [preprod_readiness_snapshot_2026-03-20.md](~/Desktop/Polymarket/preprod_readiness_snapshot_2026-03-20.md)
   [alert_delivery_smoke.json](/tmp/poly_runtime_data/live/0x3e8d50d5e0ffda60d14649540fc5429d25f48c2c/alert_delivery_smoke.json)
 
 - 风险 3：统一 release gate 仍为 `BLOCKED`

@@ -2,11 +2,18 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 
 CHANNEL_ID = "1483402853648302081"
-SESSIONS_INDEX = Path("/Users/marvin.xa/.openclaw/agents/polymarket/sessions/sessions.json")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SESSIONS_INDEX = Path(
+    os.environ.get(
+        "OPENCLAW_SESSIONS_INDEX",
+        str(Path.home() / ".openclaw" / "agents" / "polymarket" / "sessions" / "sessions.json"),
+    )
+)
 
 
 def main() -> int:
@@ -35,7 +42,7 @@ def main() -> int:
         if not isinstance(identity, dict):
             identity = {}
         out = {
-            "workspace": str(acp.get("cwd") or "/Users/marvin.xa/Desktop/Polymarket"),
+            "workspace": str(acp.get("cwd") or os.environ.get("POLYMARKET_WORKSPACE") or PROJECT_ROOT),
             "discord_channel_id": str(value.get("groupId") or ""),
             "discord_channel_name": str(value.get("groupChannel") or ""),
             "openclaw_session_key": key,

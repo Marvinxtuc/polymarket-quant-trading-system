@@ -49,7 +49,7 @@
 - `DRY_RUN rehearsal` 输出：
   [24h_dry_run_rehearsal.txt](/tmp/poly_runtime_data/paper/default/24h_dry_run_rehearsal.txt)
 - `readiness snapshot`：
-  [preprod_readiness_snapshot_2026-03-20.md](/Users/marvin.xa/Desktop/Polymarket/preprod_readiness_snapshot_2026-03-20.md)
+  [preprod_readiness_snapshot_2026-03-20.md](~/Desktop/Polymarket/preprod_readiness_snapshot_2026-03-20.md)
 
 ## 风险确认
 

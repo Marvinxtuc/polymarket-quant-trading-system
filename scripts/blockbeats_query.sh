@@ -71,7 +71,7 @@ EOF
 
 require_api_key() {
   if [[ -z "${BLOCKBEATS_API_KEY:-}" ]]; then
-    echo "BLOCKBEATS_API_KEY is required. Export it first or add it to /Users/marvin.xa/Desktop/Polymarket/.env." >&2
+    echo "BLOCKBEATS_API_KEY is required. Export it first or add it to ${BASE}/.env." >&2
     exit 1
   fi
 }

@@ -24,11 +24,11 @@
 
 对应代码位置：
 
-- [src/polymarket_bot/strategies/wallet_follower.py](/Users/marvin.xa/Desktop/Polymarket/src/polymarket_bot/strategies/wallet_follower.py)
-- [src/polymarket_bot/risk.py](/Users/marvin.xa/Desktop/Polymarket/src/polymarket_bot/risk.py)
-- [src/polymarket_bot/runner.py](/Users/marvin.xa/Desktop/Polymarket/src/polymarket_bot/runner.py)
-- [src/polymarket_bot/daemon.py](/Users/marvin.xa/Desktop/Polymarket/src/polymarket_bot/daemon.py)
-- [frontend/app.js](/Users/marvin.xa/Desktop/Polymarket/frontend/app.js)
+- [src/polymarket_bot/strategies/wallet_follower.py](~/Desktop/Polymarket/src/polymarket_bot/strategies/wallet_follower.py)
+- [src/polymarket_bot/risk.py](~/Desktop/Polymarket/src/polymarket_bot/risk.py)
+- [src/polymarket_bot/runner.py](~/Desktop/Polymarket/src/polymarket_bot/runner.py)
+- [src/polymarket_bot/daemon.py](~/Desktop/Polymarket/src/polymarket_bot/daemon.py)
+- [frontend/app.js](~/Desktop/Polymarket/frontend/app.js)
 
 ---
 
@@ -235,11 +235,11 @@ class Signal:
 
 ## Concrete Changes By File
 
-### [src/polymarket_bot/types.py](/Users/marvin.xa/Desktop/Polymarket/src/polymarket_bot/types.py)
+### [src/polymarket_bot/types.py](~/Desktop/Polymarket/src/polymarket_bot/types.py)
 
 新增 `Signal` 的解释字段。
 
-### [src/polymarket_bot/config.py](/Users/marvin.xa/Desktop/Polymarket/src/polymarket_bot/config.py)
+### [src/polymarket_bot/config.py](~/Desktop/Polymarket/src/polymarket_bot/config.py)
 
 新增策略身份相关配置：
 
@@ -254,7 +254,7 @@ class Signal:
 
 但第一阶段不必做自动映射。
 
-### [src/polymarket_bot/strategies/wallet_follower.py](/Users/marvin.xa/Desktop/Polymarket/src/polymarket_bot/strategies/wallet_follower.py)
+### [src/polymarket_bot/strategies/wallet_follower.py](~/Desktop/Polymarket/src/polymarket_bot/strategies/wallet_follower.py)
 
 在生成信号时补足：
 
@@ -271,7 +271,7 @@ class Signal:
 - 大额加仓时把 `risk_flags` 留空或弱化
 - 小额/单钱包信号可加入 `single_wallet_signal`
 
-### [src/polymarket_bot/runner.py](/Users/marvin.xa/Desktop/Polymarket/src/polymarket_bot/runner.py)
+### [src/polymarket_bot/runner.py](~/Desktop/Polymarket/src/polymarket_bot/runner.py)
 
 重点改 3 处：
 
@@ -287,7 +287,7 @@ class Signal:
 - `source_summary`
 - `entry_tags`
 
-### [src/polymarket_bot/daemon.py](/Users/marvin.xa/Desktop/Polymarket/src/polymarket_bot/daemon.py)
+### [src/polymarket_bot/daemon.py](~/Desktop/Polymarket/src/polymarket_bot/daemon.py)
 
 把已有 UI 数据真正用起来：
 
@@ -302,7 +302,7 @@ class Signal:
 - 最近信号全部来自同一钱包
 - 最近多次因为 `price outside allowed band` 被拒绝
 
-### [frontend/app.js](/Users/marvin.xa/Desktop/Polymarket/frontend/app.js)
+### [frontend/app.js](~/Desktop/Polymarket/frontend/app.js)
 
 第一阶段只做轻量展示：
 

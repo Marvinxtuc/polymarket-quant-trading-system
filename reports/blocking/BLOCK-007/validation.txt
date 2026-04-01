@@ -1,6 +1,6 @@
 [BLOCK-007 Validation]
 Date: 2026-03-27
-Workspace: /Users/marvin.xa/Desktop/Polymarket
+Workspace: ~/Desktop/Polymarket
 
 Validation round scope:
 - /api/state signer_security 增加 allowlist 过滤（最小字段导出，去除 signer_url/secret_path/token 等敏感键）。

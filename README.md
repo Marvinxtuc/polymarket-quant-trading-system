@@ -65,7 +65,7 @@ Decision terminal:
 1. Create virtual env and install:
 
 ```bash
-cd /Users/marvin.xa/Desktop/Polymarket
+cd ~/Desktop/Polymarket
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -e .
@@ -157,9 +157,9 @@ make stop-stack
 
 This workspace now includes a shared `blockbeats-skill` installation for live crypto and prediction-market news context.
 
-- Shared skill source: `/Users/marvin.xa/Desktop/skills/blockbeats-skill`
-- Codex mirror: `/Users/marvin.xa/.codex/skills/blockbeats-skill`
-- OpenClaw shared skill root: `/Users/marvin.xa/Desktop/skills` via `~/.openclaw/openclaw.json`
+- Shared skill source: `~/Desktop/skills/blockbeats-skill`
+- Codex mirror: `~/.codex/skills/blockbeats-skill`
+- OpenClaw shared skill root: `~/Desktop/skills` via `~/.openclaw/openclaw.json`
 - Project helper script: `scripts/blockbeats_query.sh`
 
 Use it when a Polymarket view depends on fresh news catalysts rather than only wallet flow or price action.

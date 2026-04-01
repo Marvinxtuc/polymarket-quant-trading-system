@@ -61,7 +61,7 @@
   [live_smoke_preflight_2026-03-21.json](/tmp/poly_runtime_data/live/0x3e8d50d5e0ffda60d14649540fc5429d25f48c2c/live_smoke_preflight_2026-03-21.json)
   [live_smoke_preflight_2026-03-21_local_webhook.json](/tmp/poly_runtime_data/live/0x3e8d50d5e0ffda60d14649540fc5429d25f48c2c/live_smoke_preflight_2026-03-21_local_webhook.json)
 - `readiness snapshot`：
-  [preprod_readiness_snapshot_2026-03-20.md](/Users/marvin.xa/Desktop/Polymarket/preprod_readiness_snapshot_2026-03-20.md)
+  [preprod_readiness_snapshot_2026-03-20.md](~/Desktop/Polymarket/preprod_readiness_snapshot_2026-03-20.md)
 - `release_gate` 输出：
   [release_gate_report.json](/tmp/poly_runtime_data/live/0x3e8d50d5e0ffda60d14649540fc5429d25f48c2c/release_gate_report.json)
 

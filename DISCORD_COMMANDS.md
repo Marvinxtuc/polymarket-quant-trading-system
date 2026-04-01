@@ -85,13 +85,13 @@ Use recent memory, git state, and current workspace docs.
 
 Before answering, verify:
 
-- workspace is `/Users/marvin.xa/Desktop/Polymarket`
+- workspace is `~/Desktop/Polymarket`
 - current branch
 - whether a recent check/test result exists
 
 Use this exact progress reply skeleton whenever the user asks for progress in shared chat:
 
-- `workspace`: `/Users/marvin.xa/Desktop/Polymarket`
+- `workspace`: `~/Desktop/Polymarket`
 - `branch`: `<current branch>`
 - `checks`: `<latest known test/check result, or "no recent check run">`
 - `focus`: `<current focus>`

@@ -15,11 +15,11 @@ if [[ ! -x "$LAUNCHER_GUI" ]]; then
 fi
 
 mkdir -p "$TARGET_DIR"
-cat > "$TARGET" <<'EOF'
+cat > "$TARGET" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_DIR="/Users/marvin.xa/Desktop/Polymarket"
+PROJECT_DIR="${PROJECT_BASE}"
 if [[ ! -x "$PROJECT_DIR/scripts/run_one_click_launcher_gui.sh" ]]; then
   echo "launcher missing: $PROJECT_DIR/scripts/run_one_click_launcher_gui.sh"
   exit 1

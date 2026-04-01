@@ -12,6 +12,11 @@ BUNDLE_DIR="/tmp/poly_git_autosync_bundle"
 METHOD_FILE="$RUNTIME_DIR/method"
 START_TS="$(date '+%Y-%m-%d %H:%M:%S %Z')"
 PYTHON_BIN="${GIT_AUTOSYNC_PYTHON:-$BASE/.venv/bin/python}"
+SYSTEM_PATH_DEFAULT="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+if command -v brew >/dev/null 2>&1; then
+  SYSTEM_PATH_DEFAULT="$(brew --prefix)/bin:${SYSTEM_PATH_DEFAULT}"
+fi
+LAUNCHD_PATH="${GIT_AUTOSYNC_PATH:-$SYSTEM_PATH_DEFAULT}"
 
 if [[ ! -x "$LAUNCHCTL_BIN" ]]; then
   echo "launchctl not available" >&2
@@ -55,7 +60,7 @@ cat > "$PLIST" <<EOF
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>${LAUNCHD_PATH}</string>
     <key>GIT_AUTOSYNC_REMOTE</key>
     <string>${GIT_AUTOSYNC_REMOTE:-origin}</string>
     <key>GIT_AUTOSYNC_POLL_SECONDS</key>

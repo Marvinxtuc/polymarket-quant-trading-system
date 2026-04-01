@@ -144,6 +144,6 @@
 - [ ] 本清单 P0 全部通过，P1 全数通过，P2 至少 80%
 - [ ] 记录“上线时刻、版本、配置 hash、上游数据源状态、钱包地址”三元组
 - [ ] 决策人签字后进入 24 小时观察期
-- [ ] 会签记录已落到 [production_signoff_template.md](/Users/marvin.xa/Desktop/Polymarket/production_signoff_template.md)
-- [ ] 发布记录已落到 [production_release_record_template.md](/Users/marvin.xa/Desktop/Polymarket/production_release_record_template.md)
-- [ ] 值守交接模板已准备并指定接班人：[operations_handoff_template.md](/Users/marvin.xa/Desktop/Polymarket/operations_handoff_template.md)
+- [ ] 会签记录已落到 [production_signoff_template.md](~/Desktop/Polymarket/production_signoff_template.md)
+- [ ] 发布记录已落到 [production_release_record_template.md](~/Desktop/Polymarket/production_release_record_template.md)
+- [ ] 值守交接模板已准备并指定接班人：[operations_handoff_template.md](~/Desktop/Polymarket/operations_handoff_template.md)

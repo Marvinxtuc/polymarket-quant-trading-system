@@ -17,15 +17,19 @@ from pathlib import Path
 from typing import Any
 
 
-DEFAULT_SESSIONS_DIR = Path("/Users/marvin.xa/.openclaw/agents/polymarket/sessions")
-DEFAULT_CODEX_INDEX = Path("/Users/marvin.xa/.codex/session_index.jsonl")
-DEFAULT_CODEX_SESSIONS_ROOT = Path("/Users/marvin.xa/.codex/sessions")
-DEFAULT_OPENCLAW_CONFIG = Path("/Users/marvin.xa/.openclaw/openclaw.json")
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_HOME = Path.home()
+DEFAULT_SESSIONS_DIR = Path(
+    os.environ.get("OPENCLAW_SESSIONS_DIR", str(DEFAULT_HOME / ".openclaw" / "agents" / "polymarket" / "sessions"))
+)
+DEFAULT_CODEX_INDEX = Path(os.environ.get("CODEX_SESSION_INDEX", str(DEFAULT_HOME / ".codex" / "session_index.jsonl")))
+DEFAULT_CODEX_SESSIONS_ROOT = Path(os.environ.get("CODEX_SESSIONS_ROOT", str(DEFAULT_HOME / ".codex" / "sessions")))
+DEFAULT_OPENCLAW_CONFIG = Path(os.environ.get("OPENCLAW_CONFIG", str(DEFAULT_HOME / ".openclaw" / "openclaw.json")))
 DEFAULT_STATE_FILE = Path("/tmp/poly_codex_discord_bridge/state.json")
 DEFAULT_LOCK_FILE = Path("/tmp/poly_codex_discord_bridge/bridge.lock")
 DEFAULT_DISCORD_TARGET = "channel:1483402853648302081"
 DEFAULT_DISCORD_CHANNEL = "discord"
-DEFAULT_WORKSPACE = "/Users/marvin.xa/Desktop/Polymarket"
+DEFAULT_WORKSPACE = os.environ.get("POLYMARKET_WORKSPACE", str(PROJECT_ROOT))
 MAX_TEXT_CHARS = 1400
 MAX_SENT_IDS = 2000
 CODEX_BOOTSTRAP_RECENT = 3
@@ -579,7 +583,7 @@ def resume_codex_session(
     cmd = [
         "codex",
         "-c",
-        'experimental_compact_prompt_file="/Users/marvin.xa/.codex/default"',
+        f'experimental_compact_prompt_file="{DEFAULT_HOME / ".codex" / "default"}"',
         "exec",
         "--dangerously-bypass-approvals-and-sandbox",
         "-C",

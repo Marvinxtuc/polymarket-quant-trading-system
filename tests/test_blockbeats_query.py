@@ -100,7 +100,7 @@ class BlockBeatsQueryScriptTests(unittest.TestCase):
 
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("BLOCKBEATS_API_KEY is required", proc.stderr)
-        self.assertIn("/Users/marvin.xa/Desktop/Polymarket/.env", proc.stderr)
+        self.assertIn(str(temp_repo / ".env"), proc.stderr)
 
     def test_prediction_falls_back_to_public_feed_without_json_decode_noise(self) -> None:
         temp_root, temp_repo = self._prepare_temp_repo()

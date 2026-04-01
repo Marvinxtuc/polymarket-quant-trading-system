@@ -4,7 +4,7 @@
 
 ## 基线信息
 
-- 仓库路径：`/Users/marvin.xa/Desktop/Polymarket`
+- 仓库路径：`~/Desktop/Polymarket`
 - 当前 commit：`34ae68825c62d1cd10421b7195d8e6ba9aafde12`
 - 当前 `.env` hash：`2ffa005389fe30f87a3fb4f4282b381ea0be8de6d4a06227dc02ee65fa7ede60`
 
@@ -123,6 +123,6 @@
 1. 保持当前 `paper` 24h rehearsal 会话继续运行，等待更多 checkpoint。
 2. 在有人值守时执行一次受控 `live connectivity` smoke。
 3. 用本文件内容填充：
-  - [production_signoff_template.md](/Users/marvin.xa/Desktop/Polymarket/production_signoff_template.md)
-  - [production_release_record_template.md](/Users/marvin.xa/Desktop/Polymarket/production_release_record_template.md)
-  - [operations_handoff_template.md](/Users/marvin.xa/Desktop/Polymarket/operations_handoff_template.md)
+  - [production_signoff_template.md](~/Desktop/Polymarket/production_signoff_template.md)
+  - [production_release_record_template.md](~/Desktop/Polymarket/production_release_record_template.md)
+  - [operations_handoff_template.md](~/Desktop/Polymarket/operations_handoff_template.md)

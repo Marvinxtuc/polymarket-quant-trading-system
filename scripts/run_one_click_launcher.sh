@@ -2,7 +2,11 @@
 set -eu
 set -o pipefail
 
-export PATH="/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin"
+SYSTEM_PATH_DEFAULT="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+if command -v brew >/dev/null 2>&1; then
+  SYSTEM_PATH_DEFAULT="$(brew --prefix)/bin:${SYSTEM_PATH_DEFAULT}"
+fi
+export PATH="${POLY_ONE_CLICK_PATH:-$SYSTEM_PATH_DEFAULT}"
 
 PROJECT_BASE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY_BIN="$PROJECT_BASE/.venv/bin/python"

@@ -14,6 +14,11 @@ ROTATE_KEEP="${ROTATE_KEEP:-24}"
 METHOD_FILE=""
 START_TS="$(date '+%Y-%m-%d %H:%M:%S %Z')"
 FORCE_NOHUP="${MONITOR_FORCE_NOHUP:-0}"
+SYSTEM_PATH_DEFAULT="/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+if command -v brew >/dev/null 2>&1; then
+  SYSTEM_PATH_DEFAULT="$(brew --prefix)/bin:${SYSTEM_PATH_DEFAULT}"
+fi
+LAUNCHD_PATH="${MONITOR_LAUNCHD_PATH:-$SYSTEM_PATH_DEFAULT}"
 
 resolve_runtime_paths() {
   local runtime_py="$PY_BIN"
@@ -101,7 +106,7 @@ cat > "$PLIST" <<EOF_INNER
   <key>EnvironmentVariables</key>
   <dict>
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>${LAUNCHD_PATH}</string>
     <key>ROTATE_KEEP</key>
     <string>$ROTATE_KEEP</string>
     <key>PYTHONPATH</key>
