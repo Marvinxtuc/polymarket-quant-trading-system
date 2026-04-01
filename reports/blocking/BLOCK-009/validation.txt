@@ -1,0 +1,28 @@
+BLOCK-009 validation (acceptance evidence round)
+Generated: 2026-03-27 11:55:00 CST
+
+Proof commands and results:
+1) Exposure ledger single-source + anti-bypass
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_exposure_ledger_limits.py'
+- Result: PASS (2 tests)
+
+2) Three-layer caps simultaneous and fixed primary reason priority
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_wallet_portfolio_condition_caps.py'
+- Result: PASS (3 tests)
+
+3) Loss streak / drawdown fixed rules (profit reset, break-even keep, split exits, day roll reset)
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_loss_streak_breaker_blocks_buy.py'
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_intraday_drawdown_breaker_blocks_buy.py'
+- Result: PASS (4 + 2 tests)
+
+4) Breaker persistence after restart + old compatibility fields cannot override breaker truth
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_risk_breaker_persists_across_restart.py'
+- Result: PASS (2 tests)
+
+5) /api/state minimum risk fields exposed
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_api_state_exposes_risk_breakers.py'
+- Result: PASS (1 test)
+
+Behavior verification:
+- PYTHONPATH=src .venv/bin/python scripts/verify_exposure_caps.py -> ok
+- PYTHONPATH=src .venv/bin/python scripts/verify_loss_streak_and_drawdown_breakers.py -> ok

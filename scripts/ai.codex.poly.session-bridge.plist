@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>ai.codex.poly.session-bridge</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>/tmp/poly_codex_discord_bridge/start_codex_session_bridge.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/tmp/poly_codex_discord_bridge</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StartInterval</key>
+  <integer>60</integer>
+
+  <key>StandardOutPath</key>
+  <string>/tmp/poly_codex_session_bridge.launchd.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>/tmp/poly_codex_session_bridge.launchd.err.log</string>
+</dict>
+</plist>

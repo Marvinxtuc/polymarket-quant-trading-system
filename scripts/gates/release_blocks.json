@@ -1,0 +1,14 @@
+{
+  "required_blocks": [
+    "BLOCK-001",
+    "BLOCK-002",
+    "BLOCK-003",
+    "BLOCK-004",
+    "BLOCK-005",
+    "BLOCK-006",
+    "BLOCK-007",
+    "BLOCK-008",
+    "BLOCK-009"
+  ],
+  "optional_blocks": []
+}

@@ -1,0 +1,104 @@
+groups:
+  - name: polymarket-blocking-safety
+    interval: 30s
+    rules:
+      - alert: PolymarketRunnerHeartbeatStale
+        expr: polymarket_runner_heartbeat_stale == 1
+        for: 2m
+        labels:
+          severity: page
+          alert_code: runner_heartbeat_stale
+        annotations:
+          summary: "Runner heartbeat stale"
+          description: "Active runner heartbeat exceeded stale threshold."
+
+      - alert: PolymarketAdmissionFailClosed
+        expr: polymarket_admission_opening_allowed == 0
+        for: 1m
+        labels:
+          severity: page
+          alert_code: admission_fail_closed
+        annotations:
+          summary: "Admission gate blocked BUY"
+          description: "Admission opening_allowed=false."
+
+      - alert: PolymarketReconciliationFail
+        expr: polymarket_reconciliation_fail == 1
+        for: 1m
+        labels:
+          severity: page
+          alert_code: reconciliation_fail
+        annotations:
+          summary: "Reconciliation failure"
+          description: "Reconciliation status is fail."
+
+      - alert: PolymarketAccountSnapshotStale
+        expr: polymarket_account_snapshot_stale == 1
+        for: 3m
+        labels:
+          severity: warning
+          alert_code: account_snapshot_stale
+        annotations:
+          summary: "Account snapshot stale"
+          description: "Account snapshot age exceeded threshold."
+
+      - alert: PolymarketEventStreamStale
+        expr: polymarket_event_stream_stale == 1
+        for: 3m
+        labels:
+          severity: warning
+          alert_code: event_stream_stale
+        annotations:
+          summary: "Broker event stream stale"
+          description: "Broker event stream age exceeded threshold."
+
+      - alert: PolymarketKillSwitchManualRequired
+        expr: polymarket_kill_switch_manual_required == 1
+        for: 1m
+        labels:
+          severity: page
+          alert_code: kill_switch_manual_required
+        annotations:
+          summary: "Kill switch requires manual intervention"
+          description: "Kill switch reached MANUAL_REQUIRED."
+
+      - alert: PolymarketSignerUnhealthy
+        expr: polymarket_signer_healthy == 0
+        for: 1m
+        labels:
+          severity: page
+          alert_code: signer_unhealthy
+        annotations:
+          summary: "Signer unhealthy"
+          description: "Signer health check failed or raw key violation latched."
+
+      - alert: PolymarketWriterReadonlyConflict
+        expr: polymarket_writer_readonly_mode == 1 and polymarket_alert_active{alert_code="writer_conflict_readonly"} == 1
+        for: 1m
+        labels:
+          severity: page
+          alert_code: writer_conflict_readonly
+        annotations:
+          summary: "Writer conflict: readonly fallback"
+          description: "Instance is readonly because of single-writer conflict."
+
+      - alert: PolymarketHotWalletCapExceeded
+        expr: polymarket_hot_wallet_cap_ok == 0
+        for: 1m
+        labels:
+          severity: page
+          alert_code: hot_wallet_cap_exceeded
+        annotations:
+          summary: "Hot wallet cap exceeded"
+          description: "Hot wallet cap hard gate failed."
+
+      - alert: PolymarketBuyBlockedTooLong
+        expr: polymarket_alert_active{alert_code="buy_blocked_too_long"} == 1
+        for: 1m
+        labels:
+          severity: warning
+          alert_code: buy_blocked_too_long
+        annotations:
+          summary: "BUY blocked too long"
+          description: "buy_blocked_duration_seconds exceeded configured alert threshold."
+

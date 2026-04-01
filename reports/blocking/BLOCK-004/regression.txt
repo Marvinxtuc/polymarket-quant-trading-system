@@ -1,0 +1,180 @@
+BLOCK-004 regression run 2026-03-26T09:43:23Z
+[cmd] bash scripts/gates/gate_tests.sh BLOCK-004
+[gate_tests] BLOCK-ID=BLOCK-004
+.............
+----------------------------------------------------------------------
+Ran 13 tests in 0.000s
+
+OK
+....Startup checks failed failures=2 warnings=0 broker=_DummyBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=reconciliation_warn,account_state_stale,bootstrap_protected_evidence_missing account_state=stale reconciliation=warn
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=reconciliation_warn,account_state_stale account_state=stale reconciliation=warn
+.Startup checks failed failures=2 warnings=0 broker=_DummyBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail,account_state_stale account_state=stale reconciliation=fail
+......Startup checks failed failures=2 warnings=0 broker=_DummyBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail,account_state_stale account_state=stale reconciliation=fail
+.Startup checks failed failures=3 warnings=0 broker=_DummyBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail,account_state_stale,recovery_conflict account_state=stale reconciliation=fail
+.Startup checks failed failures=2 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+Periodic broker reconciliation changed positions added=1 removed=0 updated=0 open=1
+.Startup checks failed failures=2 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+..BUY budget clamp signal=low-cash-market token=token-low-cash requested=50.00 available=1.88
+.......BUY condition netting clamp slug=small-cap token=token-small-cap requested=50.00 allowed=1.50 current_condition=0.00 cap=1.50
+.Startup checks failed failures=2 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=reconciliation_warn,account_state_stale account_state=stale reconciliation=warn
+Recovered position metadata with quantity mismatch token=token-demo recovery_source=runtime_previous source_qty=100.000000 target_qty=50.000000 source_cost_basis=50.000000 scaled_cost_basis=25.000000
+Late fill reconciled for prior day fill_day=2026-03-19 current_day=2026-03-20 realized_pnl=5.000000
+Periodic broker reconciliation changed positions added=0 removed=0 updated=1 open=1
+...TRADING_MODE mode=HALTED opening_allowed=False reasons=emergency_stop account_state=fresh reconciliation=ok
+EMERGENCY_EXIT slug=demo-market token=token-demo notional=60.00 remain_notional=0.00
+EMERGENCY_EXIT_CLOSE slug=demo-market token=token-demo open_positions=0
+EMERGENCY_STOP active, skip opening logic, open_positions=0
+.PERSISTENCE_FAULT kind=daemon_state_write path=/tmp/state.json err=disk full count=1
+TRADING_MODE mode=HALTED opening_allowed=False reasons=persistence_fault account_state=fresh reconciliation=ok
+HALTED_MODE active, skip automatic trading actions reasons=persistence_fault
+.Startup checks failed failures=1 warnings=0 broker=_DummyBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=bootstrap_protected_evidence_missing account_state=unknown reconciliation=ok
+.Startup checks failed failures=2 warnings=0 broker=_DummyBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+Failed to append ledger path=/private/tmp/<runtime-path> err=disk full
+PERSISTENCE_FAULT kind=ledger_append path=/private/tmp/<runtime-path> err=disk full count=1
+TRADING_MODE mode=HALTED opening_allowed=False reasons=persistence_fault account_state=fresh reconciliation=ok
+.TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=reconciliation_warn,account_state_stale,bootstrap_protected_evidence_missing account_state=stale reconciliation=warn
+.Startup checks failed failures=1 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+.Startup checks failed failures=1 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+.Startup checks failed failures=1 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+...Startup checks failed failures=2 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+Periodic broker reconciliation changed positions added=1 removed=0 updated=0 open=1
+.Startup checks failed failures=2 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=reconciliation_warn account_state=fresh reconciliation=warn
+OPERATOR_CLEAR_STALE_PENDING requested_ts=1774518204 cleared=1 remaining=1
+.Startup checks failed failures=2 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+Periodic broker reconciliation changed positions added=1 removed=0 updated=0 open=1
+.Startup checks failed failures=2 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+Periodic broker reconciliation changed positions added=1 removed=0 updated=0 open=1
+.TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=pause_opening account_state=fresh reconciliation=ok
+.Startup checks failed failures=2 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+BUY condition netting clamp slug=demo-market token=token-demo requested=50.00 allowed=25.00 current_condition=50.00 cap=75.00
+..BUY budget clamp signal=market-two token=token-two requested=7.50 available=1.50
+..Startup checks failed failures=2 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+..Startup checks failed failures=2 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+.Startup checks failed failures=2 warnings=0 broker=_DummyBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail,account_state_stale account_state=stale reconciliation=fail
+Periodic broker reconciliation changed positions added=0 removed=1 updated=0 open=0
+.Startup checks failed failures=2 warnings=0 broker=_DummyBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail,account_state_stale account_state=stale reconciliation=fail
+Recovered position metadata with quantity mismatch token=token-demo recovery_source=runtime_previous source_qty=10.000000 target_qty=6.000000 source_cost_basis=5.000000 scaled_cost_basis=3.000000
+Periodic broker reconciliation changed positions added=0 removed=0 updated=1 open=1
+..Startup checks failed failures=2 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+PERSISTENCE_FAULT kind=daemon_state_write path=/tmp/state.json err=disk full count=1
+TRADING_MODE mode=HALTED opening_allowed=False reasons=persistence_fault account_state=fresh reconciliation=ok
+HALTED_MODE active, skip automatic trading actions reasons=persistence_fault
+.Startup checks failed failures=2 warnings=0 broker=_DummyBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+PERSISTENCE_FAULT kind=daemon_state_write path=/tmp/state.json err=disk full count=1
+TRADING_MODE mode=HALTED opening_allowed=False reasons=persistence_fault account_state=fresh reconciliation=ok
+.BUY condition netting clamp slug=demo-b token=token-b requested=50.00 allowed=25.00 current_condition=50.00 cap=75.00
+.Startup checks failed failures=2 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+BUY condition netting clamp slug=demo-b token=token-b requested=50.00 allowed=25.00 current_condition=50.00 cap=75.00
+.BUY condition netting clamp slug=shared-market token=token-b requested=50.00 allowed=10.00 current_condition=50.00 cap=60.00
+..Startup checks failed failures=2 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+Periodic broker reconciliation changed positions added=1 removed=0 updated=0 open=1
+.Startup checks failed failures=2 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+Periodic broker reconciliation changed positions added=0 removed=0 updated=1 open=1
+.Startup checks failed failures=2 warnings=0 broker=_DummyBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=reconciliation_warn,ambiguous_pending_unresolved account_state=fresh reconciliation=warn
+..TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=reconciliation_warn account_state=fresh reconciliation=warn
+.TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=pause_opening account_state=fresh reconciliation=ok
+.Startup checks failed failures=2 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=pause_opening account_state=fresh reconciliation=ok
+.TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=reconciliation_warn account_state=fresh reconciliation=warn
+.Startup checks failed failures=2 warnings=0 broker=_DummyBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=ledger_diff_exceeded account_state=fresh reconciliation=ok
+.Startup checks failed failures=2 warnings=0 broker=_DummyBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=reconciliation_fail account_state=fresh reconciliation=fail
+.Startup checks failed failures=2 warnings=0 broker=_DummyBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=reconciliation_warn,broker_event_stream_stale account_state=fresh reconciliation=warn
+...Startup checks failed failures=2 warnings=0 broker=_DummyBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+PERSISTENCE_FAULT kind=runtime_truth_write path=/private/tmp/<runtime-path> err=disk full count=1
+TRADING_MODE mode=HALTED opening_allowed=False reasons=persistence_fault account_state=fresh reconciliation=ok
+.....Startup checks failed failures=3 warnings=0 broker=_DummyBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail,ambiguous_pending_unresolved,recovery_conflict account_state=unknown reconciliation=fail
+.TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=fresh reconciliation=fail
+.Startup checks failed failures=2 warnings=0 broker=_DummyBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=fresh reconciliation=fail
+.TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready account_state=fresh reconciliation=ok
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready account_state=fresh reconciliation=ok
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready account_state=fresh reconciliation=ok
+.Startup checks failed failures=3 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail,ambiguous_pending_unresolved,recovery_conflict account_state=unknown reconciliation=fail
+.Startup checks failed failures=2 warnings=0 broker=_DummyBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+...Startup checks failed failures=3 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail,recovery_conflict account_state=unknown reconciliation=fail
+.Recovered position metadata with quantity mismatch token=token-demo recovery_source=db_snapshot source_qty=10.000000 target_qty=6.000000 source_cost_basis=5.000000 scaled_cost_basis=3.000000
+Startup checks failed failures=2 warnings=0 broker=_DummyBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+...Startup checks failed failures=2 warnings=0 broker=_PendingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=unknown reconciliation=fail
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail account_state=fresh reconciliation=fail
+..Startup checks failed failures=2 warnings=0 broker=_RejectingBroker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail,account_state_stale account_state=stale reconciliation=fail
+POSITION_RETIRED slug=stale-closed-market token=token-stale-closed reason=live preflight failed: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=token-stale-closed' open_positions=0
+TIME_EXIT_RETIRE slug=stale-closed-market token=token-stale-closed reason=live preflight failed: Client error '404 Not Found' for url 'https://clob.polymarket.com/book?token_id=token-stale-closed'
+......
+----------------------------------------------------------------------
+Ran 96 tests in 2.557s
+
+OK
+<python3.13>/tempfile.py:940: ResourceWarning: Implicitly cleaning up <TemporaryDirectory '/private/tmp/<runtime-path>>
+  _warnings.warn(warn_message, ResourceWarning)
+...........
+----------------------------------------------------------------------
+Ran 11 tests in 0.087s
+
+OK
+.........
+----------------------------------------------------------------------
+Ran 9 tests in 0.202s
+
+OK
+.Periodic broker reconciliation changed positions added=1 removed=0 updated=0 open=1
+.Periodic broker reconciliation changed positions added=1 removed=0 updated=0 open=1
+.
+----------------------------------------------------------------------
+Ran 3 tests in 0.083s
+
+OK
+Periodic broker reconciliation changed positions added=1 removed=0 updated=0 open=1
+...
+----------------------------------------------------------------------
+Ran 3 tests in 0.030s
+
+OK
+[gate_tests] PASS

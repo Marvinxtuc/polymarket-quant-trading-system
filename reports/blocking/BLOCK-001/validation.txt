@@ -1,0 +1,48 @@
+[BLOCK-001 validation] 2026-03-26 14:03:00 +0800
+$ PYTHONPATH=src .venv/bin/python scripts/verify_runtime_persistence.py
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=reconciliation_warn account_state=fresh reconciliation=warn
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=reconciliation_warn account_state=fresh reconciliation=warn
+PASS: runtime persistence, tmp deletion, and dirty tmp isolation verified
+
+$ PYTHONPATH=src .venv/bin/python scripts/verify_restart_recovery.py
+Startup checks failed failures=1 warnings=0 broker=_Broker
+TRADING_MODE mode=REDUCE_ONLY opening_allowed=False reasons=startup_not_ready,reconciliation_fail,recovery_conflict account_state=fresh reconciliation=fail
+PASS: recovery conflict keeps startup not-ready, latches protection, and blocks BUY
+
+$ bash scripts/gates/gate_static.sh BLOCK-001
+[gate_static] BLOCK-ID=BLOCK-001
+[gate_static] PASS
+
+$ bash scripts/gates/gate_tests.sh BLOCK-001
+[gate_tests] BLOCK-ID=BLOCK-001
+... (all configured BLOCK-001 suites passed)
+[gate_tests] PASS
+
+$ bash scripts/gates/gate_behavior.sh BLOCK-001
+[gate_behavior] BLOCK-ID=BLOCK-001
+PASS: runtime persistence, tmp deletion, and dirty tmp isolation verified
+PASS: recovery conflict keeps startup not-ready, latches protection, and blocks BUY
+[gate_behavior] PASS
+
+$ bash scripts/gates/gate_docs.sh BLOCK-001
+[gate_docs] PASS: required docs present and non-empty
+
+$ bash scripts/gates/gate_block_item.sh BLOCK-001
+[gate_block_item] START BLOCK-ID=BLOCK-001
+... (static/tests/behavior/docs all passed)
+[gate_block_item] RESULTS static=0 tests=0 behavior=0 docs=0 overall=0
+
+$ bash scripts/gates/gate_block_item.sh BLOCK-001 (re-run)
+[gate_block_item] RESULTS static=0 tests=0 behavior=0 docs=0 overall=0
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_tmp_deletion_recovery.py' -k dirty_tmp
+Ran 1 test
+OK
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_runtime_state_persistence.py' -k pending_orders_field_in_runtime_snapshot_is_not_used_as_recovery_truth
+Ran 1 test
+OK
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_broker_db_conflict_blocks_buy.py' -k db_pending_without_broker_evidence_blocks_buy
+Ran 1 test
+OK

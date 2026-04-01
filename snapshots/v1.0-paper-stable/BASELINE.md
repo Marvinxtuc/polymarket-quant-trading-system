@@ -1,7 +1,7 @@
 # v1.0-paper-stable
 
 Frozen at: 2026-03-11 16:52:27 CST
-Workspace: /Users/marvin.xa/Desktop/Polymarket
+Workspace: ~/Desktop/Polymarket
 
 ## Baseline Scope
 - Runtime config snapshot: `.env`, `.env.example`
@@ -21,7 +21,7 @@ Workspace: /Users/marvin.xa/Desktop/Polymarket
 
 ## Restore
 ```bash
-cd /Users/marvin.xa/Desktop/Polymarket
+cd ~/Desktop/Polymarket
 cp snapshots/v1.0-paper-stable/.env .env
 cp snapshots/v1.0-paper-stable/.env.example .env.example
 cp snapshots/v1.0-paper-stable/config.py src/polymarket_bot/config.py

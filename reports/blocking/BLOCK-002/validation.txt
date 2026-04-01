@@ -1,0 +1,42 @@
+# BLOCK-002 validation log (supplement round)
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_idempotent_order_submission.py"
+- RESULT: PASS (Ran 3 tests)
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_restart_does_not_duplicate_orders.py"
+- RESULT: PASS (Ran 3 tests)
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_timeout_retry_reuses_same_intent.py"
+- RESULT: PASS (Ran 2 tests)
+
+$ ./scripts/gates/gate_static.sh BLOCK-002
+[gate_static] BLOCK-ID=BLOCK-002
+[gate_static] PASS
+- RESULT: PASS
+
+$ ./scripts/gates/gate_behavior.sh BLOCK-002
+[gate_behavior] BLOCK-ID=BLOCK-002
+[gate_behavior] PASS
+- RESULT: PASS
+
+$ ./scripts/gates/gate_docs.sh BLOCK-002
+[gate_docs] PASS: required docs present and non-empty
+- RESULT: PASS
+
+$ ./scripts/gates/gate_block_item.sh BLOCK-002
+[gate_block_item] START BLOCK-ID=BLOCK-002
+[gate_static] BLOCK-ID=BLOCK-002
+[gate_static] PASS
+[gate_tests] BLOCK-ID=BLOCK-002
+[gate_tests] PASS
+[gate_behavior] BLOCK-ID=BLOCK-002
+[gate_behavior] PASS
+[gate_docs] PASS: required docs present and non-empty
+[gate_block_item] RESULTS static=0 tests=0 behavior=0 docs=0 overall=0
+- RESULT: PASS
+
+$ ./scripts/gates/gate_docs.sh BLOCK-002 (re-run)
+[gate_docs] PASS: required docs present and non-empty
+
+$ ./scripts/gates/gate_block_item.sh BLOCK-002 (re-run)
+[gate_block_item] RESULTS static=0 tests=0 behavior=0 docs=0 overall=0

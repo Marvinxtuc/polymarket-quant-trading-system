@@ -1,0 +1,37 @@
+BLOCK-005 validation
+Date: 2026-03-26
+
+Commands:
+1) bash scripts/gates/gate_static.sh BLOCK-005
+   Result: PASS
+2) bash scripts/gates/gate_behavior.sh BLOCK-005
+   Result: PASS
+3) bash scripts/gates/gate_docs.sh BLOCK-005
+   Result: PASS
+4) bash scripts/gates/gate_block_item.sh BLOCK-005
+   Result: PASS (static=0 tests=0 behavior=0 docs=0)
+
+Behavior coverage verified by scripts:
+- scripts/verify_kill_switch_terminal.py
+  - cancel requested is not safe
+  - broker open BUY without local pending still blocks BUY
+  - emergency_stop remains latched until broker terminal
+  - restart preserves inflight waiting state
+- scripts/verify_reduce_only_terminal_cleanup.py
+  - reduce_only cleanup waits for broker terminal before release
+
+Acceptance evidence refresh (2026-03-26)
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_kill_switch_requires_broker_terminal.py' -> PASS
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_cancel_requested_is_not_safe.py' -> PASS
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_restart_preserves_kill_switch_inflight_state.py' -> PASS
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_emergency_stop_latched_until_broker_safe.py' -> PASS
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_web_api.py' -> PASS
+
+Proof command rerun (2026-03-26)
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_kill_switch_requires_broker_terminal.py' -> PASS
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_cancel_requested_is_not_safe.py' -> PASS
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_restart_preserves_kill_switch_inflight_state.py' -> PASS
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_emergency_stop_latched_until_broker_safe.py' -> PASS
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_web_api.py' -> PASS
+- PYTHONPATH=src .venv/bin/python scripts/verify_kill_switch_terminal.py -> PASS
+- PYTHONPATH=src .venv/bin/python scripts/verify_reduce_only_terminal_cleanup.py -> PASS

@@ -1,0 +1,41 @@
+[BR-002 validation] 2026-03-30 00:00:00 +0800
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_candidate_lifetime_expiration.py'
+Ran 2 tests
+OK
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_wallet_follower.py'
+Ran 14 tests
+OK
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_runner_control.py'
+Ran 103 tests
+OK
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_daemon_state.py'
+Ran 9 tests
+OK
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_web_api.py'
+Ran 13 tests
+OK
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_db.py'
+Ran 9 tests
+OK
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_alert_conditions_derived_from_runtime_state.py'
+Ran 2 tests
+OK
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_api_state_and_metrics_consistent.py'
+Ran 1 test
+OK
+
+$ PYTHONPATH=src:tests .venv/bin/python scripts/verify_candidate_lifetime_expiration.py
+Ran 7 targeted verification checks
+OK
+verify_candidate_lifetime_expiration: ok
+
+$ bash -lc 'test -s README.md && test -s docs/runbook/candidate_lifecycle.md && test -s reports/blocking/BR-002/self_check.md && test -s reports/blocking/BR-002/validation.txt && rg -q "candidate_lifetime_expired|execution-precheck|CANDIDATE_TTL_SECONDS" README.md docs/runbook/candidate_lifecycle.md && echo docs_pass'
+docs_pass

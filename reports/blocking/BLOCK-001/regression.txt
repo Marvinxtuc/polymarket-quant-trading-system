@@ -1,0 +1,35 @@
+[BLOCK-001 regression] 2026-03-26 14:03:10 +0800
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_runtime_state_persistence.py'
+Ran 2 tests in 0.026s
+OK
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_tmp_deletion_recovery.py'
+Ran 2 tests in 0.446s
+OK
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_broker_db_conflict_blocks_buy.py'
+Ran 1 test in 0.392s
+OK
+
+$ bash scripts/gates/gate_tests.sh BLOCK-001
+[gate_tests] BLOCK-ID=BLOCK-001
+Ran all configured BLOCK-001 unit/integration/regression suites
+[gate_tests] PASS
+
+$ bash scripts/gates/gate_block_item.sh BLOCK-001
+[gate_block_item] RESULTS static=0 tests=0 behavior=0 docs=0 overall=0
+
+$ bash scripts/gates/gate_block_item.sh BLOCK-001 (re-run)
+[gate_block_item] RESULTS static=0 tests=0 behavior=0 docs=0 overall=0
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_tmp_deletion_recovery.py' -k dirty_tmp
+Ran 1 test
+OK
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_runtime_state_persistence.py' -k pending_orders_field_in_runtime_snapshot_is_not_used_as_recovery_truth
+Ran 1 test
+OK
+
+$ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_broker_db_conflict_blocks_buy.py' -k db_pending_without_broker_evidence_blocks_buy
+Ran 1 test
+OK

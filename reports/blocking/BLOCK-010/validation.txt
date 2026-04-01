@@ -1,0 +1,23 @@
+BLOCK-010 validation report
+Generated: 2026-03-27 13:14:41 CST
+
+Validation commands executed:
+- bash scripts/gates/gate_static.sh BLOCK-010
+- bash scripts/gates/gate_tests.sh BLOCK-010
+- bash scripts/gates/gate_behavior.sh BLOCK-010
+- bash scripts/gates/gate_docs.sh BLOCK-010
+- bash scripts/gates/gate_block_item.sh BLOCK-010
+
+Validation result:
+- static: PASS
+- tests: PASS
+- behavior: PASS
+- docs: PASS
+- block-item: PASS
+
+Acceptance evidence added in this round:
+- required blocks single-source loading proven by tests and runtime report checks.
+- machine result line required; missing machine signal forces NO-GO.
+- atomic write path verified via os.replace assertion.
+- report structure invalid case forces NO-GO.
+- parse/runtime internal errors force NO-GO.

@@ -3,136 +3,471 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Polymarket 自动交易控制台</title>
+  <title data-i18n="app.title"></title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+SC:wght@400;500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
-  <link rel="stylesheet" href="./styles.css?v=20260313a" />
+  <link rel="stylesheet" href="./styles.css?v=20260319d" />
 </head>
 <body>
   <div class="bg-grid"></div>
   <main class="console">
     <header class="panel topbar">
       <section class="brand-wrap">
-        <span class="pill live">实盘</span>
+        <span class="pill paper" id="mode-pill" data-i18n="app.modeBadge.paper"></span>
         <div>
-          <h1>Polymarket 自动交易系统</h1>
-          <p id="status-line">聪明钱包共识引擎 · 最近刷新 --:--:-- · 下次刷新 --s · 每 --s 轮询</p>
+          <h1 data-i18n="app.systemName"></h1>
+          <p id="status-line"></p>
         </div>
       </section>
       <section class="top-actions">
-        <span class="status"><span class="dot"></span>在线</span>
-        <span class="guard" id="guard-line">账户 --U · 单笔上限 --U · 今日剩余风险 --%</span>
-        <button class="btn" id="btn-pause-opening">暂停开仓</button>
-        <button class="btn ghost" id="btn-reduce-only">只减仓模式</button>
-        <button class="btn warn" id="btn-emergency-stop">紧急退出</button>
+        <span class="status" id="live-status"><span class="dot" id="live-status-dot"></span><span id="live-status-label" data-i18n="app.liveStatus.online"></span></span>
+        <span class="guard" id="ops-gate-pill"></span>
+        <span class="guard" id="guard-line"></span>
+        <button class="btn" id="btn-pause-opening" data-i18n="app.control.pauseOpening.enable"></button>
+        <button class="btn ghost" id="btn-reduce-only" data-i18n="app.control.reduceOnly.enable"></button>
+        <button class="btn warn" id="btn-emergency-stop" data-i18n="app.control.emergencyStop.enable"></button>
       </section>
     </header>
 
-    <section class="panel budget-card">
-      <div class="head"><h2>今日风险预算</h2><span class="mono" id="budget-meta">已使用 --% · 剩余 --% · 预计可开仓 -- 次</span></div>
-      <div class="budget-line">
-        <div class="budget-fill" id="budget-fill" style="width:32%"></div>
+    <section class="panel candidate-panel" id="candidate-panel">
+      <div class="head">
+        <h2 data-i18n="candidate.panel.title"></h2>
+        <span class="mono" id="candidate-meta"></span>
       </div>
-    </section>
-
-    <section class="kpi-row">
-      <article class="panel kpi">
-        <h3>今日收益</h3>
-        <p class="num good" id="kpi-pnl">$0.00</p>
-        <small id="kpi-equity">权益：-- USDC</small>
-      </article>
-      <article class="panel kpi">
-        <h3>当前持仓</h3>
-        <p class="num" id="kpi-pos">0 / 0</p>
-        <small id="kpi-exp">总敞口：0.00%</small>
-      </article>
-      <article class="panel kpi">
-        <h3>共识信号</h3>
-        <p class="num" id="kpi-signals">0</p>
-        <small id="kpi-signals-note">每轮最多 0 条</small>
-      </article>
-      <article class="panel kpi">
-        <h3>风控模式</h3>
-        <p class="num warn" id="kpi-risk-mode">-</p>
-        <small id="kpi-risk-note">拥堵阈值 -- / 拥堵减仓 --</small>
-      </article>
-    </section>
-
-    <section class="main-grid">
-      <div class="col">
-        <article class="panel card">
-          <div class="head"><h2>策略参数</h2><span class="mono" id="param-wallet-pool">wallet_pool=0</span></div>
-          <ul class="list tight">
-            <li><span>单钱包净加仓阈值</span><b id="param-min-increase">-</b></li>
-            <li><span>每轮最大信号数</span><b id="param-max-signals">-</b></li>
-            <li><span>单笔风险</span><b id="param-risk-trade">-</b></li>
-            <li><span>日止损</span><b id="param-risk-day">-</b></li>
-            <li><span>价格带</span><b id="param-price-band">-</b></li>
-            <li><span>加仓冷却</span><b id="param-add-cooldown">-</b></li>
-          </ul>
-        </article>
-
-        <article class="panel card">
-          <div class="head"><h2>钱包监控</h2><span class="mono">可交易视图</span></div>
-          <div class="table-wrap small-scroll">
-            <table class="table">
-              <thead><tr><th>钱包</th><th>可用</th><th>今日PnL</th><th>交易次数</th><th>状态</th><th>最近异常</th></tr></thead>
-              <tbody id="wallets-body">
-                <tr><td colspan="6">等待数据...</td></tr>
-              </tbody>
-            </table>
+      <p class="api-status wait" id="candidate-panel-status" data-i18n="common.waitingData"></p>
+      <div class="candidate-toolbar">
+        <div class="candidate-toolbar-main">
+          <div class="candidate-toolbar-primary">
+            <div class="mode-switch" id="decision-mode-switch">
+              <button class="chip active" type="button" data-mode="manual" data-i18n="enum.mode.manual"></button>
+              <button class="chip" type="button" data-mode="semi_auto" data-i18n="enum.mode.semi_auto"></button>
+              <button class="chip" type="button" data-mode="auto" data-i18n="enum.mode.auto"></button>
+            </div>
+            <div class="candidate-summary" id="candidate-summary">
+              <span class="chip active"></span>
+              <span class="chip"></span>
+              <span class="chip"></span>
+              <span class="chip"></span>
+              <span class="chip"></span>
+            </div>
           </div>
-        </article>
+          <div class="candidate-toolbar-actions">
+            <label class="candidate-search">
+              <span data-i18n="candidate.panel.searchLabel"></span>
+              <input id="candidate-search-input" type="search" data-i18n-placeholder="candidate.panel.searchPlaceholder" />
+            </label>
+            <label class="candidate-sort">
+              <span data-i18n="candidate.panel.sortLabel"></span>
+              <select id="candidate-sort-select">
+                <option value="score_desc" data-i18n="candidate.sort.score_desc"></option>
+                <option value="freshness_desc" data-i18n="candidate.sort.freshness_desc"></option>
+                <option value="confidence_desc" data-i18n="candidate.sort.confidence_desc"></option>
+                <option value="wallet_score_desc" data-i18n="candidate.sort.wallet_score_desc"></option>
+                <option value="observed_notional_desc" data-i18n="candidate.sort.observed_notional_desc"></option>
+              </select>
+            </label>
+            <button class="btn ghost btn-mini" id="candidate-toggle-filters" type="button" data-i18n="candidate.panel.toggleFiltersExpand"></button>
+            <button class="btn ghost" id="candidate-clear-filters" type="button" data-i18n="candidate.panel.clearFilters"></button>
+          </div>
+        </div>
+        <p class="api-status wait candidate-filter-meta" id="candidate-filter-meta"></p>
+        <div class="candidate-toolbar-filters" id="candidate-toolbar-filters">
+          <div class="candidate-filter-group" data-filter-group="status">
+            <span data-i18n="candidate.filter.status"></span>
+            <div class="chip-row">
+              <button class="chip active" type="button" data-candidate-filter="status" data-filter-value="all" data-i18n="candidate.filter.all"></button>
+              <button class="chip" type="button" data-candidate-filter="status" data-filter-value="pending" data-i18n="candidate.status.pending"></button>
+              <button class="chip" type="button" data-candidate-filter="status" data-filter-value="approved" data-i18n="candidate.status.approved"></button>
+              <button class="chip" type="button" data-candidate-filter="status" data-filter-value="watched" data-i18n="candidate.status.watched"></button>
+              <button class="chip" type="button" data-candidate-filter="status" data-filter-value="executed" data-i18n="candidate.status.executed"></button>
+              <button class="chip" type="button" data-candidate-filter="status" data-filter-value="ignored" data-i18n="candidate.status.ignored"></button>
+              <button class="chip" type="button" data-candidate-filter="status" data-filter-value="rejected" data-i18n="candidate.status.rejected"></button>
+              <button class="chip" type="button" data-candidate-filter="status" data-filter-value="expired" data-i18n="candidate.status.expired"></button>
+            </div>
+          </div>
+          <div class="candidate-filter-group" data-filter-group="action">
+            <span data-i18n="candidate.filter.action"></span>
+            <div class="chip-row">
+              <button class="chip active" type="button" data-candidate-filter="action" data-filter-value="all" data-i18n="candidate.filter.all"></button>
+              <button class="chip" type="button" data-candidate-filter="action" data-filter-value="ignore" data-i18n="candidate.action.ignore"></button>
+              <button class="chip" type="button" data-candidate-filter="action" data-filter-value="watch" data-i18n="candidate.action.watch"></button>
+              <button class="chip" type="button" data-candidate-filter="action" data-filter-value="buy_small" data-i18n="candidate.action.buy_small"></button>
+              <button class="chip" type="button" data-candidate-filter="action" data-filter-value="buy_normal" data-i18n="candidate.action.buy_normal"></button>
+              <button class="chip" type="button" data-candidate-filter="action" data-filter-value="follow" data-i18n="candidate.action.follow"></button>
+              <button class="chip" type="button" data-candidate-filter="action" data-filter-value="close_partial" data-i18n="candidate.action.close_partial"></button>
+              <button class="chip" type="button" data-candidate-filter="action" data-filter-value="close_all" data-i18n="candidate.action.close_all"></button>
+            </div>
+          </div>
+          <div class="candidate-filter-group" data-filter-group="side">
+            <span data-i18n="candidate.filter.side"></span>
+            <div class="chip-row">
+              <button class="chip active" type="button" data-candidate-filter="side" data-filter-value="all" data-i18n="candidate.filter.all"></button>
+              <button class="chip" type="button" data-candidate-filter="side" data-filter-value="BUY" data-i18n="candidate.side.buy"></button>
+              <button class="chip" type="button" data-candidate-filter="side" data-filter-value="SELL" data-i18n="candidate.side.sell"></button>
+            </div>
+          </div>
+        </div>
       </div>
+      <div class="candidate-workspace">
+      <div class="candidate-queue">
+        <div class="head compact-head">
+          <h2 data-i18n="candidate.panel.queueTitle"></h2>
+          <span class="mono" id="candidate-grid-meta"></span>
+        </div>
+        <p class="api-status wait candidate-queue-note" data-i18n="candidate.panel.queueNote"></p>
+        <div class="candidate-grid" id="candidate-grid">
+          <article class="candidate-card candidate-empty">
+            <div>
+              <h3 data-i18n="candidate.panel.emptyTitle.noOpportunity"></h3>
+              <p data-i18n="candidate.panel.emptyBody.noOpportunity"></p>
+            </div>
+          </article>
+        </div>
+      </div>
+      <section class="candidate-focus" id="candidate-focus">
+        <div class="head">
+          <h2 data-i18n="candidate.detail.title"></h2>
+          <span class="mono" id="candidate-focus-meta" data-i18n="common.waitingData"></span>
+        </div>
+        <div class="focus-view-switch" id="candidate-focus-view-switch">
+          <button class="chip active" type="button" data-candidate-focus-view="summary" data-i18n="enum.candidateFocusView.summary"></button>
+          <button class="chip" type="button" data-candidate-focus-view="detail" data-i18n="enum.candidateFocusView.detail"></button>
+        </div>
+        <div class="candidate-focus-view active" data-candidate-focus-view-panel="summary">
+        <div class="candidate-focus-shell">
+          <div class="candidate-focus-main">
+            <section class="candidate-focus-section candidate-focus-overview">
+              <div class="profile-head" id="candidate-focus-head">
+                <span class="tag wait" data-i18n="common.waiting"></span>
+                <span class="mono" data-i18n="candidate.detail.selectHint"></span>
+              </div>
+              <p class="profile-summary" id="candidate-focus-summary" data-i18n="candidate.detail.summary"></p>
+              <ul class="list tight" id="candidate-focus-list">
+                <li><span data-i18n="candidate.detail.status"></span><b data-i18n="common.waitingData"></b></li>
+              </ul>
+              <div class="component-grid" id="candidate-focus-metrics">
+                <div class="component-card"><span data-i18n="candidate.detail.deepRead"></span><b data-i18n="common.waitingData"></b></div>
+              </div>
+            </section>
+            <section class="candidate-focus-section">
+              <div class="head compact-head"><h2 data-i18n="candidate.detail.breakdown"></h2><span class="mono" id="candidate-focus-breakdown-meta" data-i18n="candidate.detail.breakdownMeta"></span></div>
+              <div class="component-grid candidate-focus-breakdown" id="candidate-focus-breakdown">
+                <div class="component-card"><span data-i18n="candidate.detail.breakdownCard"></span><b data-i18n="common.waitingData"></b></div>
+              </div>
+            </section>
+            <section class="candidate-focus-section">
+              <div class="head compact-head"><h2 data-i18n="candidate.detail.conflict"></h2><span class="mono" id="candidate-focus-conflict-meta" data-i18n="candidate.detail.conflictMeta"></span></div>
+              <div class="component-grid candidate-focus-conflict" id="candidate-focus-conflict">
+                <div class="component-card"><span data-i18n="candidate.detail.conflictCard"></span><b data-i18n="common.waitingData"></b></div>
+              </div>
+            </section>
+            <section class="candidate-focus-section">
+              <div class="head compact-head"><h2 data-i18n="candidate.detail.trail"></h2><span class="mono" id="candidate-focus-trail-meta" data-i18n="candidate.detail.trailMeta"></span></div>
+              <ul class="review-list candidate-focus-trail" id="candidate-focus-trail">
+                <li><div class="review-main"><span data-i18n="candidate.detail.trail"></span><b data-i18n="common.waitingData"></b></div></li>
+              </ul>
+            </section>
+          </div>
+          <div class="candidate-focus-side">
+            <section class="candidate-focus-section candidate-focus-section-primary">
+              <div class="head compact-head"><h2 data-i18n="candidate.detail.factors"></h2><span class="mono" id="candidate-focus-factors-meta" data-i18n="candidate.detail.factorsMeta"></span></div>
+              <div class="candidate-focus-summary-board" id="candidate-focus-factors">
+                <div class="component-card"><span data-i18n="candidate.detail.factorsCard"></span><b data-i18n="common.waitingData"></b></div>
+              </div>
+            </section>
+            <section class="candidate-focus-section">
+              <div class="head compact-head"><h2 data-i18n="candidate.detail.explain"></h2><span class="mono" id="candidate-focus-explain-meta" data-i18n="candidate.detail.explainMeta"></span></div>
+              <ul class="review-list candidate-focus-explain" id="candidate-focus-explain">
+                <li><div class="review-main"><span data-i18n="candidate.detail.explainLabel"></span><b data-i18n="common.waitingData"></b></div></li>
+              </ul>
+            </section>
+            <section class="candidate-focus-section">
+              <div class="head compact-head"><h2 data-i18n="candidate.detail.records"></h2><span class="mono" id="candidate-focus-status" data-i18n="common.waitingData"></span></div>
+              <ul class="review-list candidate-focus-actions" id="candidate-focus-action">
+                <li><div class="review-main"><span data-i18n="candidate.detail.status"></span><b data-i18n="common.waitingData"></b></div></li>
+              </ul>
+            </section>
+            <section class="candidate-focus-section">
+              <div class="head compact-head"><h2 data-i18n="candidate.detail.enrichment"></h2><span class="mono" data-i18n="candidate.detail.enrichmentMeta"></span></div>
+              <div class="component-grid candidate-focus-snapshot" id="candidate-focus-snapshot">
+                <div class="component-card"><span data-i18n="candidate.detail.snapshot"></span><b data-i18n="common.waitingData"></b></div>
+              </div>
+            </section>
+          </div>
+        </div>
+        </div>
+        <div class="candidate-focus-view" data-candidate-focus-view-panel="detail">
+        <div class="head compact-head"><h2 data-i18n="candidate.detail.fullTitle"></h2><span class="mono" id="candidate-detail-meta" data-i18n="common.waitingData"></span></div>
+        <div class="component-grid candidate-detail-overview" id="candidate-detail-overview">
+          <div class="component-card"><span data-i18n="candidate.detail.page"></span><b data-i18n="common.waitingData"></b></div>
+        </div>
+        <div class="review-grid candidate-detail-grid">
+          <section class="review-column">
+            <h3 data-i18n="candidate.detail.timeline"></h3>
+            <ul class="review-list candidate-detail-list" id="candidate-detail-timeline">
+              <li><div class="review-main"><span data-i18n="candidate.detail.timeline"></span><b data-i18n="common.waitingData"></b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3 data-i18n="candidate.detail.decisionChain"></h3>
+            <ul class="review-list candidate-detail-list" id="candidate-detail-chain">
+              <li><div class="review-main"><span data-i18n="candidate.detail.decisionChain"></span><b data-i18n="common.waitingData"></b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3 data-i18n="candidate.detail.actionLog"></h3>
+            <ul class="review-list candidate-detail-list" id="candidate-detail-actions">
+              <li><div class="review-main"><span data-i18n="candidate.detail.action"></span><b data-i18n="common.waitingData"></b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3 data-i18n="candidate.detail.journal"></h3>
+            <ul class="review-list candidate-detail-list" id="candidate-detail-journal">
+              <li><div class="review-main"><span data-i18n="candidate.detail.journal"></span><b data-i18n="common.waitingData"></b></div></li>
+            </ul>
+          </section>
+        </div>
+        </div>
+      </section>
+      </div>
+    </section>
 
-      <div class="col">
-        <article class="panel card">
-          <div class="head"><h2>持仓详情</h2><span class="mono">含退出条件</span></div>
+    <section class="panel workspace-shell" id="workspace-shell">
+      <div class="workspace-nav" id="workspace-nav">
+        <button class="chip active" type="button" data-workspace-view="overview" data-i18n="nav.workspace.overview"></button>
+        <button class="chip" type="button" data-workspace-view="wallets" data-i18n="nav.workspace.wallets"></button>
+        <button class="chip" type="button" data-workspace-view="ops" data-i18n="nav.workspace.ops"></button>
+        <button class="chip" type="button" data-workspace-view="review" data-i18n="nav.workspace.review"></button>
+      </div>
+      <p class="api-status wait" id="workspace-meta"></p>
+    </section>
+
+    <section class="panel ops-banner ops-wait workspace-item" id="ops-banner" data-workspace-group="overview ops">
+      <div class="ops-banner-main">
+        <span class="tag wait" id="ops-gate-tag" data-i18n="opsGate.banner.tag.wait"></span>
+        <div>
+          <h2 id="ops-gate-title" data-i18n="opsGate.banner.title"></h2>
+          <p id="ops-gate-detail" data-i18n="opsGate.banner.detail"></p>
+        </div>
+      </div>
+      <ul class="ops-checks" id="ops-gate-checks">
+        <li><span data-i18n="opsGate.banner.checks.status"></span><b data-i18n="common.waitingData"></b></li>
+      </ul>
+      <div class="ops-actions-wrap">
+        <div class="head compact-head"><h2 data-i18n="opsGate.banner.actions.title"></h2><span class="mono" id="ops-gate-actions-meta" data-i18n="opsGate.banner.actions.meta"></span></div>
+        <ul class="ops-actions" id="ops-gate-actions">
+          <li><span class="tag wait" data-i18n="opsGate.banner.actions.waitingTag"></span><div><b data-i18n="opsGate.banner.actions.waitingTitle"></b><p data-i18n="opsGate.banner.actions.waitingDetail"></p></div></li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="panel card card-catalysts workspace-item" id="blockbeats-panel" data-workspace-group="overview">
+      <div class="head">
+        <h2 data-i18n="blockbeats.panel.title"></h2>
+        <span class="mono" id="blockbeats-meta"></span>
+      </div>
+      <p class="api-status wait" id="blockbeats-status" data-i18n="blockbeats.panel.waiting"></p>
+      <div class="component-grid catalyst-summary" id="blockbeats-summary">
+        <div class="component-card"><span data-i18n="blockbeats.summary.status"></span><b data-i18n="common.waitingData"></b></div>
+      </div>
+      <div class="catalyst-columns">
+        <section class="catalyst-column">
+          <div class="head compact-head">
+            <h2 data-i18n="blockbeats.feed.prediction.title"></h2>
+            <span class="mono" data-i18n="blockbeats.feed.prediction.subtitle"></span>
+          </div>
+          <ul class="review-list catalyst-list" id="blockbeats-prediction-list">
+            <li><div class="review-main"><span data-i18n="blockbeats.feed.prediction.title"></span><b data-i18n="common.waitingData"></b></div></li>
+          </ul>
+        </section>
+        <section class="catalyst-column">
+          <div class="head compact-head">
+            <h2 data-i18n="blockbeats.feed.important.title"></h2>
+            <span class="mono" data-i18n="blockbeats.feed.important.subtitle"></span>
+          </div>
+          <ul class="review-list catalyst-list" id="blockbeats-important-list">
+            <li><div class="review-main"><span data-i18n="blockbeats.feed.important.title"></span><b data-i18n="common.waitingData"></b></div></li>
+          </ul>
+        </section>
+      </div>
+    </section>
+
+    <section class="panel budget-card workspace-item" data-workspace-group="overview">
+      <div class="head"><h2 data-i18n="budget.overview.title"></h2><span class="mono" id="budget-meta" data-i18n="budget.overview.meta"></span></div>
+      <div class="budget-line">
+        <div class="budget-fill" id="budget-fill" style="width:0%"></div>
+      </div>
+    </section>
+
+    <section class="kpi-row workspace-item" data-workspace-group="overview">
+      <article class="panel kpi">
+        <h3 data-i18n="kpi.executionMode.title"></h3>
+        <p class="num" id="kpi-mode" data-i18n="kpi.executionMode.value"></p>
+        <small id="kpi-mode-note" data-i18n="kpi.executionMode.note"></small>
+      </article>
+      <article class="panel kpi">
+        <h3 data-i18n="kpi.equity.title"></h3>
+        <p class="num good" id="kpi-equity" data-i18n="kpi.equity.value"></p>
+        <small id="kpi-equity-note" data-i18n="kpi.equity.note"></small>
+      </article>
+      <article class="panel kpi">
+        <h3 data-i18n="kpi.cash.title"></h3>
+        <p class="num" id="kpi-cash" data-i18n="kpi.cash.value"></p>
+        <small id="kpi-cash-note" data-i18n="kpi.cash.note"></small>
+      </article>
+      <article class="panel kpi">
+        <h3 data-i18n="kpi.positions.title"></h3>
+        <p class="num" id="kpi-pos" data-i18n="kpi.positions.value"></p>
+        <small id="kpi-slot-note" data-i18n="kpi.positions.note"></small>
+      </article>
+      <article class="panel kpi">
+        <h3 data-i18n="kpi.notional.title"></h3>
+        <p class="num" id="kpi-notional" data-i18n="kpi.notional.value"></p>
+        <small id="kpi-notional-note" data-i18n="kpi.notional.note"></small>
+      </article>
+      <article class="panel kpi">
+        <h3 data-i18n="kpi.risk.title"></h3>
+        <p class="num warn" id="kpi-risk-mode" data-i18n="kpi.risk.value"></p>
+        <small id="kpi-risk-note" data-i18n="kpi.risk.note"></small>
+      </article>
+    </section>
+
+    <section class="main-grid workspace-item" data-workspace-group="overview wallets">
+      <div class="main-col primary-col">
+        <article class="panel card card-positions" data-workspace-group="overview">
+          <div class="head"><h2 data-i18n="positions.table.title"></h2><span class="mono" data-i18n="positions.table.subtitle"></span></div>
           <div class="table-wrap">
             <table class="table">
-              <thead><tr><th>市场</th><th>方向</th><th>数量</th><th>持仓</th><th>结算</th><th>Edge</th><th>未实现</th><th>理由</th><th>退出条件</th></tr></thead>
+              <thead><tr><th data-i18n="positions.table.market"></th><th data-i18n="positions.table.side"></th><th data-i18n="positions.table.size"></th><th data-i18n="positions.table.notional"></th><th data-i18n="positions.table.entryPrice"></th><th data-i18n="positions.table.holdTime"></th><th data-i18n="positions.table.reason"></th><th data-i18n="positions.table.exitRule"></th></tr></thead>
               <tbody id="positions-body">
-                <tr><td colspan="9">等待数据...</td></tr>
+                <tr><td colspan="8" data-i18n="common.waitingData"></td></tr>
               </tbody>
             </table>
           </div>
         </article>
 
-        <article class="panel card">
-          <div class="head"><h2>订单管理</h2><span class="mono">失败原因 + 重试次数</span></div>
+        <article class="panel card card-orders" id="orders-panel" data-workspace-group="overview">
+          <div class="head"><h2 data-i18n="orders.panel.title"></h2><span class="mono" data-i18n="orders.panel.subtitle"></span></div>
           <div class="chips">
-            <span class="chip active" id="chip-pending">进行中 0</span>
-            <span class="chip" id="chip-filled">已成交 0</span>
-            <span class="chip" id="chip-canceled">已取消 0</span>
-            <span class="chip" id="chip-rejected">已拒绝 0</span>
+            <span class="chip active" id="chip-pending" data-i18n="orders.status.pending"></span>
+            <span class="chip" id="chip-filled" data-i18n="orders.status.filled"></span>
+            <span class="chip" id="chip-canceled" data-i18n="orders.status.canceled"></span>
+            <span class="chip" id="chip-rejected" data-i18n="orders.status.rejected"></span>
           </div>
           <div class="table-wrap small-scroll">
             <table class="table">
-              <thead><tr><th>时间</th><th>市场</th><th>动作</th><th>状态</th><th>重试</th><th>耗时</th><th>原因</th></tr></thead>
+              <thead><tr><th data-i18n="orders.table.time"></th><th data-i18n="orders.table.market"></th><th data-i18n="orders.table.action"></th><th data-i18n="orders.table.status"></th><th data-i18n="orders.table.reason"></th></tr></thead>
               <tbody id="orders-body">
-                <tr><td colspan="7">等待数据...</td></tr>
+                <tr><td colspan="5" data-i18n="common.waitingData"></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="panel card card-wallets" data-workspace-group="wallets">
+          <div class="head"><h2 data-i18n="wallets.monitor.title"></h2><span class="mono" data-i18n="wallets.monitor.subtitle"></span></div>
+          <div class="table-wrap small-scroll">
+            <table class="table">
+              <thead><tr><th data-i18n="wallets.monitor.table.wallet"></th><th data-i18n="wallets.monitor.table.score"></th><th data-i18n="wallets.monitor.table.samples"></th><th data-i18n="wallets.monitor.table.roi"></th><th data-i18n="wallets.monitor.table.winRate"></th><th data-i18n="wallets.monitor.table.parsed"></th><th data-i18n="wallets.monitor.table.concentration"></th></tr></thead>
+              <tbody id="wallets-body">
+                <tr><td colspan="7" data-i18n="common.waitingData"></td></tr>
               </tbody>
             </table>
           </div>
         </article>
       </div>
 
-      <div class="col">
-        <article class="panel card">
-          <div class="head"><h2>异常告警中心</h2><span class="mono">Alerts</span></div>
+      <div class="main-col secondary-col">
+        <article class="panel card card-alerts" data-workspace-group="overview">
+          <div class="head"><h2 data-i18n="alerts.panel.title"></h2><span class="mono" data-i18n="alerts.panel.subtitle"></span></div>
           <ul class="alert-list" id="alerts-list">
-            <li><span class="level green">正常</span><span>等待数据...</span></li>
+            <li><span class="level green" data-i18n="common.ok"></span><span data-i18n="common.waitingData"></span></li>
           </ul>
         </article>
 
-        <article class="panel card">
-          <div class="head"><h2>信号源可用性</h2><span class="mono">权重色阶 + 在线状态</span></div>
+        <article class="panel card card-notifier" data-workspace-group="overview">
+          <div class="head"><h2 data-i18n="notifier.panel.title"></h2><span class="mono" id="notifier-meta"></span></div>
+          <p class="api-status wait" id="notifier-status" data-i18n="notifier.panel.waiting"></p>
+          <div class="component-grid" id="notifier-summary">
+            <div class="component-card"><span data-i18n="notifier.summary.local"></span><b data-i18n="common.waitingData"></b></div>
+          </div>
+          <div class="head compact-head"><h2 data-i18n="notifier.list.recentEvents"></h2><span class="mono" data-i18n="notifier.list.channelScope"></span></div>
+          <ul class="review-list" id="notifier-events">
+            <li><div class="review-main"><span data-i18n="notifier.list.recentEvents"></span><b data-i18n="common.waitingData"></b></div></li>
+          </ul>
+          <div class="head compact-head"><h2 data-i18n="notifier.list.detail"></h2><span class="mono" data-i18n="notifier.list.recentCount"></span></div>
+          <div class="component-grid" id="notifier-detail">
+            <div class="component-card"><span data-i18n="notifier.empty.title"></span><b data-i18n="common.waitingData"></b></div>
+          </div>
+        </article>
+
+        <article class="panel card card-wallet-profiles" data-workspace-group="wallets">
+          <div class="head"><h2 data-i18n="walletProfiles.panel.title"></h2><span class="mono" id="wallet-profiles-meta"></span></div>
+          <p class="api-status wait" id="wallet-profiles-status" data-i18n="common.waitingData"></p>
           <div class="table-wrap small-scroll">
             <table class="table">
-              <thead><tr><th>来源</th><th>权重</th><th>状态</th><th>更新</th><th>命中率</th></tr></thead>
+              <thead><tr><th data-i18n="walletProfiles.table.wallet"></th><th data-i18n="walletProfiles.table.enabled"></th><th data-i18n="walletProfiles.table.tag"></th><th data-i18n="walletProfiles.table.followability"></th><th data-i18n="walletProfiles.table.notes"></th><th data-i18n="walletProfiles.table.actions"></th></tr></thead>
+              <tbody id="wallet-profiles-body">
+                <tr><td colspan="6" data-i18n="common.waitingData"></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="panel card card-wallet-detail" data-workspace-group="wallets">
+          <div class="head"><h2 data-i18n="walletProfiles.detail.title"></h2><span class="mono" id="wallet-detail-title" data-i18n="common.none"></span></div>
+          <div class="profile-head" id="wallet-detail-head">
+            <span class="tag danger" data-i18n="common.waiting"></span>
+            <span class="mono" data-i18n="walletProfiles.detail.selectHint"></span>
+          </div>
+          <p class="profile-summary" id="wallet-detail-summary" data-i18n="walletProfiles.detail.summary"></p>
+          <ul class="list tight" id="wallet-detail-list">
+            <li><span data-i18n="walletProfiles.detail.status"></span><b data-i18n="common.waitingData"></b></li>
+          </ul>
+          <div class="component-grid" id="wallet-component-grid">
+            <div class="component-card"><span data-i18n="walletProfiles.detail.scoreBreakdown"></span><b data-i18n="common.waitingData"></b></div>
+          </div>
+          <div class="head compact-head"><h2 data-i18n="walletProfiles.detail.topicProfile"></h2><span class="mono" id="wallet-topic-meta" data-i18n="walletProfiles.detail.topicCount"></span></div>
+          <div class="topic-grid" id="wallet-topic-grid">
+            <div class="topic-card"><span data-i18n="walletProfiles.detail.topicCard"></span><b data-i18n="common.waitingData"></b></div>
+          </div>
+          <div class="head compact-head"><h2 data-i18n="walletProfiles.detail.recentSamples"></h2><span class="mono" id="wallet-detail-history-meta" data-i18n="walletProfiles.detail.sampleCount"></span></div>
+          <div class="table-wrap small-scroll">
+            <table class="table">
+              <thead><tr><th data-i18n="walletProfiles.table.market"></th><th data-i18n="walletProfiles.table.side"></th><th data-i18n="walletProfiles.table.result"></th><th data-i18n="walletProfiles.table.roi"></th><th data-i18n="walletProfiles.table.pnl"></th></tr></thead>
+              <tbody id="wallet-detail-history-body">
+                <tr><td colspan="5" data-i18n="common.waitingData"></td></tr>
+              </tbody>
+            </table>
+          </div>
+        </article>
+
+        <article class="panel card card-strategy" data-workspace-group="wallets">
+          <div class="head"><h2 data-i18n="strategy.params.title"></h2><span class="mono" id="param-wallet-pool" data-i18n="strategy.params.walletPool"></span></div>
+          <ul class="list tight">
+            <li><span data-i18n="strategy.params.minIncrease"></span><b id="param-min-increase">-</b></li>
+            <li><span data-i18n="strategy.params.maxSignals"></span><b id="param-max-signals">-</b></li>
+            <li><span data-i18n="strategy.params.minWalletScore"></span><b id="param-min-wallet-score">-</b></li>
+            <li><span data-i18n="strategy.params.scoreMultipliers"></span><b id="param-score-multipliers">-</b></li>
+            <li><span data-i18n="strategy.params.historyWindow"></span><b id="param-history-window">-</b></li>
+            <li><span data-i18n="strategy.params.topicBias"></span><b id="param-topic-bias">-</b></li>
+            <li><span data-i18n="strategy.params.discoveryBias"></span><b id="param-discovery-bias">-</b></li>
+            <li><span data-i18n="strategy.params.walletExit"></span><b id="param-wallet-exit">-</b></li>
+            <li><span data-i18n="strategy.params.riskTrade"></span><b id="param-risk-trade">-</b></li>
+            <li><span data-i18n="strategy.params.riskDay"></span><b id="param-risk-day">-</b></li>
+            <li><span data-i18n="strategy.params.priceBand"></span><b id="param-price-band">-</b></li>
+            <li><span data-i18n="strategy.params.addCooldown"></span><b id="param-add-cooldown">-</b></li>
+          </ul>
+        </article>
+
+        <article class="panel card card-sources" data-workspace-group="wallets">
+          <div class="head"><h2 data-i18n="sources.availability.title"></h2><span class="mono" data-i18n="sources.availability.subtitle"></span></div>
+          <div class="table-wrap small-scroll">
+            <table class="table">
+              <thead><tr><th data-i18n="sources.availability.table.source"></th><th data-i18n="sources.availability.table.score"></th><th data-i18n="sources.availability.table.weight"></th><th data-i18n="sources.availability.table.history"></th><th data-i18n="sources.availability.table.updated"></th></tr></thead>
               <tbody id="sources-body">
-                <tr><td colspan="5">等待数据...</td></tr>
+                <tr><td colspan="5" data-i18n="common.waitingData"></td></tr>
               </tbody>
             </table>
           </div>
@@ -140,51 +475,411 @@
       </div>
     </section>
 
-    <section class="bottom-grid">
-      <article class="panel chart">
-        <div class="head"><h2>收益曲线</h2><span class="mono">PnL Curve</span></div>
-        <div class="chips">
-          <span class="chip active">1h</span>
-          <span class="chip">6h</span>
-          <span class="chip">24h</span>
-          <span class="chip">7d</span>
+    <section class="bottom-grid workspace-item" data-workspace-group="ops review">
+      <article class="panel chart chart-monitor-reports chart-span-2" id="monitor-report-panel" data-workspace-group="ops">
+        <div class="head"><h2 data-i18n="monitor.report.title"></h2><span class="mono" id="monitor-report-meta" data-i18n="monitor.report.meta"></span></div>
+        <div class="review-summary" id="monitor-report-summary">
+          <div class="review-chip"><span data-i18n="monitor.report.summary.ready"></span><b data-i18n="common.waitingData"></b></div>
+          <div class="review-chip"><span data-i18n="monitor.report.summary.window30m"></span><b data-i18n="common.dash"></b></div>
+          <div class="review-chip"><span data-i18n="monitor.report.summary.window12h"></span><b data-i18n="common.dash"></b></div>
+          <div class="review-chip"><span data-i18n="monitor.report.summary.windowEod"></span><b data-i18n="common.dash"></b></div>
+          <div class="review-chip"><span data-i18n="monitor.report.summary.ledgerDiff"></span><b data-i18n="common.dash"></b></div>
+          <div class="review-chip"><span data-i18n="monitor.report.summary.fillsToday"></span><b data-i18n="common.dash"></b></div>
         </div>
-        <div class="plot">
-          <svg viewBox="0 0 320 92" preserveAspectRatio="none" aria-label="收益曲线">
-            <polyline points="0,65 35,62 70,58 105,60 140,50 175,43 210,37 245,31 280,29 320,24" />
-          </svg>
+        <div class="monitor-callout" id="monitor-report-callout">
+          <span class="tag wait" data-i18n="common.waiting"></span>
+          <div>
+            <b data-i18n="monitor.report.callout.title"></b>
+            <p data-i18n="monitor.report.callout.detail"></p>
+          </div>
+        </div>
+        <div class="review-grid monitor-grid">
+          <section class="review-column">
+            <h3 data-i18n="monitor.report.columns.window30m"></h3>
+            <ul class="review-list" id="monitor-30m-list">
+              <li><div class="review-main"><span data-i18n="common.waitingData"></span><b data-i18n="common.dash"></b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3 data-i18n="monitor.report.columns.window12h"></h3>
+            <ul class="review-list" id="monitor-12h-list">
+              <li><div class="review-main"><span data-i18n="common.waitingData"></span><b data-i18n="common.dash"></b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3 data-i18n="monitor.report.columns.eod"></h3>
+            <ul class="review-list" id="reconciliation-eod-list">
+              <li><div class="review-main"><span data-i18n="common.waitingData"></span><b data-i18n="common.dash"></b></div></li>
+            </ul>
+          </section>
+        </div>
+        <div class="head compact-head"><h2 data-i18n="monitor.report.breakdown.title"></h2><span class="mono" id="reconciliation-eod-breakdown-meta" data-i18n="monitor.report.breakdown.meta"></span></div>
+        <div class="component-grid monitor-breakdown-grid" id="reconciliation-eod-breakdown">
+          <div class="component-card"><span data-i18n="monitor.report.breakdown.card"></span><b data-i18n="common.waitingData"></b></div>
         </div>
       </article>
 
-      <article class="panel chart">
-        <div class="head"><h2>风险监控</h2><span class="mono">Drawdown / Exposure</span></div>
+      <article class="panel chart chart-archive chart-span-2" id="archive-panel" data-workspace-group="review">
+        <div class="head"><h2 data-i18n="archive.panel.title"></h2><span class="mono" id="archive-meta" data-i18n="archive.panel.meta"></span></div>
+        <div class="review-summary" id="archive-summary">
+          <div class="review-chip"><span data-i18n="archive.summary.candidates"></span><b data-i18n="common.dash"></b></div>
+          <div class="review-chip"><span data-i18n="archive.summary.journal"></span><b data-i18n="common.dash"></b></div>
+          <div class="review-chip"><span data-i18n="archive.summary.notifications"></span><b data-i18n="common.dash"></b></div>
+          <div class="review-chip"><span data-i18n="archive.summary.wallets"></span><b data-i18n="common.dash"></b></div>
+          <div class="review-chip"><span data-i18n="archive.summary.positions"></span><b data-i18n="common.dash"></b></div>
+          <div class="review-chip"><span data-i18n="archive.summary.slots"></span><b data-i18n="common.dash"></b></div>
+        </div>
+        <div class="archive-toolbar">
+          <div class="monitor-callout">
+            <span class="tag wait" data-i18n="archive.export.tag"></span>
+            <div>
+              <b data-i18n="archive.export.title"></b>
+              <p data-i18n="archive.export.detail"></p>
+            </div>
+          </div>
+          <div class="archive-actions" id="archive-actions">
+            <button class="btn export-btn" type="button" data-export-action="state_bundle">
+              <span data-i18n="archive.export.stateBundle.title"></span>
+              <small data-i18n="archive.export.stateBundle.detail"></small>
+            </button>
+            <button class="btn export-btn" type="button" data-export-action="candidates_csv">
+              <span data-i18n="archive.export.candidatesCsv.title"></span>
+              <small data-i18n="archive.export.candidatesCsv.detail"></small>
+            </button>
+            <button class="btn export-btn" type="button" data-export-action="journal_json">
+              <span data-i18n="archive.export.journalJson.title"></span>
+              <small data-i18n="archive.export.journalJson.detail"></small>
+            </button>
+            <button class="btn export-btn" type="button" data-export-action="monitor_bundle">
+              <span data-i18n="archive.export.monitorBundle.title"></span>
+              <small data-i18n="archive.export.monitorBundle.detail"></small>
+            </button>
+          </div>
+        </div>
+        <div class="archive-grid">
+          <div class="component-card">
+            <span data-i18n="archive.cards.topJournalTags"></span>
+            <div class="archive-tags" id="archive-tags">
+              <span class="tag wait" data-i18n="common.waitingData"></span>
+            </div>
+          </div>
+          <div class="component-card">
+            <span data-i18n="archive.cards.recentSnapshots"></span>
+            <div class="archive-snapshots" id="archive-snapshots">
+              <div class="component-card"><span data-i18n="archive.cards.recentEod"></span><b data-i18n="common.dash"></b></div>
+            </div>
+          </div>
+        </div>
+        <div class="review-grid archive-detail-grid">
+          <section class="review-column">
+            <h3 data-i18n="archive.columns.recentNotificationsJournal"></h3>
+            <ul class="review-list" id="archive-recent">
+              <li><div class="review-main"><span data-i18n="common.waitingData"></span><b data-i18n="common.dash"></b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3 data-i18n="archive.columns.candidatesWalletsPool"></h3>
+            <div class="component-grid" id="archive-stats">
+              <div class="component-card"><span data-i18n="archive.cards.stats"></span><b data-i18n="common.waitingData"></b></div>
+            </div>
+          </section>
+        </div>
+      </article>
+
+      <article class="panel chart chart-diagnostics chart-span-2" id="diagnostics-panel" data-workspace-group="ops">
+        <div class="head"><h2 data-i18n="diagnostics.panel.title"></h2><span class="mono" id="diagnostics-meta" data-i18n="diagnostics.panel.meta"></span></div>
+        <div class="review-grid diagnostics-grid">
+          <section class="review-column">
+            <h3 data-i18n="diagnostics.columns.startupChecks"></h3>
+            <ul class="review-list" id="startup-checks-list">
+              <li><div class="review-main"><span data-i18n="common.waitingData"></span><b data-i18n="common.dash"></b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3 data-i18n="diagnostics.columns.reconciliationFacts"></h3>
+            <ul class="review-list" id="reconciliation-facts-list">
+              <li><div class="review-main"><span data-i18n="common.waitingData"></span><b data-i18n="common.dash"></b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3 data-i18n="diagnostics.columns.issuesAndAdvice"></h3>
+            <ul class="review-list" id="diagnostics-issues-list">
+              <li><div class="review-main"><span data-i18n="common.waitingData"></span><b data-i18n="common.dash"></b></div></li>
+            </ul>
+          </section>
+        </div>
+        <div class="head compact-head"><h2 data-i18n="diagnostics.pending.title"></h2><span class="mono" id="diagnostic-pending-meta" data-i18n="diagnostics.pending.meta"></span></div>
+        <div class="table-wrap small-scroll">
+          <table class="table">
+            <thead><tr><th data-i18n="diagnostics.pending.table.time"></th><th data-i18n="diagnostics.pending.table.market"></th><th data-i18n="diagnostics.pending.table.status"></th><th data-i18n="diagnostics.pending.table.requestMatched"></th><th data-i18n="diagnostics.pending.table.reason"></th></tr></thead>
+            <tbody id="diagnostic-pending-body">
+              <tr><td colspan="5" data-i18n="common.waitingData"></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="head compact-head"><h2 data-i18n="diagnostics.focus.title"></h2><span class="mono" id="diagnostic-focus-meta" data-i18n="diagnostics.focus.meta"></span></div>
+        <div class="review-detail">
+          <div class="profile-head" id="diagnostic-focus-head">
+            <span class="tag danger" data-i18n="common.waiting"></span>
+            <span class="mono" data-i18n="diagnostics.focus.hint"></span>
+          </div>
+          <p class="profile-summary" id="diagnostic-focus-summary" data-i18n="diagnostics.focus.summary"></p>
+          <ul class="list tight" id="diagnostic-focus-list">
+            <li><span data-i18n="diagnostics.focus.list.status"></span><b data-i18n="common.waitingData"></b></li>
+          </ul>
+        </div>
+      </article>
+
+      <article class="panel chart chart-exit-review" data-workspace-group="review">
+        <div class="head"><h2 data-i18n="exitReview.panel.title"></h2><span class="mono" id="exit-review-meta" data-i18n="exitReview.panel.meta"></span></div>
+        <div class="review-summary" id="exit-review-summary">
+          <div class="review-chip"><span data-i18n="exitReview.summary.recentExit"></span><b data-i18n="common.waitingData"></b></div>
+          <div class="review-chip"><span data-i18n="exitReview.summary.filled"></span><b data-i18n="common.dash"></b></div>
+          <div class="review-chip"><span data-i18n="exitReview.summary.rejected"></span><b data-i18n="common.dash"></b></div>
+          <div class="review-chip"><span data-i18n="exitReview.summary.amount"></span><b data-i18n="common.dash"></b></div>
+        </div>
+        <div class="review-grid">
+          <section class="review-column">
+            <h3 data-i18n="exitReview.columns.byKind"></h3>
+            <ul class="review-list" id="exit-review-kind">
+              <li><div class="review-main"><span data-i18n="common.waitingData"></span><b data-i18n="common.dash"></b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3 data-i18n="exitReview.columns.byTopic"></h3>
+            <ul class="review-list" id="exit-review-topic">
+              <li><div class="review-main"><span data-i18n="common.waitingData"></span><b data-i18n="common.dash"></b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3 data-i18n="exitReview.columns.bySource"></h3>
+            <ul class="review-list" id="exit-review-source">
+              <li><div class="review-main"><span data-i18n="common.waitingData"></span><b data-i18n="common.dash"></b></div></li>
+            </ul>
+          </section>
+        </div>
+        <div class="review-filter-bar">
+          <span class="mono" id="exit-review-filter-state" data-i18n="exitReview.filter.state"></span>
+          <button class="btn ghost btn-mini" id="exit-review-filter-reset" data-i18n="exitReview.filter.reset"></button>
+        </div>
+        <div class="head compact-head"><h2 data-i18n="exitReview.samples.title"></h2><span class="mono" id="exit-review-samples-meta" data-i18n="exitReview.samples.meta"></span></div>
+        <div class="table-wrap small-scroll">
+          <table class="table">
+            <thead><tr><th data-i18n="exitReview.samples.table.time"></th><th data-i18n="exitReview.samples.table.market"></th><th data-i18n="exitReview.samples.table.exit"></th><th data-i18n="exitReview.samples.table.sourceTopic"></th><th data-i18n="exitReview.samples.table.amountSummary"></th></tr></thead>
+            <tbody id="exit-review-samples-body">
+              <tr><td colspan="5" data-i18n="common.waitingData"></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="head compact-head"><h2 data-i18n="exitReview.detail.title"></h2><span class="mono" id="exit-review-detail-meta" data-i18n="exitReview.detail.meta"></span></div>
+        <div class="review-detail">
+          <div class="profile-head" id="exit-review-detail-head">
+            <span class="tag danger" data-i18n="common.waiting"></span>
+            <span class="mono" data-i18n="exitReview.detail.hint"></span>
+          </div>
+          <p class="profile-summary" id="exit-review-detail-summary" data-i18n="exitReview.detail.summary"></p>
+          <ul class="list tight" id="exit-review-detail-list">
+            <li><span data-i18n="exitReview.detail.list.status"></span><b data-i18n="common.waitingData"></b></li>
+          </ul>
+          <div class="head compact-head"><h2 data-i18n="exitReview.detail.chain.title"></h2><span class="mono" id="exit-review-detail-chain-meta" data-i18n="exitReview.detail.chain.meta"></span></div>
+          <ul class="timeline review-chain" id="exit-review-detail-chain">
+            <li><span data-i18n="common.dashTime"></span><b data-i18n="common.waitingData"></b></li>
+          </ul>
+        </div>
+      </article>
+
+      <article class="panel chart chart-risk" data-workspace-group="ops">
+        <div class="head"><h2 data-i18n="risk.panel.title"></h2><span class="mono" data-i18n="risk.panel.subtitle"></span></div>
         <div class="meters">
-          <div><label>回撤</label><progress id="meter-dd" value="0" max="100"></progress><span id="meter-dd-text">0.0% / 0.0%</span></div>
-          <div><label>总敞口</label><progress id="meter-exp" value="0" max="100"></progress><span id="meter-exp-text">0.0% / 100%</span></div>
-          <div><label>加仓冷却命中</label><progress id="meter-cooldown" value="0" max="100"></progress><span id="meter-cooldown-text">0 / 0</span></div>
-          <div><label>仓位利用率</label><progress id="meter-util" value="0" max="100"></progress><span id="meter-util-text">0.0% / 100%</span></div>
+          <div><label data-i18n="risk.meters.drawdown"></label><progress id="meter-dd" value="0" max="100"></progress><span id="meter-dd-text" data-i18n="risk.meters.drawdownText"></span></div>
+          <div><label data-i18n="risk.meters.exposure"></label><progress id="meter-exp" value="0" max="100"></progress><span id="meter-exp-text" data-i18n="risk.meters.exposureText"></span></div>
+          <div><label data-i18n="risk.meters.cooldown"></label><progress id="meter-cooldown" value="0" max="100"></progress><span id="meter-cooldown-text" data-i18n="risk.meters.cooldownText"></span></div>
+          <div><label data-i18n="risk.meters.staleness"></label><progress id="meter-util" value="0" max="100"></progress><span id="meter-util-text" data-i18n="risk.meters.stalenessText"></span></div>
         </div>
       </article>
 
-      <article class="panel chart">
-        <div class="head"><h2>系统健康</h2><span class="mono" id="health-runtime">运行中</span></div>
+      <article class="panel chart chart-runtime" data-workspace-group="ops">
+        <div class="head"><h2 data-i18n="runtime.panel.title"></h2><span class="mono" id="health-runtime" data-i18n="runtime.panel.meta"></span></div>
         <ul class="health">
-          <li><span>Data API</span><b class="good" id="health-dataapi">-</b></li>
-          <li><span>Polymarket API</span><b class="good" id="health-polyapi">-</b></li>
-          <li><span>钱包池规模</span><b class="good" id="health-wallet-pool">-</b></li>
-          <li><span>Discovery</span><b class="good" id="health-discovery">-</b></li>
-          <li><span>Order Gateway</span><b class="good" id="health-gateway">正常</b></li>
+          <li><span data-i18n="runtime.health.stateAge"></span><b class="good" id="health-state-age" data-i18n="common.dash"></b></li>
+          <li><span data-i18n="runtime.health.broker"></span><b class="good" id="health-broker" data-i18n="common.dash"></b></li>
+          <li><span data-i18n="runtime.health.walletPool"></span><b class="good" id="health-wallet-pool" data-i18n="common.dash"></b></li>
+          <li><span data-i18n="runtime.health.discovery"></span><b class="good" id="health-discovery" data-i18n="common.dash"></b></li>
+          <li><span data-i18n="runtime.health.control"></span><b class="good" id="health-control" data-i18n="common.dash"></b></li>
         </ul>
       </article>
 
-      <article class="panel chart">
-        <div class="head"><h2>自动交易状态时间轴</h2><span class="mono">System Timeline</span></div>
+      <article class="panel chart chart-timeline" data-workspace-group="ops">
+        <div class="head"><h2 data-i18n="timeline.panel.title"></h2><span class="mono" data-i18n="timeline.panel.subtitle"></span></div>
         <ul class="timeline" id="timeline-list">
-          <li><span>--:--</span><b>等待数据...</b></li>
+          <li><span data-i18n="common.dashTime"></span><b data-i18n="common.waitingData"></b></li>
         </ul>
       </article>
+
+      <article class="panel chart chart-signal-review chart-span-2" data-workspace-group="review">
+        <div class="head"><h2 data-i18n="traceReview.panel.title"></h2><span class="mono" id="trace-review-meta" data-i18n="traceReview.panel.meta"></span></div>
+        <div class="review-summary" id="trace-review-summary">
+          <div class="review-chip"><span data-i18n="traceReview.summary.recentCycles"></span><b data-i18n="common.waitingData"></b></div>
+          <div class="review-chip"><span data-i18n="traceReview.summary.candidates"></span><b data-i18n="common.dash"></b></div>
+          <div class="review-chip"><span data-i18n="traceReview.summary.filled"></span><b data-i18n="common.dash"></b></div>
+          <div class="review-chip"><span data-i18n="traceReview.summary.rejected"></span><b data-i18n="common.dash"></b></div>
+          <div class="review-chip"><span data-i18n="traceReview.summary.activeTraces"></span><b data-i18n="common.dash"></b></div>
+          <div class="review-chip"><span data-i18n="traceReview.summary.closedTraces"></span><b data-i18n="common.dash"></b></div>
+        </div>
+        <div class="signal-review-grid">
+          <section class="review-column">
+            <h3 data-i18n="traceReview.columns.recentCycles"></h3>
+            <ul class="review-list" id="trace-review-cycles">
+              <li><div class="review-main"><span data-i18n="common.waitingData"></span><b data-i18n="common.dash"></b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <div class="head compact-head"><h2 data-i18n="traceReview.columns.cycleCandidates"></h2><span class="mono" id="trace-review-cycle-meta" data-i18n="traceReview.columns.cycleCandidatesMeta"></span></div>
+            <div class="table-wrap small-scroll">
+              <table class="table">
+                <thead><tr><th data-i18n="traceReview.table.market"></th><th data-i18n="traceReview.table.wallet"></th><th data-i18n="traceReview.table.action"></th><th data-i18n="traceReview.table.decision"></th><th data-i18n="traceReview.table.order"></th></tr></thead>
+                <tbody id="trace-review-cycle-body">
+                  <tr><td colspan="5" data-i18n="common.waitingData"></td></tr>
+                </tbody>
+              </table>
+            </div>
+          </section>
+        </div>
+        <div class="head compact-head"><h2 data-i18n="traceReview.detail.title"></h2><span class="mono" id="trace-review-detail-meta" data-i18n="traceReview.detail.meta"></span></div>
+        <div class="review-detail">
+          <div class="profile-head" id="trace-review-detail-head">
+            <span class="tag danger" data-i18n="common.waiting"></span>
+            <span class="mono" data-i18n="traceReview.detail.hint"></span>
+          </div>
+          <p class="profile-summary" id="trace-review-detail-summary" data-i18n="traceReview.detail.summary"></p>
+          <ul class="list tight" id="trace-review-detail-list">
+            <li><span data-i18n="traceReview.detail.list.status"></span><b data-i18n="common.waitingData"></b></li>
+          </ul>
+          <div class="head compact-head"><h2 data-i18n="traceReview.detail.chain.title"></h2><span class="mono" id="trace-review-detail-chain-meta" data-i18n="traceReview.detail.chain.meta"></span></div>
+          <ul class="timeline review-chain" id="trace-review-detail-chain">
+            <li><span data-i18n="common.dashTime"></span><b data-i18n="common.waitingData"></b></li>
+          </ul>
+        </div>
+      </article>
+
+      <article class="panel chart chart-attribution-review chart-span-2" data-workspace-group="review">
+        <div class="head"><h2 data-i18n="attributionReview.panel.title"></h2><span class="mono" id="attribution-review-meta" data-i18n="attributionReview.panel.meta"></span></div>
+        <div class="review-filter-bar">
+          <div class="chips" id="attribution-window-chips">
+            <span class="chip active" data-window="24h" data-i18n="attributionReview.windows.24h"></span>
+            <span class="chip" data-window="7d" data-i18n="attributionReview.windows.7d"></span>
+            <span class="chip" data-window="30d" data-i18n="attributionReview.windows.30d"></span>
+            <span class="chip" data-window="all" data-i18n="attributionReview.windows.all"></span>
+          </div>
+          <span class="mono" id="attribution-window-meta" data-i18n="attributionReview.window.meta"></span>
+        </div>
+        <div class="review-summary" id="attribution-review-summary">
+          <div class="review-chip"><span data-i18n="attributionReview.summary.orders"></span><b data-i18n="common.waitingData"></b></div>
+          <div class="review-chip"><span data-i18n="attributionReview.summary.filled"></span><b data-i18n="common.dash"></b></div>
+          <div class="review-chip"><span data-i18n="attributionReview.summary.rejected"></span><b data-i18n="common.dash"></b></div>
+          <div class="review-chip"><span data-i18n="attributionReview.summary.exits"></span><b data-i18n="common.dash"></b></div>
+          <div class="review-chip"><span data-i18n="attributionReview.summary.highScoreRejects"></span><b data-i18n="common.dash"></b></div>
+          <div class="review-chip"><span data-i18n="attributionReview.summary.topics"></span><b data-i18n="common.dash"></b></div>
+        </div>
+        <div class="review-grid">
+          <section class="review-column">
+            <h3 data-i18n="attributionReview.columns.byWallet"></h3>
+            <ul class="review-list" id="attr-by-wallet">
+              <li><div class="review-main"><span data-i18n="common.waitingData"></span><b data-i18n="common.dash"></b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3 data-i18n="attributionReview.columns.byTopic"></h3>
+            <ul class="review-list" id="attr-by-topic">
+              <li><div class="review-main"><span data-i18n="common.waitingData"></span><b data-i18n="common.dash"></b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3 data-i18n="attributionReview.columns.byExitKind"></h3>
+            <ul class="review-list" id="attr-by-exit-kind">
+              <li><div class="review-main"><span data-i18n="common.waitingData"></span><b data-i18n="common.dash"></b></div></li>
+            </ul>
+          </section>
+        </div>
+        <div class="head compact-head"><h2 data-i18n="attributionReview.tables.walletTopic.title"></h2><span class="mono" id="attr-wallet-topic-meta" data-i18n="attributionReview.tables.walletTopic.meta"></span></div>
+        <div class="table-wrap small-scroll">
+          <table class="table">
+            <thead><tr><th data-i18n="attributionReview.tables.walletTopic.wallet"></th><th data-i18n="attributionReview.tables.walletTopic.topic"></th><th data-i18n="attributionReview.tables.walletTopic.fillReject"></th><th data-i18n="attributionReview.tables.walletTopic.amount"></th><th data-i18n="attributionReview.tables.walletTopic.hold"></th></tr></thead>
+            <tbody id="attr-wallet-topic-body">
+              <tr><td colspan="5" data-i18n="common.waitingData"></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="head compact-head"><h2 data-i18n="attributionReview.tables.topicExit.title"></h2><span class="mono" id="attr-topic-exit-meta" data-i18n="attributionReview.tables.topicExit.meta"></span></div>
+        <div class="table-wrap small-scroll">
+          <table class="table">
+            <thead><tr><th data-i18n="attributionReview.tables.topicExit.topic"></th><th data-i18n="attributionReview.tables.topicExit.exitKind"></th><th data-i18n="attributionReview.tables.topicExit.fillReject"></th><th data-i18n="attributionReview.tables.topicExit.amount"></th><th data-i18n="attributionReview.tables.topicExit.hold"></th></tr></thead>
+            <tbody id="attr-topic-exit-body">
+              <tr><td colspan="5" data-i18n="common.waitingData"></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="head compact-head"><h2 data-i18n="attributionReview.tables.sourceResult.title"></h2><span class="mono" id="attr-source-result-meta" data-i18n="attributionReview.tables.sourceResult.meta"></span></div>
+        <div class="table-wrap small-scroll">
+          <table class="table">
+            <thead><tr><th data-i18n="attributionReview.tables.sourceResult.source"></th><th data-i18n="attributionReview.tables.sourceResult.result"></th><th data-i18n="attributionReview.tables.sourceResult.count"></th><th data-i18n="attributionReview.tables.sourceResult.amount"></th><th data-i18n="attributionReview.tables.sourceResult.rejectRate"></th></tr></thead>
+            <tbody id="attr-source-result-body">
+              <tr><td colspan="5" data-i18n="common.waitingData"></td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="review-grid">
+          <section class="review-column">
+            <h3 data-i18n="attributionReview.columns.rejectReasons"></h3>
+            <ul class="review-list" id="attr-reject-reasons">
+              <li><div class="review-main"><span data-i18n="common.waitingData"></span><b data-i18n="common.dash"></b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3 data-i18n="attributionReview.columns.holdBuckets"></h3>
+            <ul class="review-list" id="attr-hold-buckets">
+              <li><div class="review-main"><span data-i18n="common.waitingData"></span><b data-i18n="common.dash"></b></div></li>
+            </ul>
+          </section>
+          <section class="review-column">
+            <h3 data-i18n="attributionReview.columns.topBottom"></h3>
+            <div class="component-grid">
+              <div class="component-card">
+                <span data-i18n="attributionReview.rank.topWallets"></span>
+                <div class="rank-list" id="attr-top-wallets"><span data-i18n="common.waitingData"></span></div>
+              </div>
+              <div class="component-card">
+                <span data-i18n="attributionReview.rank.bottomWallets"></span>
+                <div class="rank-list" id="attr-bottom-wallets"><span data-i18n="common.waitingData"></span></div>
+              </div>
+              <div class="component-card">
+                <span data-i18n="attributionReview.rank.topTopics"></span>
+                <div class="rank-list" id="attr-top-topics"><span data-i18n="common.waitingData"></span></div>
+              </div>
+              <div class="component-card">
+                <span data-i18n="attributionReview.rank.bottomTopics"></span>
+                <div class="rank-list" id="attr-bottom-topics"><span data-i18n="common.waitingData"></span></div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </article>
+
+        <article class="panel chart card-journal" data-workspace-group="review">
+          <div class="head"><h2 data-i18n="journal.panel.title"></h2><span class="mono" id="journal-meta"></span></div>
+          <p class="api-status wait" id="journal-panel-status" data-i18n="journal.panel.waiting"></p>
+          <div class="journal-composer">
+            <input class="editor-input journal-note-input" id="journal-note-input" type="text" maxlength="240" data-i18n-placeholder="journal.composer.placeholder" />
+            <button class="btn" id="journal-note-save" type="button" data-i18n="journal.composer.save"></button>
+            <span class="mono" id="journal-note-status" data-i18n="journal.composer.ready"></span>
+          </div>
+          <div class="component-grid journal-grid" id="journal-grid">
+            <div class="component-card"><span data-i18n="journal.card.title"></span><b data-i18n="common.waitingData"></b></div>
+          </div>
+        </article>
     </section>
   </main>
-  <script src="./app.js?v=20260313a"></script>
+  <script src="./i18n.js?v=20260325a"></script>
+  <script src="./app.js?v=20260325i18n"></script>
 </body>
 </html>

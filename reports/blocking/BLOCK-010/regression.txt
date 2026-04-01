@@ -1,0 +1,11 @@
+BLOCK-010 regression report
+Generated: 2026-03-27 13:14:41 CST
+
+Regression commands executed:
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_release_gate_aggregates_block_results.py'
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_release_gate_fails_on_any_required_block.py'
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_release_gate_writes_artifacts.py'
+- PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p 'test_release_gate_machine_and_failclose.py'
+
+Regression result:
+- PASS
