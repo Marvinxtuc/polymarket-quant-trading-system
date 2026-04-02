@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 
 from polymarket_bot.brokers.live_clob import LiveClobBroker
@@ -20,6 +21,9 @@ from polymarket_bot.runner import Trader
 from polymarket_bot.secrets import SecretConfigurationError, resolve_live_secret_bundle
 from polymarket_bot.signer_client import SignerClientError, build_signer_client
 from polymarket_bot.strategies.wallet_follower import WalletFollowerStrategy
+from polymarket_bot.demo_ledger import run_demo_ledger_suite
+from polymarket_bot.demo_loop import DemoRunner
+from polymarket_bot.demo_risk import run_demo_risk_suite
 
 
 def _main_t(key: str, params: dict[str, object] | None = None, *, fallback: str = "") -> str:
@@ -131,7 +135,53 @@ def build_trader(settings: Settings, *, pre_acquired_writer_lock: FileLock | Non
 def main() -> None:
     parser = argparse.ArgumentParser(description=_main_t("description", fallback="Polymarket automated trader"))
     parser.add_argument("--once", action="store_true", help=_main_t("once", fallback="Run one cycle and exit"))
+    parser.add_argument("--demo-mode", action="store_true", help="Run isolated demo trading loop")
+    parser.add_argument("--demo-seed", type=int, default=42, help="Deterministic seed for demo mode")
+    parser.add_argument("--demo-max-ticks", type=int, default=20, help="Maximum ticks to run in demo mode")
+    parser.add_argument("--demo-tick-seconds", type=int, default=2, help="Tick interval in seconds for demo mode")
+    parser.add_argument("--demo-risk-suite", action="store_true", help="Run isolated demo risk rejection suite")
+    parser.add_argument("--demo-ledger-suite", action="store_true", help="Run isolated demo ledger reconciliation suite")
     args = parser.parse_args()
+
+    if args.demo_ledger_suite:
+        setup_logger("INFO")
+        result = run_demo_ledger_suite()
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.demo_risk_suite:
+        setup_logger("INFO")
+        result = run_demo_risk_suite(seed=args.demo_seed)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
+    if args.demo_mode:
+        setup_logger("INFO")
+        demo = DemoRunner(
+            seed=args.demo_seed,
+            max_ticks=args.demo_max_ticks,
+            tick_seconds=args.demo_tick_seconds,
+        )
+        result = demo.run()
+        print(
+            json.dumps(
+                {
+                    "mode": "demo",
+                    "run_id": result.run_id,
+                    "base_dir": str(result.base_dir),
+                    "ticks_completed": result.ticks_completed,
+                    "candidates_generated": result.candidates_generated,
+                    "orders_created": result.orders_created,
+                    "fills_recorded": result.fills_recorded,
+                    "final_equity": result.final_equity,
+                    "open_positions": result.open_positions,
+                    "stop_reason": result.stop_reason,
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
 
     settings = Settings()
     setup_logger(settings.log_level)
