@@ -148,6 +148,8 @@ _MARKET_WINDOW_SECONDS = {
     "1h": 3600,
 }
 _MARKET_METADATA_CACHE_TTL_SECONDS = 300
+_SUBMIT_UNKNOWN_PROBE_WINDOW_SECONDS = 120
+_SUBMIT_UNKNOWN_SIZE_PRECISION = 6
 _ORDER_INTENT_TERMINAL_STATUSES = {"filled", "canceled", "failed", "rejected", "unmatched"}
 _VALID_DECISION_MODES = {"manual", "semi_auto", "auto"}
 
@@ -993,6 +995,394 @@ class Trader:
         self._ack_unknown_tracker[strategy_order_uuid] = state
         return state
 
+    @staticmethod
+    def _normalize_probe_confidence(value: object) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized in {"strong", "weak", "none"}:
+            return normalized
+        return "none"
+
+    @staticmethod
+    def _normalize_probe_basis(value: object) -> str:
+        normalized = str(value or "").strip().lower()
+        if normalized in {
+            "broker_order_id",
+            "unique_broker_record_match",
+            "ambiguous_broker_record_match",
+            "submit_digest_only",
+            "no_match",
+        }:
+            return normalized
+        return "no_match"
+
+    @staticmethod
+    def _intent_status_from_lifecycle_status(status: object) -> str:
+        normalized = str(status or "").strip().lower()
+        if normalized == "partially_filled":
+            return INTENT_STATUS_PARTIAL
+        if normalized == "filled":
+            return INTENT_STATUS_FILLED
+        if normalized in {"canceled", "failed", "rejected", "unmatched"}:
+            return normalized
+        return INTENT_STATUS_ACKED_PENDING
+
+    def _submit_unknown_expected_size(self, payload: Mapping[str, object]) -> float:
+        submitted_size = self._safe_float(payload.get("submitted_size"))
+        if submitted_size > 0.0:
+            return submitted_size
+        submitted_price = self._safe_float(payload.get("submitted_price") or payload.get("requested_price"))
+        requested_notional = self._safe_float(payload.get("requested_notional"))
+        if submitted_price > 0.0 and requested_notional > 0.0:
+            return max(0.0, requested_notional / submitted_price)
+        return 0.0
+
+    @staticmethod
+    def _normalize_probe_price(price: float, tick_size: float) -> float:
+        price = max(0.0, float(price or 0.0))
+        tick_size = max(0.0, float(tick_size or 0.0))
+        if price <= 0.0 or tick_size <= 0.0:
+            return 0.0
+        return round(round(price / tick_size) * tick_size, 8)
+
+    @staticmethod
+    def _normalize_probe_size(size: float) -> float:
+        return round(max(0.0, float(size or 0.0)), _SUBMIT_UNKNOWN_SIZE_PRECISION)
+
+    def _build_submit_unknown_payload_updates(
+        self,
+        *,
+        payload: Mapping[str, object] | None = None,
+        result: ExecutionResult | None = None,
+        ack_state: Mapping[str, object] | None = None,
+        probe_confidence: str = "none",
+        probe_basis: str = "no_match",
+        manual_required_reason: str = "",
+    ) -> dict[str, object]:
+        current_payload = dict(payload or {})
+        result_metadata = dict(getattr(result, "metadata", {}) or {})
+        submit_digest = str(result_metadata.get("submit_digest") or current_payload.get("submit_digest") or "").strip()
+        submit_digest_version = str(
+            result_metadata.get("submit_digest_version") or current_payload.get("submit_digest_version") or ""
+        ).strip()
+        submitted_price = self._safe_float(
+            result_metadata.get("submitted_price")
+            or current_payload.get("submitted_price")
+            or getattr(result, "requested_price", 0.0),
+            0.0,
+        )
+        submitted_size = self._safe_float(
+            result_metadata.get("submitted_size") or current_payload.get("submitted_size"),
+            0.0,
+        )
+        if submitted_size <= 0.0 and submitted_price > 0.0:
+            requested_notional = self._safe_float(
+                current_payload.get("requested_notional") or getattr(result, "requested_notional", 0.0),
+                0.0,
+            )
+            if requested_notional > 0.0:
+                submitted_size = max(0.0, requested_notional / submitted_price)
+
+        tick_size = self._safe_float(
+            result_metadata.get("tick_size") or current_payload.get("tick_size"),
+            0.0,
+        )
+        first_seen_ts = int(
+            (ack_state or {}).get("first_ts")
+            or current_payload.get("unknown_submit_first_seen_ts")
+            or current_payload.get("ack_unknown_first_ts")
+            or 0
+        )
+        probe_count = int(
+            (ack_state or {}).get("count")
+            or current_payload.get("unknown_submit_probe_count")
+            or current_payload.get("ack_unknown_count")
+            or 0
+        )
+        updates: dict[str, object] = {
+            "pending_class": "submit_unknown",
+            "submit_digest": submit_digest,
+            "submit_digest_version": submit_digest_version,
+            "submitted_price": float(submitted_price),
+            "submitted_size": float(submitted_size),
+            "tick_size": float(tick_size),
+            "unknown_submit_first_seen_ts": int(first_seen_ts),
+            "unknown_submit_probe_count": int(probe_count),
+            "ack_unknown_first_ts": int(first_seen_ts),
+            "ack_unknown_count": int(probe_count),
+            "probe_confidence": self._normalize_probe_confidence(probe_confidence),
+            "probe_basis": self._normalize_probe_basis(probe_basis),
+            "manual_required_reason": str(manual_required_reason or current_payload.get("manual_required_reason") or ""),
+        }
+        return updates
+
+    def _classify_unknown_submit_probe(
+        self,
+        *,
+        signal: Signal,
+        intent_record: Mapping[str, object],
+    ) -> dict[str, object]:
+        payload = dict(intent_record.get("payload") or {})
+        broker_order_id = str(intent_record.get("broker_order_id") or payload.get("order_id") or "").strip()
+        submit_digest = str(payload.get("submit_digest") or "").strip()
+        first_seen_ts = int(payload.get("unknown_submit_first_seen_ts") or payload.get("ack_unknown_first_ts") or 0)
+        tick_size = self._safe_float(payload.get("tick_size"), 0.0)
+        submitted_price = self._safe_float(payload.get("submitted_price") or payload.get("requested_price"), 0.0)
+        submitted_size = self._submit_unknown_expected_size(payload)
+        signal_token = str(signal.token_id or payload.get("token_id") or "").strip().lower()
+        signal_side = str(signal.side or payload.get("side") or "").strip().upper()
+        exact_candidates: dict[str, dict[str, object]] = {}
+        partial_matches = 0
+
+        if broker_order_id:
+            get_order_status = getattr(self.broker, "get_order_status", None)
+            if callable(get_order_status):
+                try:
+                    snapshot = get_order_status(broker_order_id)
+                except Exception as exc:
+                    self.log.warning("Unknown-submit status probe failed order_id=%s err=%s", broker_order_id, exc)
+                    snapshot = None
+                if isinstance(snapshot, OrderStatusSnapshot):
+                    return {
+                        "confidence": "strong",
+                        "basis": "broker_order_id",
+                        "broker_order_id": broker_order_id,
+                        "intent_status": self._intent_status_from_lifecycle_status(snapshot.lifecycle_status),
+                        "broker_status": str(snapshot.lifecycle_status or snapshot.normalized_status or ""),
+                        "manual_required_reason": "",
+                    }
+
+        list_open_orders = getattr(self.broker, "list_open_orders", None)
+        broker_open_orders = []
+        if callable(list_open_orders):
+            try:
+                broker_open_orders = list(list_open_orders() or [])
+            except Exception as exc:
+                self.log.warning("Unknown-submit open-order probe failed err=%s", exc)
+                broker_open_orders = []
+        for snapshot in broker_open_orders:
+            if not isinstance(snapshot, OpenOrderSnapshot):
+                continue
+            snapshot_order_id = str(snapshot.order_id or "").strip()
+            snapshot_token = str(snapshot.token_id or "").strip().lower()
+            snapshot_side = str(snapshot.side or "").strip().upper()
+            if broker_order_id and snapshot_order_id and snapshot_order_id == broker_order_id:
+                return {
+                    "confidence": "strong",
+                    "basis": "broker_order_id",
+                    "broker_order_id": snapshot_order_id,
+                    "intent_status": self._intent_status_from_lifecycle_status(snapshot.lifecycle_status),
+                    "broker_status": str(snapshot.lifecycle_status or snapshot.normalized_status or ""),
+                    "manual_required_reason": "",
+                }
+            if snapshot_token != signal_token or snapshot_side != signal_side:
+                continue
+            partial_matches += 1
+            if tick_size <= 0.0 or submitted_price <= 0.0 or submitted_size <= 0.0:
+                continue
+            if first_seen_ts <= 0 or int(snapshot.created_ts or 0) <= 0:
+                continue
+            if abs(int(snapshot.created_ts) - first_seen_ts) > _SUBMIT_UNKNOWN_PROBE_WINDOW_SECONDS:
+                continue
+            candidate_size = self._safe_float(snapshot.original_size)
+            if candidate_size <= 0.0:
+                candidate_size = self._safe_float(snapshot.matched_size) + self._safe_float(snapshot.remaining_size)
+            if candidate_size <= 0.0:
+                continue
+            if (
+                self._normalize_probe_price(self._safe_float(snapshot.price), tick_size)
+                == self._normalize_probe_price(submitted_price, tick_size)
+                and self._normalize_probe_size(candidate_size) == self._normalize_probe_size(submitted_size)
+            ):
+                candidate_key = snapshot_order_id or (
+                    f"open:{snapshot_token}:{snapshot_side}:{self._normalize_probe_price(self._safe_float(snapshot.price), tick_size)}:"
+                    f"{self._normalize_probe_size(candidate_size)}:{int(snapshot.created_ts or 0)}"
+                )
+                exact_candidates[candidate_key] = {
+                    "order_id": snapshot_order_id,
+                    "intent_status": self._intent_status_from_lifecycle_status(snapshot.lifecycle_status),
+                    "broker_status": str(snapshot.lifecycle_status or snapshot.normalized_status or ""),
+                }
+
+        list_recent_fills = getattr(self.broker, "list_recent_fills", None)
+        broker_fills = []
+        if callable(list_recent_fills):
+            try:
+                broker_fills = list(list_recent_fills(limit=400) or [])
+            except Exception as exc:
+                self.log.warning("Unknown-submit fill probe failed err=%s", exc)
+                broker_fills = []
+        for fill in broker_fills:
+            if not isinstance(fill, OrderFillSnapshot):
+                continue
+            fill_order_id = str(fill.order_id or "").strip()
+            fill_token = str(fill.token_id or "").strip().lower()
+            fill_side = str(fill.side or "").strip().upper()
+            if broker_order_id and fill_order_id and fill_order_id == broker_order_id:
+                return {
+                    "confidence": "strong",
+                    "basis": "broker_order_id",
+                    "broker_order_id": fill_order_id,
+                    "intent_status": INTENT_STATUS_FILLED,
+                    "broker_status": "filled",
+                    "manual_required_reason": "",
+                }
+            if fill_token != signal_token or fill_side != signal_side:
+                continue
+            partial_matches += 1
+            if tick_size <= 0.0 or submitted_price <= 0.0 or submitted_size <= 0.0:
+                continue
+            if first_seen_ts <= 0 or int(fill.timestamp or 0) <= 0:
+                continue
+            if abs(int(fill.timestamp) - first_seen_ts) > _SUBMIT_UNKNOWN_PROBE_WINDOW_SECONDS:
+                continue
+            if (
+                self._normalize_probe_price(self._safe_float(fill.price), tick_size)
+                == self._normalize_probe_price(submitted_price, tick_size)
+                and self._normalize_probe_size(self._safe_float(fill.size)) == self._normalize_probe_size(submitted_size)
+            ):
+                candidate_key = fill_order_id or (
+                    f"fill:{fill_token}:{fill_side}:{self._normalize_probe_price(self._safe_float(fill.price), tick_size)}:"
+                    f"{self._normalize_probe_size(self._safe_float(fill.size))}:{int(fill.timestamp or 0)}"
+                )
+                exact_candidates[candidate_key] = {
+                    "order_id": fill_order_id,
+                    "intent_status": INTENT_STATUS_FILLED,
+                    "broker_status": "filled",
+                }
+
+        if len(exact_candidates) == 1:
+            candidate = next(iter(exact_candidates.values()))
+            return {
+                "confidence": "strong",
+                "basis": "unique_broker_record_match",
+                "broker_order_id": str(candidate.get("order_id") or ""),
+                "intent_status": str(candidate.get("intent_status") or INTENT_STATUS_ACKED_PENDING),
+                "broker_status": str(candidate.get("broker_status") or "open"),
+                "manual_required_reason": "",
+            }
+        if len(exact_candidates) > 1:
+            return {
+                "confidence": "weak",
+                "basis": "ambiguous_broker_record_match",
+                "broker_order_id": "",
+                "intent_status": INTENT_STATUS_ACK_UNKNOWN,
+                "broker_status": "",
+                "manual_required_reason": "submit_unknown_ambiguous_match",
+            }
+        if partial_matches > 1:
+            return {
+                "confidence": "weak",
+                "basis": "ambiguous_broker_record_match",
+                "broker_order_id": "",
+                "intent_status": INTENT_STATUS_ACK_UNKNOWN,
+                "broker_status": "",
+                "manual_required_reason": "submit_unknown_conflicting_evidence",
+            }
+        if partial_matches == 1:
+            return {
+                "confidence": "weak",
+                "basis": "ambiguous_broker_record_match",
+                "broker_order_id": "",
+                "intent_status": INTENT_STATUS_ACK_UNKNOWN,
+                "broker_status": "",
+                "manual_required_reason": "",
+            }
+        if submit_digest:
+            return {
+                "confidence": "weak",
+                "basis": "submit_digest_only",
+                "broker_order_id": "",
+                "intent_status": INTENT_STATUS_ACK_UNKNOWN,
+                "broker_status": "",
+                "manual_required_reason": "",
+            }
+        return {
+            "confidence": "none",
+            "basis": "no_match",
+            "broker_order_id": "",
+            "intent_status": INTENT_STATUS_ACK_UNKNOWN,
+            "broker_status": "",
+            "manual_required_reason": "submit_unknown_no_anchor",
+        }
+
+    def _find_pending_order_by_intent(
+        self,
+        *,
+        strategy_order_uuid: str = "",
+        idempotency_key: str = "",
+    ) -> dict[str, object] | None:
+        normalized_uuid = str(strategy_order_uuid or "").strip()
+        normalized_key = str(idempotency_key or "").strip()
+        for order in self.pending_orders.values():
+            if normalized_uuid and str(order.get("strategy_order_uuid") or "").strip() == normalized_uuid:
+                return order
+            if normalized_key and str(order.get("idempotency_key") or "").strip() == normalized_key:
+                return order
+        return None
+
+    def _apply_submit_unknown_contract(
+        self,
+        order: dict[str, object],
+        *,
+        now: int,
+        probe_confidence: str,
+        probe_basis: str,
+        manual_required_reason: str,
+        ack_state: Mapping[str, object] | None = None,
+        clear_ambiguity: bool = False,
+        broker_order_id: str = "",
+        broker_status: str = "",
+        payload: Mapping[str, object] | None = None,
+    ) -> None:
+        current_payload = dict(payload or {})
+        order["pending_class"] = "normal" if clear_ambiguity else "submit_unknown"
+        order["probe_confidence"] = self._normalize_probe_confidence(
+            current_payload.get("probe_confidence") or probe_confidence
+        )
+        order["probe_basis"] = self._normalize_probe_basis(current_payload.get("probe_basis") or probe_basis)
+        order["submit_digest"] = str(current_payload.get("submit_digest") or order.get("submit_digest") or "")
+        order["submit_digest_version"] = str(
+            current_payload.get("submit_digest_version") or order.get("submit_digest_version") or ""
+        )
+        order["unknown_submit_first_seen_ts"] = int(
+            current_payload.get("unknown_submit_first_seen_ts")
+            or current_payload.get("ack_unknown_first_ts")
+            or order.get("unknown_submit_first_seen_ts")
+            or 0
+        )
+        order["unknown_submit_probe_count"] = int(
+            current_payload.get("unknown_submit_probe_count")
+            or current_payload.get("ack_unknown_count")
+            or order.get("unknown_submit_probe_count")
+            or 0
+        )
+        order["manual_required_reason"] = str(
+            manual_required_reason or current_payload.get("manual_required_reason") or order.get("manual_required_reason") or ""
+        )
+        if ack_state:
+            order["ack_unknown_count"] = int(ack_state.get("count") or 0)
+            order["ack_unknown_first_ts"] = int(ack_state.get("first_ts") or 0)
+            order["unknown_submit_probe_count"] = int(ack_state.get("count") or 0)
+            order["unknown_submit_first_seen_ts"] = int(ack_state.get("first_ts") or 0)
+        if broker_order_id:
+            order["order_id"] = broker_order_id
+        if broker_status:
+            order["broker_status"] = broker_status
+        if clear_ambiguity:
+            order["reconcile_ambiguous_ts"] = 0
+            order["reconcile_ambiguous_reason"] = ""
+            order["manual_required_reason"] = ""
+        else:
+            order["reconcile_ambiguous_ts"] = max(now, int(order.get("reconcile_ambiguous_ts") or 0))
+            order["reconcile_ambiguous_reason"] = str(
+                order["manual_required_reason"] or order.get("reconcile_ambiguous_reason") or "submit_unknown"
+            )
+        order["recovery_status"] = (
+            "manual_required"
+            if order["manual_required_reason"]
+            else ("ack_unknown" if order["probe_confidence"] != "strong" else "confirmed")
+        )
+
     def _normalize_claim_result(self, raw_result: object, default_intent: dict[str, object]) -> tuple[str, dict[str, object]]:
         claim_status = STORAGE_ERROR
         intent = dict(default_intent)
@@ -1020,6 +1410,22 @@ class Trader:
         if bool(tracker.get("manual_required")):
             intent_status = INTENT_STATUS_MANUAL_REQUIRED
         intent["status"] = intent_status or INTENT_STATUS_NEW
+        for field_name in (
+            "ack_unknown_count",
+            "ack_unknown_first_ts",
+            "submit_digest",
+            "submit_digest_version",
+            "submitted_price",
+            "submitted_size",
+            "tick_size",
+            "unknown_submit_first_seen_ts",
+            "unknown_submit_probe_count",
+            "probe_confidence",
+            "probe_basis",
+            "manual_required_reason",
+        ):
+            if field_name in payload:
+                intent[field_name] = payload.get(field_name)
         if ack_count:
             intent["ack_unknown_count"] = ack_count
         if ack_first_ts:
@@ -1056,6 +1462,16 @@ class Trader:
                 "signal_bucket": signal_bucket,
                 "ack_unknown_count": 0,
                 "ack_unknown_first_ts": 0,
+                "submit_digest": "",
+                "submit_digest_version": "",
+                "submitted_price": float(signal.price_hint or 0.0),
+                "submitted_size": 0.0,
+                "tick_size": 0.0,
+                "unknown_submit_first_seen_ts": 0,
+                "unknown_submit_probe_count": 0,
+                "probe_confidence": "none",
+                "probe_basis": "no_match",
+                "manual_required_reason": "",
             },
         }
         if not bool(getattr(self.settings, "idempotency_enabled", False)):
@@ -5039,6 +5455,9 @@ class Trader:
 
     @staticmethod
     def _intent_pending_status_from_order(order: Mapping[str, object]) -> str:
+        recovery_status = str(order.get("recovery_status") or "").strip().lower()
+        if recovery_status in {INTENT_STATUS_ACK_UNKNOWN, INTENT_STATUS_MANUAL_REQUIRED}:
+            return recovery_status
         raw = str(order.get("broker_status") or "").strip().lower()
         if raw in {"cancel_requested", "canceled", "failed", "rejected", "unmatched", "filled"}:
             return raw
@@ -6227,11 +6646,17 @@ class Trader:
         if status == "cancelled":
             status = "canceled"
         ok_value = response.get("ok")
-        ok = bool(ok_value) if ok_value is not None else status not in {"failed", "rejected", "error", "unsupported"}
-        if status in {"submitted", "posted", "open", "live", "delayed", "accepted", "pending", "queued", "requested", "cancel_requested"}:
-            status = "requested" if ok else "failed"
+        if ok_value is False:
+            status = "failed"
+        elif status in {"submitted", "posted", "open", "live", "delayed", "accepted", "pending", "queued", "requested", "cancel_requested"}:
+            status = "requested"
+        elif status in {"unknown", "ambiguous", "indeterminate"}:
+            status = "unknown"
         elif not status:
-            status = "canceled" if ok else "failed"
+            status = "requested" if ok_value is True else "unknown"
+        ok = bool(ok_value) if ok_value is not None else status not in {"failed", "rejected", "error", "unsupported"}
+        if not ok and status not in {"failed", "rejected", "error", "unsupported"}:
+            status = "failed"
         message = str(response.get("message") or response.get("error") or "").strip()
         return (status, ok, message)
 
@@ -6353,16 +6778,16 @@ class Trader:
         if order_id and (force or last_request_ts <= 0 or (now - last_request_ts) >= retry_seconds):
             updated["cancel_request_count"] = int(updated.get("cancel_request_count") or 0) + 1
 
-        if status == "requested" and ok:
-            updated["broker_status"] = "cancel_requested"
+        if status in {"requested", "unknown"} and ok:
+            updated["broker_status"] = "cancel_requested" if status == "requested" else "cancel_unknown"
             updated["message"] = message
             updated["reason"] = message
             self._record_pending_cancel_outcome(
                 order=updated,
                 now=now,
                 position_lookup=position_lookup,
-                recent_status="CANCEL_REQUESTED",
-                broker_status="cancel_requested",
+                recent_status="CANCEL_REQUESTED" if status == "requested" else "CANCEL_UNKNOWN",
+                broker_status=str(updated["broker_status"]),
                 action_reason=action_reason,
                 message=message,
                 ok=True,
@@ -6445,6 +6870,18 @@ class Trader:
             "reconciled_size_hint": float(order.get("reconciled_size_hint") or 0.0),
             "last_fill_ts_hint": int(order.get("last_fill_ts_hint") or 0),
             "strategy_order_uuid": str(order.get("strategy_order_uuid") or ""),
+            "pending_class": str(order.get("pending_class") or ""),
+            "submit_digest": str(order.get("submit_digest") or ""),
+            "submit_digest_version": str(order.get("submit_digest_version") or ""),
+            "probe_confidence": str(order.get("probe_confidence") or ""),
+            "probe_basis": str(order.get("probe_basis") or ""),
+            "unknown_submit_first_seen_ts": int(order.get("unknown_submit_first_seen_ts") or 0),
+            "unknown_submit_probe_count": int(order.get("unknown_submit_probe_count") or 0),
+            "manual_required_reason": str(order.get("manual_required_reason") or ""),
+            "ack_unknown_count": int(order.get("ack_unknown_count") or 0),
+            "ack_unknown_first_ts": int(order.get("ack_unknown_first_ts") or 0),
+            "submitted_price": float(order.get("submitted_price") or 0.0),
+            "submitted_size": float(order.get("submitted_size") or 0.0),
         }
 
     @staticmethod
@@ -6689,6 +7126,7 @@ class Trader:
     ) -> dict[str, object]:
         key = self._pending_order_key(signal, result.broker_order_id)
         previous = previous_position or {}
+        metadata = dict(getattr(result, "metadata", {}) or {})
         record = {
             "key": key,
             "ts": now,
@@ -6751,6 +7189,18 @@ class Trader:
             "reconcile_ambiguous_reason": "",
             "recovery_source": "runtime",
             "recovery_status": "confirmed",
+            "pending_class": str(metadata.get("pending_class") or "normal"),
+            "submit_digest": str(metadata.get("submit_digest") or ""),
+            "submit_digest_version": str(metadata.get("submit_digest_version") or ""),
+            "probe_confidence": self._normalize_probe_confidence(metadata.get("probe_confidence")),
+            "probe_basis": self._normalize_probe_basis(metadata.get("probe_basis")),
+            "unknown_submit_first_seen_ts": int(self._safe_float(metadata.get("unknown_submit_first_seen_ts"), 0)),
+            "unknown_submit_probe_count": int(self._safe_float(metadata.get("unknown_submit_probe_count"), 0)),
+            "manual_required_reason": str(metadata.get("manual_required_reason") or ""),
+            "ack_unknown_count": int(self._safe_float(metadata.get("unknown_submit_probe_count"), 0)),
+            "ack_unknown_first_ts": int(self._safe_float(metadata.get("unknown_submit_first_seen_ts"), 0)),
+            "submitted_price": self._safe_float(metadata.get("submitted_price"), 0.0),
+            "submitted_size": self._safe_float(metadata.get("submitted_size"), 0.0),
         }
         record.update(self._market_context_from_result(result))
         self.pending_orders[key] = record
@@ -6816,6 +7266,18 @@ class Trader:
             "reconcile_ambiguous_reason": "",
             "recovery_source": "broker_open_orders",
             "recovery_status": "confirmed",
+            "pending_class": "normal",
+            "submit_digest": "",
+            "submit_digest_version": "",
+            "probe_confidence": "none",
+            "probe_basis": "no_match",
+            "unknown_submit_first_seen_ts": 0,
+            "unknown_submit_probe_count": 0,
+            "manual_required_reason": "",
+            "ack_unknown_count": 0,
+            "ack_unknown_first_ts": 0,
+            "submitted_price": float(snapshot.price or 0.0),
+            "submitted_size": float(snapshot.original_size or 0.0),
         }
 
     def _restore_pending_orders_from_broker(self, rows: list[dict[str, object]]) -> list[dict[str, object]]:
@@ -6969,6 +7431,18 @@ class Trader:
             "reconcile_ambiguous_reason": str(row.get("reconcile_ambiguous_reason") or ""),
             "recovery_source": str(row.get("recovery_source") or "snapshot"),
             "recovery_status": str(row.get("recovery_status") or "restored"),
+            "pending_class": str(row.get("pending_class") or "normal"),
+            "submit_digest": str(row.get("submit_digest") or ""),
+            "submit_digest_version": str(row.get("submit_digest_version") or ""),
+            "probe_confidence": self._normalize_probe_confidence(row.get("probe_confidence")),
+            "probe_basis": self._normalize_probe_basis(row.get("probe_basis")),
+            "unknown_submit_first_seen_ts": int(self._safe_float(row.get("unknown_submit_first_seen_ts"))),
+            "unknown_submit_probe_count": int(self._safe_float(row.get("unknown_submit_probe_count"))),
+            "manual_required_reason": str(row.get("manual_required_reason") or ""),
+            "ack_unknown_count": int(self._safe_float(row.get("ack_unknown_count"))),
+            "ack_unknown_first_ts": int(self._safe_float(row.get("ack_unknown_first_ts"))),
+            "submitted_price": self._safe_float(row.get("submitted_price")),
+            "submitted_size": self._safe_float(row.get("submitted_size")),
         }
         for field_name in self._market_context_fields():
             value = row.get(field_name)
@@ -9979,47 +10453,124 @@ class Trader:
                 elif claim_status == EXISTING_NON_TERMINAL:
                     if intent_status in {INTENT_STATUS_SENDING, INTENT_STATUS_ACK_UNKNOWN}:
                         # SENDING/ACK_UNKNOWN 只允许恢复探测，不允许直接重发。
-                        broker_open_order_duplicate = self._find_broker_open_order_duplicate(sig)
-                        if broker_open_order_duplicate is not None:
+                        probe = self._classify_unknown_submit_probe(signal=sig, intent_record=intent_record)
+                        ack_state = self._record_ack_unknown_probe(
+                            str(strategy_uuid or ""),
+                            current_count=ack_count,
+                            current_first_ts=ack_first_ts,
+                        )
+                        probe_confidence = self._normalize_probe_confidence(probe.get("confidence"))
+                        probe_basis = self._normalize_probe_basis(probe.get("basis"))
+                        if probe_confidence == "strong":
+                            recovered_status = str(probe.get("intent_status") or INTENT_STATUS_ACKED_PENDING)
+                            recovered_broker_order_id = str(probe.get("broker_order_id") or "")
+                            recovered_broker_status = str(probe.get("broker_status") or "")
                             self._set_intent_status(
                                 strategy_order_uuid=str(strategy_uuid or ""),
                                 idempotency_key=idempotency_key,
-                                status=INTENT_STATUS_ACKED_PENDING,
-                                broker_order_id=str(broker_open_order_duplicate.get("order_id") or ""),
+                                status=recovered_status,
+                                broker_order_id=recovered_broker_order_id,
                                 payload_updates={
-                                    "probe_source": "broker_open_orders",
+                                    **self._build_submit_unknown_payload_updates(
+                                        payload=dict(intent_record.get("payload") or {}),
+                                        ack_state=ack_state,
+                                        probe_confidence=probe_confidence,
+                                        probe_basis=probe_basis,
+                                    ),
+                                    "pending_class": "normal",
+                                    "manual_required_reason": "",
+                                    "reconcile_ambiguous_ts": 0,
+                                    "reconcile_ambiguous_reason": "",
+                                    "probe_source": probe_basis,
                                     "probe_ts": int(time.time()),
                                 },
-                                recovery_reason="broker_open_detected_during_probe",
+                                recovery_reason="submit_unknown_probe_recovered",
                             )
                             duplicate_reason = "intent_recovery_pending"
-                            duplicate_context.update(dict(broker_open_order_duplicate))
-                        else:
-                            ack_state = self._record_ack_unknown_probe(
-                                str(strategy_uuid or ""),
-                                current_count=ack_count,
-                                current_first_ts=ack_first_ts,
+                            duplicate_context.update(
+                                {
+                                    "probe_confidence": probe_confidence,
+                                    "probe_basis": probe_basis,
+                                    "probe_broker_order_id": recovered_broker_order_id,
+                                    "probe_broker_status": recovered_broker_status,
+                                }
                             )
+                            pending_order = self._find_pending_order_by_intent(
+                                strategy_order_uuid=str(strategy_uuid or ""),
+                                idempotency_key=idempotency_key,
+                            )
+                            if pending_order is not None:
+                                self._apply_submit_unknown_contract(
+                                    pending_order,
+                                    now=int(time.time()),
+                                    probe_confidence=probe_confidence,
+                                    probe_basis=probe_basis,
+                                    manual_required_reason="",
+                                    ack_state=ack_state,
+                                    clear_ambiguity=True,
+                                    broker_order_id=recovered_broker_order_id,
+                                    broker_status=recovered_broker_status,
+                                    payload=self._build_submit_unknown_payload_updates(
+                                        payload=dict(intent_record.get("payload") or {}),
+                                        ack_state=ack_state,
+                                        probe_confidence=probe_confidence,
+                                        probe_basis=probe_basis,
+                                    ),
+                                )
+                        else:
+                            manual_required_reason = str(probe.get("manual_required_reason") or "")
+                            if probe_confidence == "none":
+                                manual_required_reason = manual_required_reason or "submit_unknown_no_anchor"
+                            if not manual_required_reason and bool(ack_state.get("manual_required")):
+                                manual_required_reason = "submit_unknown_probe_exhausted"
                             probe_status = (
                                 INTENT_STATUS_MANUAL_REQUIRED
-                                if bool(ack_state.get("manual_required"))
+                                if manual_required_reason
                                 else INTENT_STATUS_ACK_UNKNOWN
                             )
+                            payload_updates = self._build_submit_unknown_payload_updates(
+                                payload=dict(intent_record.get("payload") or {}),
+                                ack_state=ack_state,
+                                probe_confidence=probe_confidence,
+                                probe_basis=probe_basis,
+                                manual_required_reason=manual_required_reason,
+                            ) | {
+                                "pending_class": "submit_unknown",
+                                "reconcile_ambiguous_ts": int(time.time()),
+                                "reconcile_ambiguous_reason": manual_required_reason or "submit_unknown",
+                            }
                             self._set_intent_status(
                                 strategy_order_uuid=str(strategy_uuid or ""),
                                 idempotency_key=idempotency_key,
                                 status=probe_status,
-                                payload_updates={
-                                    "ack_unknown_count": int(ack_state.get("count") or 0),
-                                    "ack_unknown_first_ts": int(ack_state.get("first_ts") or 0),
-                                    "last_probe_ts": int(time.time()),
-                                },
+                                payload_updates=payload_updates | {"last_probe_ts": int(time.time())},
                                 recovery_reason="ack_unknown_probe_without_broker_evidence",
                             )
+                            pending_order = self._find_pending_order_by_intent(
+                                strategy_order_uuid=str(strategy_uuid or ""),
+                                idempotency_key=idempotency_key,
+                            )
+                            if pending_order is not None:
+                                self._apply_submit_unknown_contract(
+                                    pending_order,
+                                    now=int(time.time()),
+                                    probe_confidence=probe_confidence,
+                                    probe_basis=probe_basis,
+                                    manual_required_reason=manual_required_reason,
+                                    ack_state=ack_state,
+                                    payload=payload_updates,
+                                )
                             duplicate_reason = (
                                 "intent_manual_required"
                                 if probe_status == INTENT_STATUS_MANUAL_REQUIRED
                                 else "intent_ack_unknown"
+                            )
+                            duplicate_context.update(
+                                {
+                                    "probe_confidence": probe_confidence,
+                                    "probe_basis": probe_basis,
+                                    "manual_required_reason": manual_required_reason,
+                                }
                             )
                     elif intent_status == INTENT_STATUS_MANUAL_REQUIRED:
                         duplicate_reason = "intent_manual_required"
@@ -10144,16 +10695,31 @@ class Trader:
                     current_count=int(intent_record.get("ack_unknown_count") or 0),
                     current_first_ts=int(intent_record.get("ack_unknown_first_ts") or 0),
                 )
-                ack_status = INTENT_STATUS_MANUAL_REQUIRED if ack_state.get("manual_required") else INTENT_STATUS_ACK_UNKNOWN
+                ack_metadata = dict(getattr(result, "metadata", {}) or {})
+                probe_confidence = "weak" if str(ack_metadata.get("submit_digest") or "").strip() else "none"
+                probe_basis = "submit_digest_only" if probe_confidence == "weak" else "no_match"
+                manual_required_reason = "submit_unknown_no_anchor" if probe_confidence == "none" else ""
+                if bool(ack_state.get("manual_required")) and not manual_required_reason:
+                    manual_required_reason = "submit_unknown_probe_exhausted"
+                ack_status = INTENT_STATUS_MANUAL_REQUIRED if manual_required_reason else INTENT_STATUS_ACK_UNKNOWN
+                payload_updates = self._build_submit_unknown_payload_updates(
+                    payload=dict(intent_record.get("payload") or {}),
+                    result=result,
+                    ack_state=ack_state,
+                    probe_confidence=probe_confidence,
+                    probe_basis=probe_basis,
+                    manual_required_reason=manual_required_reason,
+                ) | {
+                    "pending_class": "submit_unknown",
+                    "reconcile_ambiguous_ts": now,
+                    "reconcile_ambiguous_reason": manual_required_reason or "broker_ack_unknown",
+                }
                 self._set_intent_status(
                     strategy_order_uuid=order_meta["strategy_order_uuid"],
                     idempotency_key=idempotency_key,
                     status=ack_status,
                     broker_order_id=str(result.broker_order_id or ""),
-                    payload_updates={
-                        "ack_unknown_count": int(ack_state.get("count") or 0),
-                        "ack_unknown_first_ts": int(ack_state.get("first_ts") or 0),
-                    },
+                    payload_updates=payload_updates,
                     recovery_reason="broker_ack_unknown",
                 )
                 entry_context = (
@@ -10170,7 +10736,15 @@ class Trader:
                     status=ack_status,
                     requested_notional=result.requested_notional or notional_to_use,
                     requested_price=result.requested_price or 0.0,
-                    metadata=dict(getattr(result, "metadata", {}) or {}),
+                    metadata=dict(getattr(result, "metadata", {}) or {})
+                    | {
+                        "pending_class": "submit_unknown",
+                        "probe_confidence": probe_confidence,
+                        "probe_basis": probe_basis,
+                        "manual_required_reason": manual_required_reason,
+                        "unknown_submit_first_seen_ts": int(ack_state.get("first_ts") or 0),
+                        "unknown_submit_probe_count": int(ack_state.get("count") or 0),
+                    },
                 )
                 pending_record = self._register_pending_order(
                     signal=sig,
@@ -10182,9 +10756,15 @@ class Trader:
                     order_reason=self._order_reason(sig, result.message),
                     now=now,
                 )
-                pending_record["ack_unknown_count"] = int(ack_state.get("count") or 0)
-                pending_record["ack_unknown_first_ts"] = int(ack_state.get("first_ts") or 0)
-                pending_record["recovery_status"] = ack_status
+                self._apply_submit_unknown_contract(
+                    pending_record,
+                    now=now,
+                    probe_confidence=probe_confidence,
+                    probe_basis=probe_basis,
+                    manual_required_reason=manual_required_reason,
+                    ack_state=ack_state,
+                    payload=payload_updates,
+                )
                 self._append_event(
                     "order_ack_unknown",
                     {
@@ -10197,6 +10777,9 @@ class Trader:
                         "ack_unknown_count": ack_state.get("count"),
                         "ack_unknown_first_ts": ack_state.get("first_ts"),
                         "intent_status": ack_status,
+                        "probe_confidence": probe_confidence,
+                        "probe_basis": probe_basis,
+                        "manual_required_reason": manual_required_reason,
                         **market_context,
                     },
                 )

@@ -229,8 +229,18 @@ class SecondExecutorTests(unittest.TestCase):
                     _writer_lock=pre_acquired_writer_lock,
                 )
 
+            args = SimpleNamespace(
+                once=True,
+                demo_mode=False,
+                demo_seed=42,
+                demo_max_ticks=20,
+                demo_tick_seconds=2,
+                demo_risk_suite=False,
+                demo_ledger_suite=False,
+            )
+
             with (
-                patch.object(main_mod.argparse.ArgumentParser, "parse_args", return_value=SimpleNamespace(once=True)),
+                patch.object(main_mod.argparse.ArgumentParser, "parse_args", return_value=args),
                 patch.object(main_mod, "Settings", return_value=settings),
                 patch.object(main_mod, "setup_logger"),
                 patch.object(main_mod.FileLock, "acquire", autospec=True, side_effect=_fake_acquire),

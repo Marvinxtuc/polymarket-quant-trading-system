@@ -35,6 +35,11 @@ class _CancelOpenOrdersClient:
         return True
 
 
+class _StringCancelClient:
+    def cancel_order(self, order_id):
+        return f"cancel submitted:{order_id}"
+
+
 class BrokerCancelTests(unittest.TestCase):
     def test_live_cancel_order_uses_delete_order_alias(self):
         broker = LiveClobBroker.__new__(LiveClobBroker)
@@ -94,8 +99,20 @@ class BrokerCancelTests(unittest.TestCase):
         assert results is not None
         self.assertEqual(len(results), 2)
         self.assertEqual([row["order_id"] for row in results], ["oid-a", "oid-b"])
-        self.assertTrue(all(row["status"] == "canceled" for row in results))
+        self.assertTrue(all(row["status"] == "requested" for row in results))
         self.assertEqual(broker.client.calls, ["cancel_open_orders"])
+
+    def test_live_cancel_string_response_stays_non_terminal(self):
+        broker = LiveClobBroker.__new__(LiveClobBroker)
+        broker.client = _StringCancelClient()
+
+        result = broker.cancel_order("oid-str")
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result["order_id"], "oid-str")
+        self.assertEqual(result["status"], "unknown")
+        self.assertTrue(result["ok"])
 
     def test_paper_cancel_methods_are_safe_and_simulated(self):
         broker = PaperBroker()

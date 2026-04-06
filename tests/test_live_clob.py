@@ -165,7 +165,7 @@ class LiveClobTests(unittest.TestCase):
         broker._signer_client = _FakeSignerClient()
         order_args = _FakeOrderArgs(token_id="token-1", price=0.44, size=2.0, side="BUY")
 
-        response = broker._create_and_post_order(order_args, tick_size=0.01, neg_risk=True)
+        response, submit_metadata = broker._create_and_post_order(order_args, tick_size=0.01, neg_risk=True)
 
         self.assertEqual(response["orderID"], "oid-demo")
         self.assertEqual(len(broker._signer_client.payloads), 1)
@@ -176,6 +176,11 @@ class LiveClobTests(unittest.TestCase):
         self.assertEqual(payload["chain_id"], 137)
         self.assertEqual(payload["funder_address"], "0xabc")
         self.assertEqual(broker.client.last_signed, {"signed_payload": payload})
+        self.assertEqual(float(submit_metadata["submitted_price"]), 0.44)
+        self.assertEqual(float(submit_metadata["submitted_size"]), 2.0)
+        self.assertEqual(float(submit_metadata["tick_size"]), 0.01)
+        self.assertEqual(str(submit_metadata["submit_digest_version"]), "sdig-v1")
+        self.assertTrue(bool(str(submit_metadata["submit_digest"])))
 
     def test_create_and_post_order_wraps_unexpected_signer_exception(self):
         class _BrokenSigner:

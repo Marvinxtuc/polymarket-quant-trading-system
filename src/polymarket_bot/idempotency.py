@@ -22,6 +22,7 @@ INTENT_STATUS_REJECTED = "rejected"
 INTENT_STATUS_FAILED = "failed"
 INTENT_STATUS_ACK_UNKNOWN = "ack_unknown"
 INTENT_STATUS_MANUAL_REQUIRED = "manual_required"
+SUBMIT_DIGEST_VERSION = "sdig-v1"
 
 NON_TERMINAL_STATUSES = {
     INTENT_STATUS_NEW,
@@ -81,3 +82,30 @@ def build_intent_idempotency_key(
         digest.update(str(salt).encode("utf-8"))
     digest.update(encoded.encode("utf-8"))
     return digest.hexdigest()
+
+
+def canonicalize_submit_payload(payload: object) -> str:
+    """
+    Canonical JSON used for submit-digest generation.
+
+    Rules:
+    - dict keys sorted recursively
+    - array order preserved
+    - no whitespace
+    - UTF-8 JSON
+    - NaN/Infinity rejected
+    """
+
+    return json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def build_submit_digest(payload: object) -> tuple[str, str]:
+    canonical = canonicalize_submit_payload(payload)
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return (digest, SUBMIT_DIGEST_VERSION)
