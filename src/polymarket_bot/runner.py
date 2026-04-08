@@ -1131,7 +1131,6 @@ class Trader:
         signal_token = str(signal.token_id or payload.get("token_id") or "").strip().lower()
         signal_side = str(signal.side or payload.get("side") or "").strip().upper()
         exact_candidates: dict[str, dict[str, object]] = {}
-        partial_matches = 0
 
         if broker_order_id:
             get_order_status = getattr(self.broker, "get_order_status", None)
@@ -1176,7 +1175,6 @@ class Trader:
                 }
             if snapshot_token != signal_token or snapshot_side != signal_side:
                 continue
-            partial_matches += 1
             if tick_size <= 0.0 or submitted_price <= 0.0 or submitted_size <= 0.0:
                 continue
             if first_seen_ts <= 0 or int(snapshot.created_ts or 0) <= 0:
@@ -1228,7 +1226,6 @@ class Trader:
                 }
             if fill_token != signal_token or fill_side != signal_side:
                 continue
-            partial_matches += 1
             if tick_size <= 0.0 or submitted_price <= 0.0 or submitted_size <= 0.0:
                 continue
             if first_seen_ts <= 0 or int(fill.timestamp or 0) <= 0:
@@ -1268,24 +1265,6 @@ class Trader:
                 "intent_status": INTENT_STATUS_ACK_UNKNOWN,
                 "broker_status": "",
                 "manual_required_reason": "submit_unknown_ambiguous_match",
-            }
-        if partial_matches > 1:
-            return {
-                "confidence": "weak",
-                "basis": "ambiguous_broker_record_match",
-                "broker_order_id": "",
-                "intent_status": INTENT_STATUS_ACK_UNKNOWN,
-                "broker_status": "",
-                "manual_required_reason": "submit_unknown_conflicting_evidence",
-            }
-        if partial_matches == 1:
-            return {
-                "confidence": "weak",
-                "basis": "ambiguous_broker_record_match",
-                "broker_order_id": "",
-                "intent_status": INTENT_STATUS_ACK_UNKNOWN,
-                "broker_status": "",
-                "manual_required_reason": "",
             }
         if submit_digest:
             return {

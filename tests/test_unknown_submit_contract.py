@@ -214,7 +214,7 @@ class UnknownSubmitContractTests(unittest.TestCase):
         self.assertEqual(str(pending["manual_required_reason"]), "submit_unknown_no_anchor")
         self.assertEqual(trader._intent_pending_status_from_order(pending), INTENT_STATUS_MANUAL_REQUIRED)
 
-    def test_submit_unknown_conflicting_evidence_manual_required(self):
+    def test_submit_unknown_multiple_anchored_matches_are_ambiguous(self):
         first_seen = int(time.time())
         signal = build_signal(token_id="token-conflict", side="BUY")
         broker = DummyBroker(
@@ -252,7 +252,7 @@ class UnknownSubmitContractTests(unittest.TestCase):
                 "payload": {
                     "submitted_price": float(signal.price_hint),
                     "submitted_size": 1.0,
-                    "tick_size": 0.0,
+                    "tick_size": 0.01,
                     "unknown_submit_first_seen_ts": first_seen,
                     "submit_digest": "digest-conflict",
                 }
@@ -260,7 +260,57 @@ class UnknownSubmitContractTests(unittest.TestCase):
         )
 
         self.assertEqual(str(probe["confidence"]), "weak")
-        self.assertEqual(str(probe["manual_required_reason"]), "submit_unknown_conflicting_evidence")
+        self.assertEqual(str(probe["basis"]), "ambiguous_broker_record_match")
+        self.assertEqual(str(probe["manual_required_reason"]), "submit_unknown_ambiguous_match")
+
+    def test_submit_unknown_unanchored_same_token_activity_falls_back_to_digest(self):
+        first_seen = int(time.time())
+        signal = build_signal(token_id="token-unanchored", side="BUY")
+        broker = DummyBroker(
+            open_orders=[
+                OpenOrderSnapshot(
+                    order_id="oid-stale-open",
+                    token_id=str(signal.token_id),
+                    side="BUY",
+                    status="live",
+                    price=float(signal.price_hint),
+                    original_size=1.0,
+                    remaining_size=1.0,
+                    created_ts=first_seen - 3600,
+                    condition_id=str(signal.condition_id),
+                    market_slug=str(signal.market_slug),
+                )
+            ],
+            fills=[
+                OrderFillSnapshot(
+                    order_id="oid-wrong-fill",
+                    token_id=str(signal.token_id),
+                    side="BUY",
+                    price=float(signal.price_hint) + 0.02,
+                    size=2.0,
+                    timestamp=first_seen,
+                    market_slug=str(signal.market_slug),
+                )
+            ],
+        )
+        trader = _make_trader(workdir=new_tmp_dir(), broker=broker, dry_run=False)
+
+        probe = trader._classify_unknown_submit_probe(
+            signal=signal,
+            intent_record={
+                "payload": {
+                    "submitted_price": float(signal.price_hint),
+                    "submitted_size": 1.0,
+                    "tick_size": 0.01,
+                    "unknown_submit_first_seen_ts": first_seen,
+                    "submit_digest": "digest-unanchored",
+                }
+            },
+        )
+
+        self.assertEqual(str(probe["confidence"]), "weak")
+        self.assertEqual(str(probe["basis"]), "submit_digest_only")
+        self.assertEqual(str(probe["manual_required_reason"]), "")
 
     def test_existing_manual_required_blocks_new_intent_and_resend(self):
         workdir = new_tmp_dir()
