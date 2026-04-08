@@ -152,7 +152,7 @@ rehearse-progress:
 	@tail -n 20 "$$(PYTHONPATH=src $(PYTHON) scripts/runtime_paths.py rehearsal_10h_out_path)"
 
 rehearse-24h-progress:
-	@DEFAULT_OUT="$$(PYTHONPATH=src $(PYTHON) scripts/runtime_paths.py rehearsal_24h_out_path)"; \
+	@DEFAULT_OUT="$$(PYTHONPATH=src $(PYTHON) scripts/runtime_paths.py rehearsal_24h_dry_run_out_path)"; \
 		tail -n 20 "$${REHEARSE_24H_OUT:-$$DEFAULT_OUT}"
 
 run-once:
