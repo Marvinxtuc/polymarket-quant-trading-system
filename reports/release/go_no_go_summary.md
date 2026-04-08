@@ -1,9 +1,9 @@
 # Release Go/No-Go Summary
 
 - Decision: **GO**
-- Timestamp (UTC): `2026-04-06T07:16:26.707690+00:00`
-- Git Branch: `main`
-- Git Commit: `453155977a0ad23ad97364f6fe7b59c172b61a04`
+- Timestamp (UTC): `2026-04-08T05:27:22.418485+00:00`
+- Git Branch: `codex/submit-unknown-hardening`
+- Git Commit: `fbaf8da41275a6a2c8d26aa1d0757defa4ee6a9f`
 - Command: `bash scripts/gates/gate_release_readiness.sh`
 
 ## Required Blocks
