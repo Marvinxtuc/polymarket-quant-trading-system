@@ -26,9 +26,16 @@
 - 以下都视为**不安全**：
   - broker 仍存在 BUY open order；
   - 订单状态为 `cancel_requested/requested/queued/pending_cancel`；
+  - 取消接口仅返回 `unknown/cancel_unknown/ambiguous`，但 broker 终态仍未确认；
   - 仅本地 pending 清空但 broker 无终态证据。
 - 以下才视为**安全**：
   - broker BUY 订单全部终态（如 `canceled/filled/rejected/failed/expired`），且无 non-terminal BUY。
+
+## Cancel Unknown Handling
+- 若 broker cancel 返回 `requested`，系统记录为非终态取消请求，继续等待 broker 终态。
+- 若 broker cancel 返回 `unknown`，系统记录 `broker_status=cancel_unknown`，语义是“请求是否生效不确定”。
+- `cancel_unknown` 不得被解释为已取消、已安全或可恢复 BUY。
+- 在 `cancel_unknown` 场景下，值守动作应是继续查询 broker 终态；若多轮查询后仍无锚点，按人工介入处理。
 
 ## 重启恢复
 - kill switch inflight 状态持久化到 SQLite runtime truth（`runtime_state.kill_switch`）。

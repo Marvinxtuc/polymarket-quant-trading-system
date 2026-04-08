@@ -13,6 +13,7 @@ from typing import Any, Callable
 
 from polymarket_bot.brokers.base import Broker
 from polymarket_bot.clients.data_api import PolymarketDataClient
+from polymarket_bot.idempotency import build_submit_digest
 from polymarket_bot.models import SignerStatusSnapshot
 from polymarket_bot.secrets import normalize_identity
 from polymarket_bot.signer_client import SignerClient, SignerClientError, SignerHealthSnapshot
@@ -273,6 +274,7 @@ class LiveClobBroker(Broker):
             from py_clob_client.client import ClobClient
             from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType, PartialCreateOrderOptions
             from py_clob_client.order_builder.constants import BUY, SELL
+            from py_clob_client.utilities import order_to_json
         except Exception as exc:  # pragma: no cover
             raise RuntimeError(
                 "py-clob-client not installed. Install with: pip install '.[live]'"
@@ -284,6 +286,7 @@ class LiveClobBroker(Broker):
         self._OrderType = OrderType
         self._PartialCreateOrderOptions = PartialCreateOrderOptions
         self._side_map = {"BUY": BUY, "SELL": SELL}
+        self._order_to_json = order_to_json
         self.market_client = market_client
         self.maker_buffer_ticks = max(0, int(maker_buffer_ticks))
         self._funder = str(funder or "").strip().lower()
@@ -653,7 +656,7 @@ class LiveClobBroker(Broker):
         *,
         tick_size: float,
         neg_risk: bool,
-    ) -> object:
+    ) -> tuple[object, dict[str, object]]:
         order_payload = {
             "token_id": str(getattr(order_args, "token_id", "") or ""),
             "price": float(self._safe_float(getattr(order_args, "price", 0.0), 0.0)),
@@ -674,7 +677,43 @@ class LiveClobBroker(Broker):
                 str(exc),
                 reason_code="signer_sign_order_failed",
             ) from exc
-        return self.client.post_order(signed, self._OrderType.GTC)
+        submit_metadata: dict[str, object] = {
+            "submitted_price": float(order_payload["price"]),
+            "submitted_size": float(order_payload["size"]),
+            "tick_size": float(tick_size or 0.0),
+        }
+        try:
+            owner = ""
+            get_address = getattr(self.client, "get_address", None)
+            if callable(get_address):
+                owner = str(get_address() or "").strip()
+            if not owner:
+                owner = str(getattr(self, "_funder", "") or "").strip()
+            order_to_json = getattr(self, "_order_to_json", None)
+            if callable(order_to_json):
+                submit_body = order_to_json(signed, owner, self._OrderType.GTC, False)
+            else:
+                submit_body = {
+                    "order": signed.dict() if hasattr(signed, "dict") else signed,
+                    "owner": owner,
+                    "orderType": self._OrderType.GTC,
+                    "postOnly": False,
+                }
+            submit_digest, submit_digest_version = build_submit_digest(submit_body)
+            submit_metadata.update(
+                {
+                    "submit_digest": submit_digest,
+                    "submit_digest_version": submit_digest_version,
+                }
+            )
+        except Exception:
+            submit_metadata.update(
+                {
+                    "submit_digest": "",
+                    "submit_digest_version": "",
+                }
+            )
+        return (self.client.post_order(signed, self._OrderType.GTC), submit_metadata)
 
     @staticmethod
     def _parse_timestamp(value: object) -> int:
@@ -911,7 +950,7 @@ class LiveClobBroker(Broker):
                     rows.append(
                         self._cancel_result(
                             fallback_order_id,
-                            status="canceled" if item else "failed",
+                            status="requested" if item else "failed",
                             ok=bool(item),
                             message=default_message if item else "live cancel rejected",
                             method=method,
@@ -923,7 +962,7 @@ class LiveClobBroker(Broker):
                 rows.append(
                     self._cancel_result(
                         fallback_order_id,
-                        status="canceled" if fallback_order_id else "requested",
+                        status="unknown",
                         ok=True,
                         message=message,
                         method=method,
@@ -974,10 +1013,14 @@ class LiveClobBroker(Broker):
             success = response.get("success")
             if success is False:
                 status = "failed"
+            elif status in {"submitted", "posted", "open", "live", "delayed", "accepted", "pending", "queued", "requested", "cancel_requested"}:
+                status = "requested"
+            elif status in {"unknown", "ambiguous", "indeterminate"}:
+                status = "unknown"
             elif success is True and not status:
-                status = "canceled"
+                status = "requested"
             if not status:
-                status = "canceled" if order_id else "requested"
+                status = "unknown"
             ok = status not in {"failed", "rejected", "error", "unsupported"}
             message = str(response.get("message") or response.get("error") or default_message or "").strip()
             if not message and ok:
@@ -996,7 +1039,7 @@ class LiveClobBroker(Broker):
         if isinstance(response, bool):
             if not order_ids:
                 return None
-            status = "canceled" if response else "failed"
+            status = "requested" if response else "failed"
             message = default_message if response else "live cancel rejected"
             return [
                 self._cancel_result(
@@ -1012,27 +1055,16 @@ class LiveClobBroker(Broker):
 
         if isinstance(response, str):
             message = response.strip() or default_message
-            if not order_ids:
-                return [
-                    self._cancel_result(
-                        "",
-                        status="requested",
-                        ok=True,
-                        message=message,
-                        method=method,
-                        raw=response,
-                    )
-                ]
             return [
                 self._cancel_result(
                     order_id,
-                    status="canceled",
+                    status="unknown",
                     ok=True,
                     message=message,
                     method=method,
                     raw=response,
                 )
-                for order_id in order_ids
+                for order_id in (order_ids or [""])
             ]
 
         if response is None:
@@ -1042,7 +1074,7 @@ class LiveClobBroker(Broker):
         return [
             self._cancel_result(
                 order_id,
-                status="canceled",
+                status="unknown",
                 ok=True,
                 message=default_message,
                 method=method,
@@ -1136,7 +1168,7 @@ class LiveClobBroker(Broker):
                 rows.append(
                     self._cancel_result(
                         order_id,
-                        status="canceled",
+                        status="unknown",
                         ok=True,
                         message="live cancel requested",
                         method="cancel_order",
@@ -1205,7 +1237,7 @@ class LiveClobBroker(Broker):
         return [
             self._cancel_result(
                 order_id,
-                status="canceled",
+                status="unknown",
                 ok=True,
                 message="live cancel-all requested",
                 method="cancel_open_orders",
@@ -1717,6 +1749,7 @@ class LiveClobBroker(Broker):
         price: float,
         preflight_snapshot: dict[str, float | bool | str] | None = None,
         strategy_order_uuid: str | None = None,
+        submit_metadata: dict[str, object] | None = None,
     ) -> ExecutionResult:
         order_id = None
         message = "live order posted"
@@ -1780,6 +1813,10 @@ class LiveClobBroker(Broker):
         metadata: dict[str, object] = {}
         if strategy_order_uuid:
             metadata["strategy_order_uuid"] = strategy_order_uuid
+        if submit_metadata:
+            metadata.update(dict(submit_metadata))
+        if ok and not str(order_id or "").strip():
+            metadata["ack_unknown"] = True
         if preflight_snapshot:
             best_bid = self._safe_float(preflight_snapshot.get("best_bid"))
             best_ask = self._safe_float(preflight_snapshot.get("best_ask"))
@@ -1886,7 +1923,7 @@ class LiveClobBroker(Broker):
         )
 
         try:
-            resp = self._create_and_post_order(
+            resp, submit_metadata = self._create_and_post_order(
                 order_args,
                 tick_size=self._safe_float(snapshot.get("tick_size"), 0.01),
                 neg_risk=bool(snapshot.get("neg_risk")),
@@ -1976,4 +2013,5 @@ class LiveClobBroker(Broker):
             price=price,
             preflight_snapshot=snapshot,
             strategy_order_uuid=strategy_order_uuid,
+            submit_metadata=submit_metadata,
         )

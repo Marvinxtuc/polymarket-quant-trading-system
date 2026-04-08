@@ -44,6 +44,50 @@ Rules:
 - `MANUAL_REQUIRED` is blocking non-terminal and keeps the same strategy intent locked until manual intervention
 - broker-open probe hit: set `ACKED_PENDING` and keep same `strategy_order_uuid`
 
+## Submit-Unknown Contract
+When live submit returns success without a durable broker order id, the system must not treat that path as a normal posted order.
+
+Required runtime payload fields:
+- `pending_class=submit_unknown`
+- `submit_digest`
+- `submit_digest_version=sdig-v1`
+- `submitted_price`
+- `submitted_size`
+- `tick_size`
+- `unknown_submit_first_seen_ts`
+- `unknown_submit_probe_count`
+- `probe_confidence`
+- `probe_basis`
+- `manual_required_reason`
+
+Evidence classes:
+- `strong`
+  - broker order id resolves directly, or exactly one broker record matches token/side/price/size/time window
+  - action: recover same intent to `ACKED_PENDING|PARTIAL|FILLED`; never create a second intent
+- `weak`
+  - only `submit_digest` or incomplete broker evidence exists
+  - action: keep same intent blocked in `ACK_UNKNOWN`; continue bounded probe loop only
+- `none`
+  - no stable broker anchor exists
+  - action: promote to `MANUAL_REQUIRED` with explicit reason; auto resend remains forbidden
+
+Probe basis values:
+- `broker_order_id`
+- `unique_broker_record_match`
+- `ambiguous_broker_record_match`
+- `submit_digest_only`
+- `no_match`
+
+Manual-required reasons:
+- `submit_unknown_no_anchor`
+- `submit_unknown_probe_exhausted`
+- `submit_unknown_ambiguous_match`
+- `submit_unknown_conflicting_evidence`
+
+Operator rule:
+- `MANUAL_REQUIRED` means the same idempotency key is still locked.
+- Do not retry by forcing a new BUY on the same signal key until the broker/order truth is manually reconciled and the blocking intent is closed out.
+
 ## Behavior Verification
 Run tests:
 ```bash
@@ -51,6 +95,7 @@ PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_idempoten
 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_duplicate_executor_same_signal.py"
 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_timeout_retry_reuses_same_intent.py"
 PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_restart_does_not_duplicate_orders.py"
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -p "test_unknown_submit_contract.py"
 ```
 
 Run behavior scripts:
