@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import re
 import subprocess
 import sys
@@ -17,52 +16,22 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from polymarket_bot.config import Settings, build_runtime_artifact_paths
 from polymarket_bot.i18n import t as i18n_t
-
-DEFAULT_RUNTIME_ROOT = "/tmp/poly_runtime_data"
 
 
 def _finalize_t(key: str, params: dict[str, object] | None = None, *, fallback: str = "") -> str:
     return i18n_t(f"report.rehearsalFinalize.{key}", dict(params or {}), fallback=fallback)
 
 
-def _read_dotenv_var(key: str) -> str:
-    dotenv = ROOT / ".env"
-    try:
-        lines = dotenv.read_text(encoding="utf-8").splitlines()
-    except Exception:
-        return ""
-    prefix = f"{key}="
-    for raw in lines:
-        line = raw.strip()
-        if not line or line.startswith("#") or not line.startswith(prefix):
-            continue
-        value = line[len(prefix) :].strip()
-        if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
-            value = value[1:-1]
-        return value
-    return ""
-
-
-def _sanitize_runtime_identity(value: str) -> str:
-    text = str(value or "").strip().lower()
-    if not text:
-        return "default"
-    sanitized = re.sub(r"[^a-z0-9_-]+", "-", text).strip("-")
-    return sanitized or "default"
-
-
 def _default_paths() -> dict[str, str]:
-    runtime_root = str(os.getenv("RUNTIME_ROOT_PATH", "")).strip() or _read_dotenv_var("RUNTIME_ROOT_PATH") or DEFAULT_RUNTIME_ROOT
-    funder = str(os.getenv("FUNDER_ADDRESS", "")).strip() or _read_dotenv_var("FUNDER_ADDRESS")
-    live_identity = _sanitize_runtime_identity(funder or "default")
-    live_runtime_dir = str(Path(runtime_root).expanduser() / "live" / live_identity)
-    paper_runtime_dir = str(Path(runtime_root).expanduser() / "paper" / "default")
+    live_paths = build_runtime_artifact_paths(Settings(dry_run=False))
+    paper_paths = build_runtime_artifact_paths(Settings(dry_run=True))
     return {
-        "live_runtime_dir": live_runtime_dir,
-        "paper_runtime_dir": paper_runtime_dir,
-        "rehearsal_path": str(Path(paper_runtime_dir) / "24h_dry_run_rehearsal.txt"),
-        "output_path": str(Path(live_runtime_dir) / "rehearsal_finalize_report.json"),
+        "live_runtime_dir": str(live_paths["runtime_dir"]),
+        "paper_runtime_dir": str(paper_paths["runtime_dir"]),
+        "rehearsal_path": str(paper_paths["rehearsal_24h_dry_run_out_path"]),
+        "output_path": str(Path(live_paths["runtime_dir"]) / "rehearsal_finalize_report.json"),
     }
 
 

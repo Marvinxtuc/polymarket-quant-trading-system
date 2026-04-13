@@ -249,6 +249,14 @@ class _AddressOnlySigner:
         return self._address
 
 
+class _SerializedSignedOrder:
+    def __init__(self, payload: dict[str, object]) -> None:
+        self._payload = dict(payload)
+
+    def dict(self) -> dict[str, object]:
+        return dict(self._payload)
+
+
 class LiveClobBroker(Broker):
     def __init__(
         self,
@@ -298,6 +306,7 @@ class LiveClobBroker(Broker):
         self._user_stream_url = str(user_stream_url or "").strip()
         self._signer_client = signer_client
         self._signer_health = signer_health
+        self._api_identity = normalize_identity(signer_health.api_identity)
 
         if not self._funder:
             raise RuntimeError("funder address missing in live broker")
@@ -321,7 +330,8 @@ class LiveClobBroker(Broker):
             api_passphrase=api_passphrase_text,
         )
         self.client.set_api_creds(creds)
-        self.client.signer = _AddressOnlySigner(self._funder)
+        api_header_identity = self._api_identity or self._funder
+        self.client.signer = _AddressOnlySigner(api_header_identity)
         self.client.mode = self.client._get_client_mode()
         self._api_creds = {
             "apiKey": api_key_text,
@@ -345,6 +355,14 @@ class LiveClobBroker(Broker):
             else None
         )
 
+    def _proxy_identity_mode(self, *, signer_identity: str, api_identity: str) -> bool:
+        signature_type = int(getattr(self, "_signature_type", 0) or 0)
+        if signature_type != 2:
+            return False
+        if not signer_identity or not api_identity:
+            return False
+        return signer_identity == api_identity and signer_identity != self._funder
+
     def _validate_identity_binding(self) -> None:
         health = self._signer_health
         reason_codes: list[str] = []
@@ -352,14 +370,18 @@ class LiveClobBroker(Broker):
             reason_codes.append(str(health.reason_code or "signer_unhealthy"))
         signer_identity = normalize_identity(health.signer_identity)
         api_identity = normalize_identity(health.api_identity)
-        if signer_identity and signer_identity != self._funder:
-            reason_codes.append("signer_identity_mismatch")
-        if api_identity and api_identity != self._funder:
-            reason_codes.append("api_identity_mismatch")
-        if not signer_identity:
-            reason_codes.append("signer_identity_missing")
-        if not api_identity:
-            reason_codes.append("api_identity_missing")
+        self._api_identity = api_identity or str(getattr(self, "_api_identity", "") or "")
+        if self._proxy_identity_mode(signer_identity=signer_identity, api_identity=api_identity):
+            pass
+        else:
+            if signer_identity and signer_identity != self._funder:
+                reason_codes.append("signer_identity_mismatch")
+            if api_identity and api_identity != self._funder:
+                reason_codes.append("api_identity_mismatch")
+            if not signer_identity:
+                reason_codes.append("signer_identity_missing")
+            if not api_identity:
+                reason_codes.append("api_identity_missing")
         self._security_reason_codes = list(dict.fromkeys(reason_codes))
         if self._security_reason_codes:
             raise RuntimeError(
@@ -370,13 +392,28 @@ class LiveClobBroker(Broker):
         health = self._signer_health
         signer_identity = normalize_identity(health.signer_identity)
         api_identity = normalize_identity(health.api_identity)
+        proxy_identity_mode = self._proxy_identity_mode(signer_identity=signer_identity, api_identity=api_identity)
+        signer_identity_matched = bool(
+            signer_identity
+            and (
+                signer_identity == self._funder
+                or proxy_identity_mode
+            )
+        )
+        api_identity_matched = bool(
+            api_identity
+            and (
+                api_identity == self._funder
+                or proxy_identity_mode
+            )
+        )
         snapshot = SignerStatusSnapshot(
             live_mode=True,
             signer_required=True,
             signer_mode="external_http",
             signer_healthy=bool(health.healthy),
-            signer_identity_matched=bool(signer_identity and signer_identity == self._funder),
-            api_identity_matched=bool(api_identity and api_identity == self._funder),
+            signer_identity_matched=signer_identity_matched,
+            api_identity_matched=api_identity_matched,
             broker_identity_matched=bool(self._funder),
             raw_key_detected=False,
             funder_identity_present=bool(self._funder),
@@ -677,6 +714,8 @@ class LiveClobBroker(Broker):
                 str(exc),
                 reason_code="signer_sign_order_failed",
             ) from exc
+        if isinstance(signed, dict) and "signature" in signed:
+            signed = _SerializedSignedOrder(signed)
         submit_metadata: dict[str, object] = {
             "submitted_price": float(order_payload["price"]),
             "submitted_size": float(order_payload["size"]),
@@ -1316,7 +1355,7 @@ class LiveClobBroker(Broker):
                 try:
                     payload = get_open_orders(*args, **kwargs)
                     break
-                except TypeError:
+                except (TypeError, AttributeError):
                     continue
                 except Exception:
                     return None
@@ -1326,14 +1365,14 @@ class LiveClobBroker(Broker):
             if not callable(get_orders):
                 return None
             for args, kwargs in (
-                (({"status": "open"},), {}),
-                (tuple(), {"status": "open"}),
                 (tuple(), {}),
+                (tuple(), {"status": "open"}),
+                (({"status": "open"},), {}),
             ):
                 try:
                     payload = get_orders(*args, **kwargs)
                     break
-                except TypeError:
+                except (TypeError, AttributeError):
                     continue
                 except Exception:
                     return None
@@ -1473,7 +1512,7 @@ class LiveClobBroker(Broker):
             try:
                 payload = get_trades(*args, **kwargs)
                 break
-            except TypeError:
+            except (TypeError, AttributeError):
                 continue
             except Exception:
                 return None

@@ -2516,7 +2516,7 @@
       },
       "check": {
         "dryRunDisabled": "DRY_RUN=false is required for live smoke preflight",
-        "liveSecrets": "PRIVATE_KEY and FUNDER_ADDRESS must both be configured",
+        "liveSecrets": "FUNDER_ADDRESS, signer endpoint, and CLOB API credentials must be configured, and PRIVATE_KEY must be empty in live mode",
         "liveAdmissionFlags": "LIVE_ALLOWANCE_READY, LIVE_GEOBLOCK_READY, and LIVE_ACCOUNT_READY must all be true",
         "remoteAlertConfigured": "A remote alert channel must be configured before live smoke",
         "stateFilePresent": "The live state file must exist and be readable",

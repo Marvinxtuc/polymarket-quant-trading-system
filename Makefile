@@ -49,7 +49,7 @@ reconciliation-report:
 	PYTHONPATH=src $(PYTHON) scripts/generate_reconciliation_report.py
 
 full-validate:
-	PYTHONPATH=src $(PYTHON) scripts/full_flow_validate.py --bootstrap-stack
+	DRY_RUN=false PYTHONPATH=src $(PYTHON) scripts/full_flow_validate.py --bootstrap-stack
 
 fault-drill:
 	PYTHONPATH=src $(PYTHON) scripts/fault_drill.py
@@ -101,19 +101,19 @@ monitor-scheduler-smoke:
 	./scripts/verify_monitor_scheduler_nohup.sh
 
 alert-smoke:
-	PYTHONPATH=src $(PYTHON) scripts/verify_alert_delivery.py
+	DRY_RUN=false PYTHONPATH=src $(PYTHON) scripts/verify_alert_delivery.py
 
 alert-smoke-send:
-	PYTHONPATH=src $(PYTHON) scripts/verify_alert_delivery.py --send-remote
+	DRY_RUN=false PYTHONPATH=src $(PYTHON) scripts/verify_alert_delivery.py --send-remote
 
 alert-smoke-local:
-	PYTHONPATH=src $(PYTHON) scripts/verify_alert_delivery_local.py
+	DRY_RUN=false PYTHONPATH=src $(PYTHON) scripts/verify_alert_delivery_local.py
 
 live-smoke-preflight:
-	PYTHONPATH=src $(PYTHON) scripts/live_smoke_preflight.py
+	DRY_RUN=false PYTHONPATH=src $(PYTHON) scripts/live_smoke_preflight.py
 
 live-smoke:
-	./scripts/run_live_smoke.sh "$${LIVE_SMOKE_TOKEN_ID:-}"
+	DRY_RUN=false ./scripts/run_live_smoke.sh "$${LIVE_SMOKE_TOKEN_ID:-}"
 
 ops-12h:
 	@echo "==> Pre-production ops: 12h rapid debrief template"
@@ -152,7 +152,7 @@ rehearse-progress:
 	@tail -n 20 "$$(PYTHONPATH=src $(PYTHON) scripts/runtime_paths.py rehearsal_10h_out_path)"
 
 rehearse-24h-progress:
-	@DEFAULT_OUT="$$(PYTHONPATH=src $(PYTHON) scripts/runtime_paths.py rehearsal_24h_out_path)"; \
+	@DEFAULT_OUT="$$(PYTHONPATH=src $(PYTHON) scripts/runtime_paths.py rehearsal_24h_dry_run_out_path)"; \
 		tail -n 20 "$${REHEARSE_24H_OUT:-$$DEFAULT_OUT}"
 
 run-once:
