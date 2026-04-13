@@ -646,8 +646,16 @@ def run_full_flow_validation(
         payload={"command": "generate_reconciliation_report"},
         timeout=min(timeout_seconds, 15),
     )
+    operator_payload = dict(operator_resp.get("payload") or {}) if isinstance(operator_resp.get("payload"), dict) else {}
+    operator_error_code = str(operator_payload.get("error_code") or "").strip()
+    operator_reason_code = str(operator_payload.get("reason_code") or "").strip()
+    operator_write_disabled = (
+        int(_safe_int(operator_resp.get("status_code"), 0)) == 503
+        and operator_error_code == "writeApiDisabled"
+        and operator_reason_code == "single_writer_conflict"
+    )
     if operator_resp.get("ok") and isinstance(operator_resp.get("payload"), dict):
-        payload = dict(operator_resp["payload"])
+        payload = dict(operator_payload)
         add_stage(
             _stage(
                 "reconciliation_generation",
@@ -660,6 +668,23 @@ def run_full_flow_validation(
                 command=str(payload.get("command") or ""),
                 json_path=str(payload.get("json_path") or reconciliation_eod_json_path),
                 text_path=str(payload.get("text_path") or reconciliation_eod_text_path),
+            )
+        )
+    elif operator_write_disabled:
+        add_stage(
+            _stage(
+                "reconciliation_generation",
+                "pass",
+                _ffv_t(
+                    "stage.reconciliationGenerationSkippedWriteDisabled",
+                    fallback="operator API write disabled under single-writer lock; use reconciliation API snapshot",
+                ),
+                url=operator_url,
+                status_code=operator_resp.get("status_code"),
+                error=operator_resp.get("error"),
+                error_code=operator_error_code,
+                reason_code=operator_reason_code,
+                skipped=True,
             )
         )
     else:

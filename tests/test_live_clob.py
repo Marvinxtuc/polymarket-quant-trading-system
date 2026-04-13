@@ -224,6 +224,7 @@ class LiveClobTests(unittest.TestCase):
     def test_validate_identity_binding_rejects_mismatched_identities(self):
         broker = LiveClobBroker.__new__(LiveClobBroker)
         broker._funder = "0xabc123"
+        broker._signature_type = 0
         broker._signer_health = SimpleNamespace(
             healthy=True,
             signer_identity="0xdef456",
@@ -675,6 +676,7 @@ class LiveClobTests(unittest.TestCase):
             ):
                 broker = LiveClobBroker.__new__(LiveClobBroker)
                 broker._funder = "0xabc"
+                broker._signature_type = 0
                 broker._security_reason_codes = []
                 broker._signer_health = SignerHealthSnapshot(
                     healthy=True,
@@ -688,6 +690,23 @@ class LiveClobTests(unittest.TestCase):
                     broker._validate_identity_binding()
 
                 self.assertIn(expected_reason, broker._security_reason_codes)
+
+    def test_identity_binding_allows_proxy_mode_signature_type_2(self):
+        broker = LiveClobBroker.__new__(LiveClobBroker)
+        broker._funder = "0xproxy"
+        broker._signature_type = 2
+        broker._security_reason_codes = []
+        broker._signer_health = SignerHealthSnapshot(
+            healthy=True,
+            signer_identity="0xsigner",
+            api_identity="0xsigner",
+            reason_code="",
+            message="ok",
+        )
+
+        broker._validate_identity_binding()
+
+        self.assertEqual(broker._security_reason_codes, [])
 
 
 if __name__ == "__main__":

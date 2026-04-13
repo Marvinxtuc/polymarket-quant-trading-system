@@ -38,6 +38,14 @@ SIZE_QUANT = Decimal("0.01")
 USD_QUANT = Decimal("0.01")
 
 
+class _SerializedSignedOrder:
+    def __init__(self, payload: dict[str, Any]) -> None:
+        self._payload = dict(payload)
+
+    def dict(self) -> dict[str, Any]:
+        return dict(self._payload)
+
+
 def _load_env() -> None:
     if load_dotenv is not None:
         load_dotenv()
@@ -361,6 +369,8 @@ def _post_limit_order(
             "funder_address": str(broker._funder),
         }
         signed = broker._signer_client.sign_order(order_payload)
+        if isinstance(signed, dict) and "signature" in signed:
+            signed = _SerializedSignedOrder(signed)
         posted = broker.client.post_order(signed, order_type)
     else:
         if OrderArgs is None:
