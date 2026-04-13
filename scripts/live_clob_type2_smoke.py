@@ -13,13 +13,22 @@ try:
 except Exception:  # pragma: no cover
     load_dotenv = None
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OpenOrderParams, OrderArgs, OrderType, PartialCreateOrderOptions, TradeParams
-from py_clob_client.order_builder.constants import BUY, SELL
+from py_clob_client.clob_types import OpenOrderParams, TradeParams
+
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+SRC = ROOT / "src"
+if str(SRC) not in sys.path:
+    sys.path.insert(0, str(SRC))
+
+from polymarket_bot.brokers.live_clob import LiveClobBroker
+from polymarket_bot.config import Settings
+from polymarket_bot.secrets import resolve_live_secret_bundle
+from polymarket_bot.signer_client import build_signer_client
 
 
-HOST_DEFAULT = "https://clob.polymarket.com"
-CHAIN_ID_DEFAULT = 137
 SIZE_QUANT = Decimal("0.01")
 USD_QUANT = Decimal("0.01")
 
@@ -27,13 +36,6 @@ USD_QUANT = Decimal("0.01")
 def _load_env() -> None:
     if load_dotenv is not None:
         load_dotenv()
-
-
-def _require_env(name: str) -> str:
-    value = str(os.getenv(name, "")).strip()
-    if not value:
-        raise SystemExit(f"missing required env var: {name}")
-    return value
 
 
 def _as_float(value: Any, default: float = 0.0) -> float:
@@ -90,7 +92,7 @@ def _book_level(levels: Any, *, side: str) -> tuple[float, float]:
     return min(rows, key=lambda item: item[0])
 
 
-def _book_snapshot(client: ClobClient, token_id: str) -> dict[str, Any]:
+def _book_snapshot(client: object, token_id: str) -> dict[str, Any]:
     book = client.get_order_book(token_id)
     midpoint = client.get_midpoint(token_id)
     if book is None:
@@ -126,14 +128,6 @@ def _resting_buy_price(snapshot: dict[str, Any]) -> float:
     if best_ask > 0 and price >= best_ask:
         price = _floor_to_tick(max(tick_size, best_ask - tick_size), tick_size)
     return max(tick_size, min(0.99, price))
-
-
-def _order_options(snapshot: dict[str, Any]) -> PartialCreateOrderOptions:
-    return PartialCreateOrderOptions(
-        tick_size=str(snapshot["tick_text"]),
-        neg_risk=bool(snapshot["neg_risk"]),
-    )
-
 
 def _choose_aggressive_buy_size(price: float, *, min_size: float, target_usd: float, max_usd: float) -> tuple[float, float]:
     price_dec = Decimal(str(max(0.0, price)))
@@ -252,7 +246,7 @@ def _trade_size(row: dict[str, Any]) -> float:
     return 0.0
 
 
-def _matching_trades(client: ClobClient, order_id: str, funder: str, after_ts: int) -> list[dict[str, Any]]:
+def _matching_trades(client: object, order_id: str, funder: str, after_ts: int) -> list[dict[str, Any]]:
     params = TradeParams(after=max(0, int(after_ts) - 5))
     rows = client.get_trades(params)
     if not isinstance(rows, list):
@@ -267,7 +261,7 @@ def _matching_trades(client: ClobClient, order_id: str, funder: str, after_ts: i
     return matches
 
 
-def _summarize_order(client: ClobClient, order_id: str, funder: str, after_ts: int, fallback_price: float = 0.0) -> dict[str, Any]:
+def _summarize_order(client: object, order_id: str, funder: str, after_ts: int, fallback_price: float = 0.0) -> dict[str, Any]:
     order_row = client.get_order(order_id)
     trades = _matching_trades(client, order_id, funder, after_ts)
     matched_from_order = _matched_size_from_order(order_row if isinstance(order_row, dict) else {}, fallback_price)
@@ -280,24 +274,60 @@ def _summarize_order(client: ClobClient, order_id: str, funder: str, after_ts: i
     }
 
 
+def _build_live_broker() -> LiveClobBroker:
+    settings = Settings(dry_run=False)
+    bundle = resolve_live_secret_bundle(settings)
+    signer_client = build_signer_client(bundle)
+    signer_health = signer_client.health_check()
+    return LiveClobBroker(
+        host=settings.polymarket_clob_host,
+        chain_id=settings.chain_id,
+        funder=bundle.funder_address,
+        signer_client=signer_client,
+        signer_health=signer_health,
+        api_key=bundle.clob_api_key,
+        api_secret=bundle.clob_api_secret,
+        api_passphrase=bundle.clob_api_passphrase,
+        market_client=None,
+        signature_type=settings.clob_signature_type,
+        user_stream_enabled=False,
+    )
+
+
 def _post_limit_order(
-    client: ClobClient,
+    broker: LiveClobBroker,
     *,
     token_id: str,
     side: str,
     price: float,
     size: float,
     order_type: str,
-    options: PartialCreateOrderOptions,
+    tick_size: float,
+    neg_risk: bool,
 ) -> tuple[str, dict[str, Any]]:
-    order = OrderArgs(
+    normalized_side = str(side or "").strip().upper()
+    if normalized_side not in broker._side_map:
+        raise SystemExit(f"unsupported side: {side}")
+
+    order = broker._OrderArgs(
         token_id=token_id,
         price=price,
         size=size,
-        side=side,
+        side=broker._side_map[normalized_side],
     )
-    signed = client.create_order(order, options=options)
-    posted = client.post_order(signed, order_type)
+    order_payload = {
+        "token_id": str(getattr(order, "token_id", "") or ""),
+        "price": float(_as_float(getattr(order, "price", 0.0), 0.0)),
+        "size": float(_as_float(getattr(order, "size", 0.0), 0.0)),
+        "side": str(getattr(order, "side", "") or ""),
+        "fee_rate_bps": int(_as_float(getattr(order, "fee_rate_bps", 0), 0.0)),
+        "tick_size": float(_as_float(tick_size, 0.01)),
+        "neg_risk": bool(neg_risk),
+        "chain_id": int(broker._chain_id),
+        "funder_address": str(broker._funder),
+    }
+    signed = broker._signer_client.sign_order(order_payload)
+    posted = broker.client.post_order(signed, order_type)
     if not isinstance(posted, dict):
         raise SystemExit(f"unexpected post_order response: {posted!r}")
     order_id = _extract_order_id(posted)
@@ -326,7 +356,7 @@ def _is_retryable_sell_error(exc: Exception) -> bool:
 
 
 def _post_aggressive_sell_with_retries(
-    client: ClobClient,
+    broker: LiveClobBroker,
     *,
     token_id: str,
     filled_buy_size: float,
@@ -335,17 +365,19 @@ def _post_aggressive_sell_with_retries(
 ) -> tuple[str, dict[str, Any], float, float]:
     last_exc: Exception | None = None
     for attempt in range(max(1, int(attempts))):
+        client = broker.client
         snapshot = _book_snapshot(client, token_id)
         aggressive_sell_price, sell_size = _build_aggressive_sell(snapshot, filled_buy_size)
         try:
             aggressive_sell_id, aggressive_sell_post = _post_limit_order(
-                client,
+                broker,
                 token_id=token_id,
-                side=SELL,
+                side="SELL",
                 price=aggressive_sell_price,
                 size=sell_size,
-                order_type=OrderType.FAK,
-                options=_order_options(snapshot),
+                order_type=broker._OrderType.FAK,
+                tick_size=float(snapshot["tick_size"]),
+                neg_risk=bool(snapshot["neg_risk"]),
             )
             return aggressive_sell_id, aggressive_sell_post, aggressive_sell_price, sell_size
         except Exception as exc:
@@ -369,7 +401,7 @@ def _json_dump(label: str, payload: Any) -> None:
 def main() -> int:
     _load_env()
 
-    parser = argparse.ArgumentParser(description="Minimal live py-clob-client smoke test for type2/proxy wallets.")
+    parser = argparse.ArgumentParser(description="Minimal live smoke test through the configured signer boundary.")
     parser.add_argument("--token-id", required=True, help="Conditional token id to trade.")
     parser.add_argument("--resting-usd", type=float, default=1.0, help="Approx notional for the resting BUY.")
     parser.add_argument("--aggressive-usd", type=float, default=1.0, help="Approx notional for aggressive BUY/SELL.")
@@ -381,32 +413,20 @@ def main() -> int:
     if not args.yes_live:
         raise SystemExit("refusing to submit live orders without --yes-live")
 
-    host = str(os.getenv("POLYMARKET_CLOB_HOST") or os.getenv("CLOB_HOST") or HOST_DEFAULT).strip()
-    chain_id = int(os.getenv("CHAIN_ID") or CHAIN_ID_DEFAULT)
-    signature_type = int(os.getenv("CLOB_SIGNATURE_TYPE") or 2)
-    private_key = _require_env("PRIVATE_KEY")
-    funder = _normalize_address(_require_env("FUNDER_ADDRESS"))
+    broker = _build_live_broker()
+    client = broker.client
+    funder = _normalize_address(broker._funder)
     token_id = str(args.token_id).strip()
-
-    client = ClobClient(
-        host,
-        chain_id=chain_id,
-        key=private_key,
-        signature_type=signature_type,
-        funder=funder,
-    )
-    creds = client.create_or_derive_api_creds()
-    client.set_api_creds(creds)
 
     _json_dump(
         "auth",
         {
-            "host": host,
-            "chain_id": chain_id,
-            "signature_type": signature_type,
-            "signer_address": client.get_address(),
+            "host": broker._host,
+            "chain_id": broker._chain_id,
+            "signature_type": broker._signature_type,
+            "signer_address": getattr(client, "get_address", lambda: "")(),
             "funder_address": funder,
-            "api_creds_ready": bool(getattr(creds, "api_key", "")),
+            "api_creds_ready": True,
         },
     )
 
@@ -428,16 +448,16 @@ def main() -> int:
 
     resting_price = _resting_buy_price(snapshot)
     resting_size = _ceil_size(max(snapshot["min_order_size"], float(args.resting_usd) / resting_price))
-    resting_options = _order_options(snapshot)
     resting_started = int(time.time())
     resting_id, resting_post = _post_limit_order(
-        client,
+        broker,
         token_id=token_id,
-        side=BUY,
+        side="BUY",
         price=resting_price,
         size=resting_size,
-        order_type=OrderType.GTC,
-        options=resting_options,
+        order_type=broker._OrderType.GTC,
+        tick_size=float(snapshot["tick_size"]),
+        neg_risk=bool(snapshot["neg_risk"]),
     )
     _json_dump(
         "resting_buy_post",
@@ -459,7 +479,7 @@ def main() -> int:
         },
     )
 
-    cancel_response = client.cancel(resting_id)
+    cancel_response = broker.cancel_order(resting_id)
     _json_dump("resting_buy_cancel", cancel_response)
     time.sleep(max(0.0, args.sleep_seconds))
     _json_dump("resting_buy_after_cancel", _summarize_order(client, resting_id, funder, resting_started, resting_price))
@@ -481,13 +501,14 @@ def main() -> int:
 
     aggressive_buy_started = int(time.time())
     aggressive_buy_id, aggressive_buy_post = _post_limit_order(
-        client,
+        broker,
         token_id=token_id,
-        side=BUY,
+        side="BUY",
         price=aggressive_buy_price,
         size=aggressive_size,
-        order_type=OrderType.FAK,
-        options=_order_options(snapshot),
+        order_type=broker._OrderType.FAK,
+        tick_size=float(snapshot["tick_size"]),
+        neg_risk=bool(snapshot["neg_risk"]),
     )
     _json_dump(
         "aggressive_buy_post",
@@ -514,7 +535,7 @@ def main() -> int:
 
     aggressive_sell_started = int(time.time())
     aggressive_sell_id, aggressive_sell_post, aggressive_sell_price, sell_size = _post_aggressive_sell_with_retries(
-        client,
+        broker,
         token_id=token_id,
         filled_buy_size=filled_buy_size,
         sleep_seconds=float(args.sleep_seconds),
