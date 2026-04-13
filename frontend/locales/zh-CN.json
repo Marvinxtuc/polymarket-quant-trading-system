@@ -2516,7 +2516,7 @@
       },
       "check": {
         "dryRunDisabled": "实盘 smoke 预检要求 DRY_RUN=false",
-        "liveSecrets": "必须同时配置 PRIVATE_KEY 与 FUNDER_ADDRESS",
+        "liveSecrets": "必须配置 FUNDER_ADDRESS、signer 端点与 CLOB API 凭证，且实盘模式下 PRIVATE_KEY 必须留空",
         "liveAdmissionFlags": "LIVE_ALLOWANCE_READY、LIVE_GEOBLOCK_READY、LIVE_ACCOUNT_READY 必须全部为 true",
         "remoteAlertConfigured": "实盘 smoke 前必须先配置远程告警通道",
         "stateFilePresent": "实盘状态文件必须存在且可读取",

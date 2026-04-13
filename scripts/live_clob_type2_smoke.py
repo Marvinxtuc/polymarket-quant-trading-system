@@ -13,7 +13,12 @@ try:
 except Exception:  # pragma: no cover
     load_dotenv = None
 
-from py_clob_client.clob_types import OpenOrderParams, TradeParams
+try:
+    from py_clob_client.clob_types import OpenOrderParams, OrderArgs, TradeParams
+except Exception:  # pragma: no cover
+    from py_clob_client.clob_types import OpenOrderParams, TradeParams
+
+    OrderArgs = None  # type: ignore[assignment]
 
 from pathlib import Path
 import sys
@@ -128,6 +133,30 @@ def _resting_buy_price(snapshot: dict[str, Any]) -> float:
     if best_ask > 0 and price >= best_ask:
         price = _floor_to_tick(max(tick_size, best_ask - tick_size), tick_size)
     return max(tick_size, min(0.99, price))
+
+
+def _order_options(snapshot: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "tick_size": float(_as_float(snapshot.get("tick_size"), 0.01)),
+        "neg_risk": bool(snapshot.get("neg_risk", False)),
+    }
+
+
+def _resolve_order_hints(*, options: object | None, tick_size: float | None, neg_risk: bool | None) -> tuple[float, bool]:
+    resolved_tick = float(_as_float(tick_size, 0.01))
+    resolved_neg_risk = bool(neg_risk)
+    if options is not None:
+        option_tick = getattr(options, "tick_size", None)
+        option_neg_risk = getattr(options, "neg_risk", None)
+        if isinstance(options, dict):
+            option_tick = options.get("tick_size", options.get("tick_text"))
+            option_neg_risk = options.get("neg_risk")
+        if option_tick is not None:
+            resolved_tick = float(_as_float(option_tick, resolved_tick))
+        if option_neg_risk is not None:
+            resolved_neg_risk = bool(option_neg_risk)
+    return max(0.0001, resolved_tick), resolved_neg_risk
+
 
 def _choose_aggressive_buy_size(price: float, *, min_size: float, target_usd: float, max_usd: float) -> tuple[float, float]:
     price_dec = Decimal(str(max(0.0, price)))
@@ -295,39 +324,60 @@ def _build_live_broker() -> LiveClobBroker:
 
 
 def _post_limit_order(
-    broker: LiveClobBroker,
+    client_or_broker: object,
     *,
     token_id: str,
     side: str,
     price: float,
     size: float,
     order_type: str,
-    tick_size: float,
-    neg_risk: bool,
+    options: object | None = None,
+    tick_size: float | None = None,
+    neg_risk: bool | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    normalized_side = str(side or "").strip().upper()
-    if normalized_side not in broker._side_map:
-        raise SystemExit(f"unsupported side: {side}")
+    resolved_tick_size, resolved_neg_risk = _resolve_order_hints(options=options, tick_size=tick_size, neg_risk=neg_risk)
 
-    order = broker._OrderArgs(
-        token_id=token_id,
-        price=price,
-        size=size,
-        side=broker._side_map[normalized_side],
-    )
-    order_payload = {
-        "token_id": str(getattr(order, "token_id", "") or ""),
-        "price": float(_as_float(getattr(order, "price", 0.0), 0.0)),
-        "size": float(_as_float(getattr(order, "size", 0.0), 0.0)),
-        "side": str(getattr(order, "side", "") or ""),
-        "fee_rate_bps": int(_as_float(getattr(order, "fee_rate_bps", 0), 0.0)),
-        "tick_size": float(_as_float(tick_size, 0.01)),
-        "neg_risk": bool(neg_risk),
-        "chain_id": int(broker._chain_id),
-        "funder_address": str(broker._funder),
-    }
-    signed = broker._signer_client.sign_order(order_payload)
-    posted = broker.client.post_order(signed, order_type)
+    if hasattr(client_or_broker, "_signer_client") and hasattr(client_or_broker, "client"):
+        broker = client_or_broker
+        normalized_side = str(side or "").strip().upper()
+        if normalized_side not in broker._side_map:
+            raise SystemExit(f"unsupported side: {side}")
+
+        order = broker._OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=size,
+            side=broker._side_map[normalized_side],
+        )
+        order_payload = {
+            "token_id": str(getattr(order, "token_id", "") or ""),
+            "price": float(_as_float(getattr(order, "price", 0.0), 0.0)),
+            "size": float(_as_float(getattr(order, "size", 0.0), 0.0)),
+            "side": str(getattr(order, "side", "") or ""),
+            "fee_rate_bps": int(_as_float(getattr(order, "fee_rate_bps", 0), 0.0)),
+            "tick_size": resolved_tick_size,
+            "neg_risk": resolved_neg_risk,
+            "chain_id": int(broker._chain_id),
+            "funder_address": str(broker._funder),
+        }
+        signed = broker._signer_client.sign_order(order_payload)
+        posted = broker.client.post_order(signed, order_type)
+    else:
+        if OrderArgs is None:
+            raise SystemExit("py_clob_client OrderArgs unavailable for legacy create_order path")
+        client = client_or_broker
+        create_options = options
+        if create_options is None:
+            create_options = {"tick_size": _tick_string(resolved_tick_size), "neg_risk": resolved_neg_risk}
+        order = OrderArgs(
+            token_id=token_id,
+            price=price,
+            size=size,
+            side=side,
+        )
+        signed = client.create_order(order, options=create_options)
+        posted = client.post_order(signed, order_type)
+
     if not isinstance(posted, dict):
         raise SystemExit(f"unexpected post_order response: {posted!r}")
     order_id = _extract_order_id(posted)
@@ -356,7 +406,7 @@ def _is_retryable_sell_error(exc: Exception) -> bool:
 
 
 def _post_aggressive_sell_with_retries(
-    broker: LiveClobBroker,
+    broker_or_client: object,
     *,
     token_id: str,
     filled_buy_size: float,
@@ -365,19 +415,19 @@ def _post_aggressive_sell_with_retries(
 ) -> tuple[str, dict[str, Any], float, float]:
     last_exc: Exception | None = None
     for attempt in range(max(1, int(attempts))):
-        client = broker.client
+        client = getattr(broker_or_client, "client", broker_or_client)
         snapshot = _book_snapshot(client, token_id)
         aggressive_sell_price, sell_size = _build_aggressive_sell(snapshot, filled_buy_size)
+        order_type = getattr(getattr(broker_or_client, "_OrderType", None), "FAK", "FAK")
         try:
             aggressive_sell_id, aggressive_sell_post = _post_limit_order(
-                broker,
+                broker_or_client,
                 token_id=token_id,
                 side="SELL",
                 price=aggressive_sell_price,
                 size=sell_size,
-                order_type=broker._OrderType.FAK,
-                tick_size=float(snapshot["tick_size"]),
-                neg_risk=bool(snapshot["neg_risk"]),
+                order_type=order_type,
+                options=_order_options(snapshot),
             )
             return aggressive_sell_id, aggressive_sell_post, aggressive_sell_price, sell_size
         except Exception as exc:
