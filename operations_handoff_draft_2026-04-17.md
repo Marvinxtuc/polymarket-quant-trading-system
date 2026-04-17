@@ -35,6 +35,10 @@
 - 动作：执行 `make live-smoke-preflight` 与 `make live-smoke`
 - 结果：统一阻断到 `collateralBalanceAllowanceInsufficient`，未触发真实下单
 
+- 事件 4：执行控制链路演练（pause/reduce/emergency）
+- 动作：调用 `/api/control` 写入命令并抓取前后状态快照
+- 结果：写入统一返回 `write api disabled`，仅保留读链路与故障证据
+
 ## 未决风险
 
 - 风险 1：funder collateral 余额为 0，无法通过 smoke 预算校验
@@ -47,11 +51,16 @@
 - 需要关注的指标：`release_gate_report.blockers`
 - 对应证据路径：`/Users/marvin.x/.local/share/poly_runtime_data/live/0x3e8d50d5e0ffda60d14649540fc5429d25f48c2c/release_gate_report.json`
 
+- 风险 3：控制写平面未放开（`write api disabled`）
+- 当前保护状态：依赖既有保护位，不可执行控制写演练闭环
+- 需要关注的指标：`control_drill_2026-04-17.log` 中所有 POST 结果
+- 对应证据路径：`/Users/marvin.x/.local/share/poly_runtime_data/live/0x3e8d50d5e0ffda60d14649540fc5429d25f48c2c/control_drill_2026-04-17.log`
+
 ## 下一班必须做的动作
 
 1. 资金侧完成注资并确认 `balance_usd >= 2.0`
 2. 重新执行 `LIVE_SMOKE_ACK=YES LIVE_SMOKE_TOKEN_ID=<id> make live-smoke`
-3. 重跑 `make release-gate` 与 `make readiness-brief`，确认 blocker 清零后再会签
+3. 放开控制写平面后重做 kill-switch 写演练，再跑 `make release-gate` 与 `make readiness-brief`
 
 ## 升级联系人
 

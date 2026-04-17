@@ -18,7 +18,7 @@
 4. `LIVE_SMOKE_ACK=YES LIVE_SMOKE_TOKEN_ID=<id> make live-smoke`：失败（preflight fail-close，未进入下单）
 5. `make release-gate`：`blocked`
 6. `make readiness-brief`：`release_gate_status=blocked`
-7. 控制链路演练资料：已收集（见回退触发表与 API 路径说明）
+7. 控制链路演练资料：已执行读写链路；写入返回 `write api disabled`（见 `control_drill_2026-04-17.log`）
 8. 结论产出：本窗口 NO-GO，进入资金补齐后复测流程
 
 ## 关键快照
@@ -43,12 +43,17 @@
 - `live_smoke_execution_summary.json`：`/Users/marvin.x/.local/share/poly_runtime_data/live/0x3e8d50d5e0ffda60d14649540fc5429d25f48c2c/live_smoke_execution_summary.json`
 - `readiness_brief.json`：`/Users/marvin.x/.local/share/poly_runtime_data/live/0x3e8d50d5e0ffda60d14649540fc5429d25f48c2c/readiness_brief.json`
 - `network_smoke_log`：`/Users/marvin.x/.local/share/poly_runtime_data/live/0x3e8d50d5e0ffda60d14649540fc5429d25f48c2c/poly_network_smoke.jsonl`
+- `control_drill_2026-04-17.log`：`/Users/marvin.x/.local/share/poly_runtime_data/live/0x3e8d50d5e0ffda60d14649540fc5429d25f48c2c/control_drill_2026-04-17.log`
 
 ## 异常与处理
 
 - 异常 1：preflight collateral 检查阻断（余额不足）
 - 处理动作：修复 signer 可用性、刷新 state、新增 sig-type2 preflight 兼容后复测
 - 结果：阻断已定位为业务条件不足（`balance_usd=0.0`），非接口不可用
+
+- 异常 2：控制接口写操作返回 `write api disabled`
+- 处理动作：保留控制链路证据并维持 `pause_opening=true` 保护态
+- 结果：本窗口不满足“可执行 kill-switch 写平面演练”放行条件
 
 ## 发布结论
 
