@@ -57,6 +57,7 @@
   - 资金侧完成注资（collateral `balance >= 2.00 USDC`）
   - 重新执行 `LIVE_SMOKE_ACK=YES LIVE_SMOKE_TOKEN_ID=<id> make live-smoke` 且成功
   - `make release-gate` 清零 blocker（允许仅保留 `operational_readiness=observe` advisory）
+  - 控制写平面恢复可用（`/api/control` 不再返回 `write api disabled`）
 - 条件放行复核点（仅在上述条件全部满足后生效）：
   - 首次复核：放行后 +30 分钟
   - 二次复核：放行后 +60 分钟
