@@ -17,6 +17,8 @@ if str(SRC) not in sys.path:
 
 from polymarket_bot.config import Settings
 from polymarket_bot.i18n import t as i18n_t
+from polymarket_bot.secrets import normalize_identity, resolve_live_secret_bundle
+from polymarket_bot.signer_client import build_signer_client
 
 USDC_BASE_UNITS = Decimal("1000000")
 
@@ -86,6 +88,11 @@ def _extract_named_units(payload: Any, aliases: tuple[str, ...]) -> int | None:
         if isinstance(current, dict):
             for key, value in current.items():
                 normalized_key = str(key or "").strip().lower().replace("-", "_")
+                if normalized_key == "allowances" and "allowance" in normalized_aliases and isinstance(value, dict):
+                    parsed_values = [_to_units(item) for item in value.values()]
+                    valid_values = [int(item) for item in parsed_values if item is not None]
+                    if valid_values:
+                        return max(valid_values)
                 if normalized_key in normalized_aliases:
                     parsed = _extract_units_from_value(value)
                     if parsed is not None:
@@ -126,6 +133,9 @@ def _evaluate_collateral_budget(settings: Settings, *, enabled: bool = True) -> 
         "allowance_units": None,
         "balance_usd": None,
         "allowance_usd": None,
+        "api_header_identity": "",
+        "signer_api_identity": "",
+        "signer_health_error": "",
         "error": "",
         "response_keys": [],
     }
@@ -145,6 +155,20 @@ def _evaluate_collateral_budget(settings: Settings, *, enabled: bool = True) -> 
         return result
 
     try:
+        funder_identity = normalize_identity(str(settings.funder_address or ""))
+        api_header_identity = funder_identity
+        signer_api_identity = ""
+        signer_health_error = ""
+        try:
+            bundle = resolve_live_secret_bundle(settings)
+            signer_client = build_signer_client(bundle)
+            signer_health = signer_client.health_check()
+            signer_api_identity = normalize_identity(getattr(signer_health, "api_identity", ""))
+            if signer_api_identity:
+                api_header_identity = signer_api_identity
+        except Exception as exc:
+            signer_health_error = str(exc or "")
+
         client = ClobClient(
             str(settings.polymarket_clob_host or "").strip(),
             chain_id=int(settings.chain_id),
@@ -159,7 +183,7 @@ def _evaluate_collateral_budget(settings: Settings, *, enabled: bool = True) -> 
                 api_passphrase=str(settings.clob_api_passphrase or "").strip(),
             )
         )
-        client.signer = _AddressOnlySigner(str(settings.funder_address or ""))
+        client.signer = _AddressOnlySigner(api_header_identity or funder_identity)
         client.mode = client._get_client_mode()
         payload = client.get_balance_allowance(
             BalanceAllowanceParams(
@@ -174,7 +198,15 @@ def _evaluate_collateral_budget(settings: Settings, *, enabled: bool = True) -> 
             detail = sorted(payload.keys()) if isinstance(payload, dict) else [type(payload).__name__]
             raise RuntimeError(f"unable to parse balance/allowance from response: {detail}")
     except Exception as exc:
-        result.update({"ok": False, "error": str(exc or "unknown error")})
+        result.update(
+            {
+                "ok": False,
+                "error": str(exc or "unknown error"),
+                "api_header_identity": str(locals().get("api_header_identity") or ""),
+                "signer_api_identity": str(locals().get("signer_api_identity") or ""),
+                "signer_health_error": str(locals().get("signer_health_error") or ""),
+            }
+        )
         if isinstance(payload, dict):
             result["response_keys"] = sorted(str(key) for key in payload.keys())[:40]
         return result
@@ -189,6 +221,9 @@ def _evaluate_collateral_budget(settings: Settings, *, enabled: bool = True) -> 
             "allowance_units": int(allowance_units),
             "balance_usd": balance_usd,
             "allowance_usd": allowance_usd,
+            "api_header_identity": api_header_identity,
+            "signer_api_identity": signer_api_identity,
+            "signer_health_error": signer_health_error,
             "response_keys": sorted(str(key) for key in payload.keys())[:40] if isinstance(payload, dict) else [],
         }
     )
