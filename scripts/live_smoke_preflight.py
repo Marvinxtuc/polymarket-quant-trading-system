@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
+from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +18,8 @@ if str(SRC) not in sys.path:
 from polymarket_bot.config import Settings
 from polymarket_bot.i18n import t as i18n_t
 
+USDC_BASE_UNITS = Decimal("1000000")
+
 
 def _preflight_t(key: str, params: dict[str, object] | None = None, *, fallback: str = "") -> str:
     return i18n_t(f"report.liveSmokePreflight.{key}", dict(params or {}), fallback=fallback)
@@ -23,6 +27,172 @@ def _preflight_t(key: str, params: dict[str, object] | None = None, *, fallback:
 
 def _truthy(value: Any) -> bool:
     return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _smoke_budget_usd() -> tuple[float, float, float, float]:
+    resting_usd = max(0.0, _safe_float(os.getenv("LIVE_SMOKE_RESTING_USD"), 1.0))
+    aggressive_usd = max(0.0, _safe_float(os.getenv("LIVE_SMOKE_AGGRESSIVE_USD"), 1.0))
+    max_usd = max(0.0, _safe_float(os.getenv("LIVE_SMOKE_MAX_USD"), 2.0))
+    required_usd = max(0.01, resting_usd, aggressive_usd, max_usd)
+    return required_usd, resting_usd, aggressive_usd, max_usd
+
+
+def _to_units(value: Any) -> int | None:
+    if isinstance(value, bool):
+        return None
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        numeric = Decimal(text)
+    except Exception:
+        return None
+    if not numeric.is_finite():
+        return None
+    if numeric <= 0:
+        return 0
+    return int(numeric.to_integral_value(rounding=ROUND_FLOOR))
+
+
+def _extract_units_from_value(value: Any) -> int | None:
+    parsed = _to_units(value)
+    if parsed is not None:
+        return parsed
+    if not isinstance(value, dict):
+        return None
+    for key in ("raw", "amount", "value", "units", "balance", "allowance"):
+        if key not in value:
+            continue
+        parsed = _to_units(value.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _extract_named_units(payload: Any, aliases: tuple[str, ...]) -> int | None:
+    normalized_aliases = {str(alias or "").strip().lower().replace("-", "_") for alias in aliases if str(alias or "").strip()}
+    queue: list[Any] = [payload]
+    visited = 0
+    while queue and visited < 200:
+        visited += 1
+        current = queue.pop(0)
+        if isinstance(current, dict):
+            for key, value in current.items():
+                normalized_key = str(key or "").strip().lower().replace("-", "_")
+                if normalized_key in normalized_aliases:
+                    parsed = _extract_units_from_value(value)
+                    if parsed is not None:
+                        return parsed
+                if isinstance(value, (dict, list, tuple)):
+                    queue.append(value)
+            continue
+        if isinstance(current, (list, tuple)):
+            for value in current:
+                if isinstance(value, (dict, list, tuple)):
+                    queue.append(value)
+    return None
+
+
+class _AddressOnlySigner:
+    def __init__(self, address: str) -> None:
+        self._address = str(address or "").strip().lower()
+
+    def address(self) -> str:
+        return self._address
+
+
+def _evaluate_collateral_budget(settings: Settings, *, enabled: bool = True) -> dict[str, Any]:
+    required_usd, resting_usd, aggressive_usd, max_usd = _smoke_budget_usd()
+    required_units = int((Decimal(str(required_usd)) * USDC_BASE_UNITS).to_integral_value(rounding=ROUND_CEILING))
+    token_id = str(os.getenv("LIVE_SMOKE_TOKEN_ID") or "").strip()
+    result: dict[str, Any] = {
+        "enabled": bool(enabled),
+        "skipped": False,
+        "ok": True,
+        "token_id": token_id,
+        "required_usd": required_usd,
+        "required_units": required_units,
+        "resting_usd": resting_usd,
+        "aggressive_usd": aggressive_usd,
+        "max_usd": max_usd,
+        "balance_units": None,
+        "allowance_units": None,
+        "balance_usd": None,
+        "allowance_usd": None,
+        "error": "",
+        "response_keys": [],
+    }
+    if not enabled:
+        result.update({"skipped": True, "skip_reason": "live_secrets_not_ready", "ok": True})
+        return result
+    if not token_id:
+        result.update({"skipped": True, "skip_reason": "live_smoke_token_id_missing", "ok": True})
+        return result
+
+    payload: Any = {}
+    try:
+        from py_clob_client.client import ClobClient
+        from py_clob_client.clob_types import ApiCreds, AssetType, BalanceAllowanceParams
+    except Exception as exc:
+        result.update({"ok": False, "error": f"py_clob_client_unavailable: {exc}"})
+        return result
+
+    try:
+        client = ClobClient(
+            str(settings.polymarket_clob_host or "").strip(),
+            chain_id=int(settings.chain_id),
+            key=None,
+            signature_type=int(settings.clob_signature_type),
+            funder=str(settings.funder_address or "").strip(),
+        )
+        client.set_api_creds(
+            ApiCreds(
+                api_key=str(settings.clob_api_key or "").strip(),
+                api_secret=str(settings.clob_api_secret or "").strip(),
+                api_passphrase=str(settings.clob_api_passphrase or "").strip(),
+            )
+        )
+        client.signer = _AddressOnlySigner(str(settings.funder_address or ""))
+        client.mode = client._get_client_mode()
+        payload = client.get_balance_allowance(
+            BalanceAllowanceParams(
+                asset_type=AssetType.COLLATERAL,
+                token_id=None,
+                signature_type=int(settings.clob_signature_type),
+            )
+        )
+        balance_units = _extract_named_units(payload, ("balance", "balance_raw", "raw_balance"))
+        allowance_units = _extract_named_units(payload, ("allowance", "allowance_raw", "raw_allowance"))
+        if balance_units is None or allowance_units is None:
+            detail = sorted(payload.keys()) if isinstance(payload, dict) else [type(payload).__name__]
+            raise RuntimeError(f"unable to parse balance/allowance from response: {detail}")
+    except Exception as exc:
+        result.update({"ok": False, "error": str(exc or "unknown error")})
+        if isinstance(payload, dict):
+            result["response_keys"] = sorted(str(key) for key in payload.keys())[:40]
+        return result
+
+    balance_usd = float((Decimal(balance_units) / USDC_BASE_UNITS)) if balance_units is not None else 0.0
+    allowance_usd = float((Decimal(allowance_units) / USDC_BASE_UNITS)) if allowance_units is not None else 0.0
+    ok = bool(balance_units >= required_units and allowance_units >= required_units)
+    result.update(
+        {
+            "ok": ok,
+            "balance_units": int(balance_units),
+            "allowance_units": int(allowance_units),
+            "balance_usd": balance_usd,
+            "allowance_usd": allowance_usd,
+            "response_keys": sorted(str(key) for key in payload.keys())[:40] if isinstance(payload, dict) else [],
+        }
+    )
+    return result
 
 
 def _check(
@@ -130,6 +300,31 @@ def build_report(settings: Settings, *, now_ts: int | None = None) -> tuple[dict
     )
     if not remote_alert_ok:
         add_blocker("remoteAlertNotConfigured")
+
+    collateral_budget = _evaluate_collateral_budget(
+        settings,
+        enabled=funder_ready and api_creds_ready and not raw_private_key_present,
+    )
+    collateral_required_usd = _safe_float(collateral_budget.get("required_usd"), 0.0)
+    collateral_ok = bool(collateral_budget.get("ok"))
+    checks.append(
+        _check(
+            "collateral_balance_allowance",
+            collateral_ok,
+            _preflight_t(
+                "check.collateralBalanceAllowance",
+                {"requiredUsd": f"{collateral_required_usd:.2f}"},
+                fallback=f"Collateral balance/allowance must cover live smoke budget (${collateral_required_usd:.2f})",
+            ),
+            message_code="collateralBalanceAllowance",
+            details=collateral_budget,
+        )
+    )
+    if not collateral_ok:
+        if str(collateral_budget.get("error") or "").strip():
+            add_blocker("collateralBalanceAllowanceUnavailable")
+        else:
+            add_blocker("collateralBalanceAllowanceInsufficient")
 
     state_path = Path(settings.runtime_store_path("state.json")).expanduser()
     state_payload: dict[str, Any] = {}

@@ -2527,7 +2527,8 @@
         "reconciliationOk": "reconciliation.status must be ok",
         "persistenceOk": "persistence.status must be ok",
         "openPositionsZero": "open_positions must be 0 before live smoke",
-        "trackedNotionalZero": "tracked_notional_usd must be 0 before live smoke"
+        "trackedNotionalZero": "tracked_notional_usd must be 0 before live smoke",
+        "collateralBalanceAllowance": "Collateral balance and allowance must cover the live smoke budget (at least {{requiredUsd}} USDC)"
       },
       "blocker": {
         "dryRunTrue": "DRY_RUN is true",
@@ -2542,7 +2543,9 @@
         "reconciliationNotOk": "reconciliation.status is not ok",
         "persistenceNotOk": "persistence.status is not ok",
         "openPositionsNonZero": "open_positions is not zero",
-        "trackedNotionalNonZero": "tracked_notional_usd is not zero"
+        "trackedNotionalNonZero": "tracked_notional_usd is not zero",
+        "collateralBalanceAllowanceInsufficient": "Collateral balance or allowance is insufficient for the live smoke budget",
+        "collateralBalanceAllowanceUnavailable": "Unable to verify collateral balance/allowance; fix permissions or API availability first"
       }
     },
     "rehearsalFinalize": {
