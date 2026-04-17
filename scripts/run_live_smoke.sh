@@ -57,6 +57,10 @@ PY
 set +e
 {
   echo "==> live smoke preflight"
+  LIVE_SMOKE_TOKEN_ID="$TOKEN_ID" \
+  LIVE_SMOKE_RESTING_USD="$RESTING_USD" \
+  LIVE_SMOKE_AGGRESSIVE_USD="$AGGRESSIVE_USD" \
+  LIVE_SMOKE_MAX_USD="$MAX_USD" \
   PYTHONPATH=src "$PY_BIN" "$BASE/scripts/live_smoke_preflight.py"
 } 2>&1 | tee "$LOG_PATH"
 PRE_RC=${PIPESTATUS[0]}

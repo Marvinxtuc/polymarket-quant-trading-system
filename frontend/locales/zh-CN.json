@@ -2527,7 +2527,8 @@
         "reconciliationOk": "reconciliation.status 必须为 ok",
         "persistenceOk": "persistence.status 必须为 ok",
         "openPositionsZero": "实盘 smoke 前 open_positions 必须为 0",
-        "trackedNotionalZero": "实盘 smoke 前 tracked_notional_usd 必须为 0"
+        "trackedNotionalZero": "实盘 smoke 前 tracked_notional_usd 必须为 0",
+        "collateralBalanceAllowance": "实盘 smoke 前，账户 collateral 余额与授权必须覆盖预算（至少 {{requiredUsd}} USDC）"
       },
       "blocker": {
         "dryRunTrue": "当前 DRY_RUN=true",
@@ -2542,7 +2543,9 @@
         "reconciliationNotOk": "reconciliation.status 当前不是 ok",
         "persistenceNotOk": "persistence.status 当前不是 ok",
         "openPositionsNonZero": "open_positions 当前不为 0",
-        "trackedNotionalNonZero": "tracked_notional_usd 当前不为 0"
+        "trackedNotionalNonZero": "tracked_notional_usd 当前不为 0",
+        "collateralBalanceAllowanceInsufficient": "账户 collateral 余额或授权不足，无法覆盖实盘 smoke 预算",
+        "collateralBalanceAllowanceUnavailable": "无法完成 collateral 余额/授权查询，请先修复权限或接口可用性"
       }
     },
     "rehearsalFinalize": {
